@@ -326,10 +326,11 @@ def clear_user_active_item(user_id, chat_id):
         c.execute("UPDATE users SET active_item = '' WHERE user_id = %s AND chat_id = %s", (user_id, chat_id))
 
 
-def get_group_player_count(chat_id):
+def get_active_today_count(chat_id, today_str):
+    """Counts only members who grew (used /d) today - the pool اجماع quorum is based on."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM users WHERE chat_id = %s', (chat_id,))
+        c.execute('SELECT COUNT(*) FROM users WHERE chat_id = %s AND last_grown = %s', (chat_id, today_str))
         return c.fetchone()[0]
 
 
