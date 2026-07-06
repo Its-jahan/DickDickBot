@@ -370,7 +370,7 @@ def render_consensus_message(target_name, amount, required_votes, total_players,
     lines = [
         f"⚖️ اجماع علیه {target_name}",
         f"در صورت رای‌آوری، {int(amount)} سانتی‌متر از {target_name} کم می‌شود.",
-        f"برای موفقیت نیاز به {required_votes} رای موافق از {total_players} عضو گروه است.",
+        f"برای موفقیت نیاز به {required_votes} رای موافق از {total_players} نفری است که امروز فعال بوده‌اند.",
         "⏰ مهلت رای‌گیری: ۱ ساعت.",
     ]
     if voters:
@@ -416,7 +416,12 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.track_chat(chat_id)
     text = update.message.text
 
-    db.get_user(user.id, chat_id, user.username, user.first_name)
+    _, initiator_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    today_str = datetime.date.today().isoformat()
+    if initiator_last_grown != today_str:
+        await update.message.reply_text("فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن اجماع راه بندازن!")
+        return
+
     target_user_id, target_first_name = get_target_user(update, text, chat_id)
 
     if not target_user_id:
@@ -449,9 +454,9 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    player_count = db.get_group_player_count(chat_id)
+    player_count = db.get_active_today_count(chat_id, today_str)
     if player_count < MIN_CONSENSUS_PLAYERS:
-        await update.message.reply_text(f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} عضو فعال در این گروه نیاز است!")
+        await update.message.reply_text(f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} نفر که امروز دودولشونو مالیدن نیاز است!")
         return
 
     required_votes = player_count // 2 + 1
@@ -501,7 +506,11 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("نمی‌توانید به اجماع علیه خودتان رای بدهید!", show_alert=True)
         return
 
-    db.get_user(user.id, chat_id, user.username, user.first_name)
+    _, voter_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    today_str = datetime.date.today().isoformat()
+    if voter_last_grown != today_str:
+        await query.answer("فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن به اجماع رای بدن!", show_alert=True)
+        return
 
     is_new_vote = db.cast_consensus_vote(vote_id, user.id, user.first_name, choice)
     if not is_new_vote:
