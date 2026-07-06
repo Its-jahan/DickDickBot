@@ -71,6 +71,33 @@ def init_db():
             )
         ''')
 
+        # Remembers the last group each user interacted in, so inline results
+        # (like the leaderboard) can be rendered for that group directly.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS user_last_chat (
+                user_id BIGINT PRIMARY KEY,
+                chat_id BIGINT
+            )
+        ''')
+
+
+def set_last_chat(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO user_last_chat (user_id, chat_id) VALUES (%s, %s) '
+            'ON CONFLICT (user_id) DO UPDATE SET chat_id = EXCLUDED.chat_id',
+            (user_id, chat_id)
+        )
+
+
+def get_last_chat(user_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT chat_id FROM user_last_chat WHERE user_id = %s', (user_id,))
+        row = c.fetchone()
+        return row[0] if row else None
+
 
 def track_chat(chat_id):
     if chat_id < 0:
@@ -107,6 +134,13 @@ def get_all_chats():
 def get_user(user_id, chat_id, username, first_name):
     with get_connection() as conn:
         c = conn.cursor()
+        # Remember this group as the user's last active chat (for inline results).
+        if chat_id < 0:
+            c.execute(
+                'INSERT INTO user_last_chat (user_id, chat_id) VALUES (%s, %s) '
+                'ON CONFLICT (user_id) DO UPDATE SET chat_id = EXCLUDED.chat_id',
+                (user_id, chat_id)
+            )
         c.execute('SELECT size, last_grown, perk FROM users WHERE user_id = %s AND chat_id = %s', (user_id, chat_id))
         row = c.fetchone()
         if row is None:

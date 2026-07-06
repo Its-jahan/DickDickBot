@@ -31,6 +31,25 @@ def get_dick_name(size):
     else:
         return "کیررررر"
 
+def build_top_text(chat_id):
+    """Build the group leaderboard message. Returns None if the group has no players."""
+    rows = db.get_top_users(chat_id, 10)
+    if not rows:
+        return None
+    msg = "🏆 برترین‌های این گروه:\n\n"
+    for i, (first_name, size) in enumerate(rows, 1):
+        d_name = get_dick_name(size)
+        if i == 1:
+            title = f"🥇 {d_name} طلا"
+        elif i == 2:
+            title = f"🥈 {d_name} نقره"
+        elif i == 3:
+            title = f"🥉 {d_name} برنزی"
+        else:
+            title = f"💩 {d_name} رعیت"
+        msg += f"{i}. {first_name} ({title}): {int(size)} سانتی‌متر\n"
+    return msg
+
 # Setup Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -286,26 +305,12 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db.track_chat(chat_id)
-    rows = db.get_top_users(chat_id, 10)
-    
-    if not rows:
+    msg = build_top_text(chat_id)
+
+    if not msg:
         await update.message.reply_text("هنوز هیچکس در این گروه در بازی شرکت نکرده است!")
         return
-        
-    msg = "🏆 برترین‌های این گروه:\n\n"
-    for i, (first_name, size) in enumerate(rows, 1):
-        d_name = get_dick_name(size)
-        if i == 1:
-            title = f"🥇 {d_name} طلا"
-        elif i == 2:
-            title = f"🥈 {d_name} نقره"
-        elif i == 3:
-            title = f"🥉 {d_name} برنزی"
-        else:
-            title = f"💩 {d_name} رعیت"
-            
-        msg += f"{i}. {first_name} ({title}): {int(size)} سانتی‌متر\n"
-        
+
     await update.message.reply_text(msg)
 
 async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,7 +743,27 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         input_message_content=InputTextMessageContent(f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر ایجاد کرد!\nاولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود."),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=f"chal_{user.id}_{bet}")]])
     )
-    
+
+    # Leaderboard: render directly for the user's last active group so no extra
+    # button press is needed. Fall back to a button only if we don't know the group.
+    last_chat = db.get_last_chat(user.id)
+    top_text = build_top_text(last_chat) if last_chat else None
+    if top_text:
+        top_article = InlineQueryResultArticle(
+            id=str(uuid4()),
+            title="🏆 برترین‌های گروه",
+            description="نمایش لیدربرد این گروه",
+            input_message_content=InputTextMessageContent(top_text)
+        )
+    else:
+        top_article = InlineQueryResultArticle(
+            id=str(uuid4()),
+            title="🏆 برترین‌های گروه",
+            description="نمایش لیدربرد این گروه",
+            input_message_content=InputTextMessageContent("🏆 در حال بارگذاری لیدربرد گروه..."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نمایش برترین‌ها 👁️", callback_data=f"showtop_{user.id}")]])
+        )
+
     results = [
         InlineQueryResultArticle(
             id=str(uuid4()),
@@ -747,13 +772,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             input_message_content=InputTextMessageContent(f"🌱 {user.first_name} می‌خواد دودولش رو بماله..."),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بمالش تا بزرگ شه 💦", callback_data=f"grow_self_{user.id}")]])
         ),
-        InlineQueryResultArticle(
-            id=str(uuid4()),
-            title="🏆 برترین‌های گروه",
-            description="نمایش لیدربرد این گروه",
-            input_message_content=InputTextMessageContent("🏆 در حال بارگذاری لیدربرد گروه..."),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نمایش برترین‌ها 👁️", callback_data=f"showtop_{user.id}")]])
-        ),
+        top_article,
         InlineQueryResultArticle(
             id=str(uuid4()),
             title="📏 نمایش سایز من",
@@ -799,25 +818,12 @@ async def show_top_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat_id:
         await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
         return
-    rows = db.get_top_users(chat_id, 10)
-    
-    if not rows:
+    msg = build_top_text(chat_id)
+
+    if not msg:
         await query.edit_message_text("هنوز هیچکس در این گروه در بازی شرکت نکرده است!")
         return
-        
-    msg = "🏆 برترین‌های این گروه:\n\n"
-    for i, (first_name, size) in enumerate(rows, 1):
-        d_name = get_dick_name(size)
-        if i == 1:
-            title = f"🥇 {d_name} طلا"
-        elif i == 2:
-            title = f"🥈 {d_name} نقره"
-        elif i == 3:
-            title = f"🥉 {d_name} برنزی"
-        else:
-            title = f"💩 {d_name} رعیت"
-        msg += f"{i}. {first_name} ({title}): {int(size)} سانتی‌متر\n"
-    
+
     await query.edit_message_text(msg)
 
 async def show_size_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
