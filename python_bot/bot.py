@@ -350,6 +350,126 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     await update.message.reply_text(f"شما {int(amount)} سانتی‌متر به {target_first_name} اهدا کردید!\nسایز جدید شما: {int(new_size)} سانتی‌متر.")
 
+MIN_CONSENSUS_PLAYERS = 3
+CONSENSUS_STEAL_RATIO = 0.30
+
+async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    text = update.message.text
+
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    target_user_id, target_first_name = get_target_user(update, text, chat_id)
+
+    if not target_user_id:
+        await update.message.reply_text("استفاده صحیح:\n/ejma @username\nیا ریپلای کردن روی پیام شخص و تایپ /ejma")
+        return
+
+    if target_user_id == user.id:
+        await update.message.reply_text("نمی‌توانید علیه خودتان اجماع کنید!")
+        return
+
+    target_info = db.get_user_info(target_user_id, chat_id)
+    target_size = target_info[1] if target_info else 0.0
+    if target_size <= 0:
+        await update.message.reply_text(f"{target_first_name} سایز کافی برای اجماع ندارد!")
+        return
+
+    remaining = db.get_consensus_protection_remaining(chat_id, target_user_id)
+    if remaining is not None:
+        hours = max(1, int(remaining.total_seconds() // 3600))
+        await update.message.reply_text(
+            f"اجماع قبلی علیه {target_first_name} شکست خورده بود! تا حدود {hours} ساعت دیگر نمی‌شود دوباره علیه او اجماع کرد."
+        )
+        return
+
+    if db.get_open_consensus(chat_id, target_user_id):
+        db.fail_open_consensus(chat_id, target_user_id)
+        await update.message.reply_text(
+            f"اجماع قبلی علیه {target_first_name} به حد نصاب رای نرسیده بود و شکست خورد!\n"
+            f"تا ۳ روز دیگر نمی‌شود علیه او اجماع جدیدی راه انداخت."
+        )
+        return
+
+    player_count = db.get_group_player_count(chat_id)
+    if player_count < MIN_CONSENSUS_PLAYERS:
+        await update.message.reply_text(f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} عضو فعال در این گروه نیاز است!")
+        return
+
+    required_votes = player_count // 2 + 1
+    amount = max(1, round(target_size * CONSENSUS_STEAL_RATIO))
+
+    vote_id = db.create_consensus(chat_id, target_user_id, target_first_name, user.id, amount, required_votes)
+
+    keyboard = [[InlineKeyboardButton(f"✅ رای به اجماع (1/{required_votes})", callback_data=f"ejmavote_{vote_id}")]]
+    await update.message.reply_text(
+        f"⚖️ {user.first_name} درخواست اجماع علیه {target_first_name} داد!\n"
+        f"در صورت رای‌آوری، {int(amount)} سانتی‌متر از {target_first_name} (سایز فعلی: {int(target_size)}) کم می‌شود.\n"
+        f"برای موفقیت نیاز به {required_votes} رای از {player_count} عضو گروه است.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
+        return
+
+    data = query.data.split('_')
+    if len(data) != 2 or data[0] != 'ejmavote':
+        return
+    vote_id = int(data[1])
+
+    consensus = db.get_consensus(vote_id)
+    if not consensus:
+        await query.answer("این رای‌گیری وجود ندارد!", show_alert=True)
+        return
+
+    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, status = consensus
+
+    if status != 'open':
+        await query.answer("این رای‌گیری دیگر فعال نیست!", show_alert=True)
+        return
+
+    if user.id == target_id:
+        await query.answer("نمی‌توانید به اجماع علیه خودتان رای بدهید!", show_alert=True)
+        return
+
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    is_new_vote = db.cast_consensus_vote(vote_id, user.id)
+    if not is_new_vote:
+        await query.answer("شما قبلاً رای داده بودید!", show_alert=True)
+        return
+
+    vote_count = db.count_consensus_votes(vote_id)
+
+    if vote_count >= required_votes:
+        if db.resolve_consensus_success(vote_id):
+            db.update_size(target_id, chat_id, -amount)
+            new_size, _, _ = db.get_user(target_id, chat_id, None, None)
+            await query.answer("اجماع موفق شد!")
+            await query.edit_message_text(
+                f"⚖️ اجماع علیه {target_name} با {vote_count} رای موفق شد!\n"
+                f"📉 {int(amount)} سانتی‌متر از {target_name} کم شد.\n"
+                f"اندازه جدید: {int(new_size)} سانتی‌متر."
+            )
+        return
+
+    await query.answer(f"رای شما ثبت شد! ({vote_count}/{required_votes})")
+    keyboard = [[InlineKeyboardButton(f"✅ رای به اجماع ({vote_count}/{required_votes})", callback_data=f"ejmavote_{vote_id}")]]
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    except:
+        pass
+
 async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -917,11 +1037,13 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.Regex(r'^/(challenge|c)\b'), challenge))
     app.add_handler(MessageHandler(filters.Regex(r'^/(inv|inventory|i)\b'), inventory_cmd))
     app.add_handler(MessageHandler(filters.Regex(r'^/(use|u)\b'), use_item_cmd))
-    
+    app.add_handler(MessageHandler(filters.Regex(r'^/ejma\b'), consensus_cmd))
+
     app.add_handler(CallbackQueryHandler(accept_challenge_callback, pattern=r'^chal_'))
     app.add_handler(CallbackQueryHandler(rematch_callback, pattern=r'^rematch_'))
     app.add_handler(CallbackQueryHandler(grow_callback, pattern=r'^grow_self_'))
     app.add_handler(CallbackQueryHandler(use_item_callback, pattern=r'^useitem_'))
+    app.add_handler(CallbackQueryHandler(consensus_vote_callback, pattern=r'^ejmavote_'))
     app.add_handler(CallbackQueryHandler(show_top_callback, pattern=r'^showtop_'))
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))
     app.add_handler(CallbackQueryHandler(show_inv_callback, pattern=r'^showinv_'))
