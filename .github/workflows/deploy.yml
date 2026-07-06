@@ -1,0 +1,33 @@
+name: Deploy to server
+
+# Auto-deploy: every push to main (and manual runs) SSHes into the server,
+# pulls the latest code, updates dependencies and restarts the systemd service.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            set -e
+            cd /opt/DickDickBot
+            git fetch origin main
+            git checkout main 2>/dev/null || git checkout -b main origin/main
+            git reset --hard origin/main
+            /opt/DickDickBot/venv/bin/pip install -r python_bot/requirements.txt
+            systemctl restart dickbot
+            sleep 2
+            systemctl is-active dickbot

@@ -4,3 +4,6 @@
 .idea
 dickbot_backup_local.db
 .claude/
+__pycache__/
+*.pyc
+*.db
