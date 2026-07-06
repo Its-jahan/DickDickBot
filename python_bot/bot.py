@@ -97,7 +97,13 @@ PERK_DESCRIPTIONS = {
     "خایه‌مال": "شما پرک **خایه‌مال 🤲** گرفتید! (+۵ سانت هدیه بلافاصله اضافه شد).",
     "کون‌گشاد": "شما پرک **کون‌گشاد 🦥** گرفتید! (تاس‌های شما همیشه ۱ دونه کمتر محاسبه میشه).",
     "زن جنده": "به صورت رندوم یکی از اعضای گروه رو انتخاب می‌کنه و اگه سایزش بیشتر از ۱۰ باشه ۵ سانت از اون کم می‌کنه و به تو اضافه می‌کنه.",
-    "جقی": "موقع چالش ممکنه عدد تاس رو رندوم به شدت بالا یا پایین ببره!"
+    "جقی": "موقع چالش ممکنه عدد تاس رو رندوم به شدت بالا یا پایین ببره!",
+    "کیرکلفت": "شما پرک **کیرکلفت 💪** گرفتید! (یه رشد اضافه هم بلافاصله گیرت اومد).",
+    "کص‌شانس": "شما پرک **کص‌شانس 🍀** گرفتید! (امروز شانس پیدا کردن آیتم دو برابره).",
+    "خایه‌سنگی": "شما پرک **خایه‌سنگی 🛡️** گرفتید! (اگه امروز تو چالش ببازید، هیچی از دست نمی‌دید).",
+    "کیرشکسته": "شما پرک **کیرشکسته 💔** گرفتید! (یه مقدار سانت هم بلافاصله از دست دادید).",
+    "کون‌سوخته": "شما پرک **کون‌سوخته 🔥** گرفتید! (امروز نمی‌تونید از هیچ آیتمی استفاده کنید).",
+    "حروم‌دست": "شما پرک **حروم‌دست 🎲** گرفتید! (تاس‌های امروزتون تو چالش ۲ عدد کمتر محاسبه میشه)."
 }
 
 ITEM_DESCRIPTIONS = {
@@ -131,9 +137,8 @@ def get_target_user(update: Update, text: str, chat_id: int):
             
     return target_user_id, target_first_name
 
-def drop_item(user_id, chat_id):
-    # 30% chance to drop an item
-    if random.random() > 0.3:
+def drop_item(user_id, chat_id, chance=0.3):
+    if random.random() > chance:
         return None
     
     # Pool weights: viagra 24, pill 10, saffron 1, condom 15, milk 15, needle 10, spell 15, spray 10
@@ -228,10 +233,15 @@ async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id != target_id:
         await query.answer("شما فقط می‌توانید از آیتم‌های خودتان استفاده کنید!", show_alert=True)
         return
-        
+
+    _, _, user_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+    if user_perk == "کون‌سوخته":
+        await query.answer("شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!", show_alert=True)
+        return
+
     challenge_items = ["کاندوم", "شیر موز", "سوزن", "طلسم", "اسپری"]
     direct_items = ["ویاگرا", "قرص اورژانسی", "زعفرون"]
-    
+
     if item_name in direct_items:
         await query.answer(f"برای استفاده از {item_name} باید تو گروه بنویسی:\n/use {item_name} @username", show_alert=True)
         return
@@ -266,8 +276,11 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     db.track_chat(chat_id)
-    db.get_user(user.id, chat_id, user.username, user.first_name)
-    
+    _, _, user_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+    if user_perk == "کون‌سوخته":
+        await update.message.reply_text("شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!")
+        return
+
     text = update.message.text
     parts = text.split()
     if len(parts) < 2:
@@ -693,9 +706,11 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
     # Apply Dice Perks
     if c_perk == "کون‌گشاد": val1 = max(1, val1 - 1)
     elif c_perk == "زن جنده": val1 = min(6, val1 + 1)
-        
+    elif c_perk == "حروم‌دست": val1 = max(1, val1 - 2)
+
     if user_perk == "کون‌گشاد": val2 = max(1, val2 - 1)
     elif user_perk == "زن جنده": val2 = min(6, val2 + 1)
+    elif user_perk == "حروم‌دست": val2 = max(1, val2 - 2)
     
     msg_item_log = ""
     if c_item or u_item:
@@ -767,7 +782,9 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         
     if loser_perk == "لاشی":
         loser_loss = int(bet * 0.5)
-        
+    elif loser_perk == "خایه‌سنگی":
+        loser_loss = 0
+
     if winner_milk:
         extra = random.randint(5, 15)
         winner_gain += extra
@@ -792,6 +809,8 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         msg += f"\n({winner_perk} باعث شد برنده {winner_gain} سانت گیرش بیاد)"
     if loser_perk == "لاشی" and loser_loss > 0:
         msg += f"\n(لاشی باعث شد بازنده فقط {loser_loss} سانت از دست بده)"
+    if loser_perk == "خایه‌سنگی":
+        msg += "\n(خایه‌سنگی باعث شد بازنده هیچی از دست نده)"
 
     # Fetch new stats
     winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
@@ -975,8 +994,9 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_size = current_size + delta
     
     perk_pool = [
-        "عادی", "عادی", "عادی", "عادی",
-        "جاکش", "کص‌کش", "حرومزاده", "لاشی", "خایه‌مال", "کون‌گشاد", "زن جنده", "جقی"
+        "عادی", "عادی", "عادی", "عادی", "عادی", "عادی", "عادی",
+        "جاکش", "کص‌کش", "حرومزاده", "لاشی", "خایه‌مال", "کون‌گشاد", "زن جنده", "جقی",
+        "کیرکلفت", "کص‌شانس", "خایه‌سنگی", "کیرشکسته", "کون‌سوخته", "حروم‌دست"
     ]
     new_perk = random.choice(perk_pool)
     db.set_user_perk(user.id, chat_id, new_perk)
@@ -985,7 +1005,17 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.update_size(user.id, chat_id, 5)
 
     perk_extra_msg = ""
-    if new_perk == "زن جنده":
+    if new_perk == "کیرکلفت":
+        bonus = random.randint(10, 25)
+        current_size += bonus
+        db.update_size(user.id, chat_id, bonus)
+        perk_extra_msg = f"\n💪 علاوه بر این، {bonus} سانت اضافه هم گیرت اومد!"
+    elif new_perk == "کیرشکسته":
+        penalty = random.randint(10, 20)
+        current_size -= penalty
+        db.update_size(user.id, chat_id, -penalty)
+        perk_extra_msg = f"\n💔 علاوه بر این، {penalty} سانت هم بلافاصله از دست دادی!"
+    elif new_perk == "زن جنده":
         victim = db.get_random_victim(chat_id, user.id, 10)
         if victim:
             victim_id, victim_name, _ = victim
@@ -996,7 +1026,8 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             perk_extra_msg = "\n😅 دنبال قربانی گشتی ولی کسی با سایز کافی پیدا نشد!"
 
-    dropped_item = drop_item(user.id, chat_id)
+    drop_chance = 0.6 if new_perk == "کص‌شانس" else 0.3
+    dropped_item = drop_item(user.id, chat_id, drop_chance)
     item_msg = f"\n🎁 شما یک آیتم پیدا کردید: **{dropped_item}**\n📝 توضیحات: {ITEM_DESCRIPTIONS.get(dropped_item, '')}" if dropped_item else ""
 
     verb = "بزرگ شد" if delta >= 0 else "کوچک شد"
