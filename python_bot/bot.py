@@ -364,17 +364,42 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 MIN_CONSENSUS_PLAYERS = 3
 CONSENSUS_STEAL_RATIO = 0.30
+CONSENSUS_VOTE_WINDOW_SECONDS = 3600
 
 def render_consensus_message(target_name, amount, required_votes, total_players, voters):
     lines = [
         f"⚖️ اجماع علیه {target_name}",
         f"در صورت رای‌آوری، {int(amount)} سانتی‌متر از {target_name} کم می‌شود.",
         f"برای موفقیت نیاز به {required_votes} رای موافق از {total_players} عضو گروه است.",
+        "⏰ مهلت رای‌گیری: ۱ ساعت.",
     ]
     if voters:
         lines.append("\n🗳️ رای‌ها:")
         lines.extend(f"{'✅' if choice == 'yes' else '❌'} {name}" for name, choice in voters)
     return "\n".join(lines)
+
+async def consensus_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    job_data = context.job.data
+    vote_id = job_data["vote_id"]
+    chat_id = job_data["chat_id"]
+    message_id = job_data["message_id"]
+
+    consensus = db.get_consensus(vote_id)
+    if not consensus:
+        return
+    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status = consensus
+    if status != 'open':
+        return  # already resolved (success or early failure) by a vote before the deadline
+
+    db.fail_open_consensus(chat_id, target_id)
+    voters = db.get_consensus_voters(vote_id)
+    msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
+    msg += "\n\n⏰ مهلت یک‌ساعتهٔ اجماع تمام شد و به حد نصاب نرسید! اجماع شکست خورد."
+    msg += f"\n🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود."
+    try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=msg)
+    except:
+        pass
 
 def build_consensus_keyboard(vote_id, yes_count, no_count):
     return InlineKeyboardMarkup([[
@@ -435,9 +460,15 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vote_id = db.create_consensus(chat_id, target_user_id, target_first_name, user.id, user.first_name, amount, required_votes, player_count)
 
     voters = db.get_consensus_voters(vote_id)
-    await update.message.reply_text(
+    sent_message = await update.message.reply_text(
         render_consensus_message(target_first_name, amount, required_votes, player_count, voters),
         reply_markup=build_consensus_keyboard(vote_id, 1, 0)
+    )
+    context.job_queue.run_once(
+        consensus_timeout_job,
+        when=CONSENSUS_VOTE_WINDOW_SECONDS,
+        data={"vote_id": vote_id, "chat_id": chat_id, "message_id": sent_message.message_id},
+        name=f"consensus_timeout_{vote_id}"
     )
 
 async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
