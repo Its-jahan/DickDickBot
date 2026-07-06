@@ -46,8 +46,8 @@ def get_dick_name(size):
         return "کیررررر"
 
 def build_top_text(chat_id):
-    """Build the group leaderboard message. Returns None if the group has no players."""
-    rows = db.get_top_users(chat_id, 10)
+    """Build the group leaderboard message (every participant). Returns None if the group has no players."""
+    rows = db.get_top_users(chat_id)
     if not rows:
         return None
     msg = "🏆 برترین‌های این گروه:\n\n"
@@ -81,12 +81,19 @@ challenges = {}
 #              "bets": {user_id: (side, amount, first_name)}}
 active_bet_matches = {}
 BET_AMOUNTS = [5, 10, 50, 100]
-BET_WINDOW_SECONDS = 45
+BET_WINDOW_SECONDS = 20
 
 def build_bet_keyboard(match_id):
-    win_row = [InlineKeyboardButton(f"✅ می‌بره {amt}", callback_data=f"bet_{match_id}_win_{amt}") for amt in BET_AMOUNTS]
-    lose_row = [InlineKeyboardButton(f"❌ می‌بازه {amt}", callback_data=f"bet_{match_id}_lose_{amt}") for amt in BET_AMOUNTS]
-    return InlineKeyboardMarkup([win_row, lose_row])
+    # One row per amount (win/lose side by side) so labels stay readable on small screens,
+    # instead of cramming 4 buttons into a single row.
+    rows = [
+        [
+            InlineKeyboardButton(f"✅ برد {amt}", callback_data=f"bet_{match_id}_win_{amt}"),
+            InlineKeyboardButton(f"❌ باخت {amt}", callback_data=f"bet_{match_id}_lose_{amt}"),
+        ]
+        for amt in BET_AMOUNTS
+    ]
+    return InlineKeyboardMarkup(rows)
 
 PERK_DESCRIPTIONS = {
     "عادی": "شما امروز پرک خاصی نگرفتید (عادی 👤).",
@@ -1208,7 +1215,7 @@ async def show_inv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     db.init_db()
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     
     app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     

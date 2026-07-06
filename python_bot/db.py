@@ -223,10 +223,14 @@ def get_user_info(user_id, chat_id):
         return c.fetchone()
 
 
-def get_top_users(chat_id, limit=10):
+def get_top_users(chat_id, limit=None):
+    """Returns every player in the group ordered by size, unless limit caps it."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT first_name, size FROM users WHERE chat_id = %s ORDER BY size DESC LIMIT %s', (chat_id, limit))
+        if limit:
+            c.execute('SELECT first_name, size FROM users WHERE chat_id = %s ORDER BY size DESC LIMIT %s', (chat_id, limit))
+        else:
+            c.execute('SELECT first_name, size FROM users WHERE chat_id = %s ORDER BY size DESC', (chat_id,))
         return c.fetchall()
 
 
