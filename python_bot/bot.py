@@ -378,7 +378,7 @@ async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه ندارید! سایز فعلی شما: {int(user_size)}")
         return
         
-    keyboard = [[InlineKeyboardButton("پذیرش چالش ⚔️", callback_data=f"chal_{user.id}_{bet}")]]
+    keyboard = [[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=f"chal_{user.id}_{bet}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
@@ -736,7 +736,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title=f"⚔️ چالش ({bet} سانت)",
         description=f"ایجاد چالش با شرط {bet} سانتی‌متر",
         input_message_content=InputTextMessageContent(f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر ایجاد کرد!\nاولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود."),
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پذیرش چالش ⚔️", callback_data=f"chal_{user.id}_{bet}")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=f"chal_{user.id}_{bet}")]])
     )
     
     results = [
