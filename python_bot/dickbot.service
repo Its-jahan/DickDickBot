@@ -1,0 +1,12 @@
+[Unit]
+Description=Dick Grower Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/DickDickBot
+ExecStart=/opt/DickDickBot/venv/bin/python bot.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

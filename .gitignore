@@ -1,0 +1,6 @@
+/target
+/data
+.env
+.idea
+dickbot_backup_local.db
+.claude/
