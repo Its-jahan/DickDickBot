@@ -711,12 +711,24 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_size += 5
         db.update_size(user.id, chat_id, 5)
 
+    perk_extra_msg = ""
+    if new_perk == "زن جنده":
+        victim = db.get_random_victim(chat_id, user.id, 10)
+        if victim:
+            victim_id, victim_name, _ = victim
+            db.update_size(victim_id, chat_id, -5)
+            db.update_size(user.id, chat_id, 5)
+            current_size += 5
+            perk_extra_msg = f"\n😈 شانس آوردی! از **{victim_name}** به‌زور ۵ سانت گرفتی!"
+        else:
+            perk_extra_msg = "\n😅 دنبال قربانی گشتی ولی کسی با سایز کافی پیدا نشد!"
+
     dropped_item = drop_item(user.id, chat_id)
     item_msg = f"\n🎁 شما یک آیتم پیدا کردید: **{dropped_item}**\n📝 توضیحات: {ITEM_DESCRIPTIONS.get(dropped_item, '')}" if dropped_item else ""
 
     verb = "بزرگ شد" if delta >= 0 else "کوچک شد"
     d_name = get_dick_name(current_size)
-    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{item_msg}"
+    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
     
     await query.answer(f"{d_name} شما تغییر کرد!")
     try:
