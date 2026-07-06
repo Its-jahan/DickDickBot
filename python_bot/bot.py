@@ -19,6 +19,13 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Failed to send reminder to {cid}: {e}")
 
+def roll_nonzero(low, high):
+    """random.randint(low, high) but re-rolled until it's not 0 (growth must always change something)."""
+    delta = random.randint(low, high)
+    while delta == 0:
+        delta = random.randint(low, high)
+    return delta
+
 def get_dick_name(size):
     if size < 0:
         return "شاه کص"
@@ -950,12 +957,12 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     if current_size < 50:
-        delta = random.randint(-5, 20)
+        delta = roll_nonzero(-5, 20)
     elif current_size < 150:
-        delta = random.randint(-3, 20)
+        delta = roll_nonzero(-3, 20)
     else:
-        delta = random.randint(-6, 10)
-        
+        delta = roll_nonzero(-6, 10)
+
     db.update_size(user.id, chat_id, delta, today_str)
     
     current_size = current_size + delta
