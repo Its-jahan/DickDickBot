@@ -78,10 +78,22 @@ challenges = {}
 
 # Memory store for spectator betting on ongoing 1v1 matches.
 # match_id -> {"chat_id", "challenger_id", "challenger_name", "acceptor_id", "acceptor_name",
-#              "bets": {user_id: (side, amount, first_name)}}
+#              "bet", "bets": {user_id: (side, amount, first_name)}}
 active_bet_matches = {}
 BET_AMOUNTS = [5, 10, 50, 100]
 BET_WINDOW_SECONDS = 20
+
+def render_bet_message(match_state):
+    lines = [
+        f"⚔️ مسابقه بین {match_state['challenger_name']} و {match_state['acceptor_name']} بر سر {match_state['bet']} سانتی‌متر آغاز شد!",
+        f"🎰 تا {BET_WINDOW_SECONDS} ثانیه بقیهٔ اعضای گروه می‌تونن رو نتیجه شرط ببندن (شروع‌کننده = {match_state['challenger_name']}):",
+    ]
+    if match_state["bets"]:
+        lines.append("\n📋 شرط‌های ثبت‌شده تا الان:")
+        for side, amount, name in match_state["bets"].values():
+            side_fa = "برد" if side == "win" else "باخت"
+            lines.append(f"- {name}: {amount} سانت گذاشت روی {side_fa} {match_state['challenger_name']}")
+    return "\n".join(lines)
 
 def build_bet_keyboard(match_id):
     # One row per amount (win/lose side by side) so labels stay readable on small screens,
@@ -680,13 +692,13 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         "challenger_name": challenger_name,
         "acceptor_id": user.id,
         "acceptor_name": user.first_name,
+        "bet": bet,
         "bets": {},
     }
 
     await query.answer("چالش پذیرفته شد!")
     await query.edit_message_text(
-        f"⚔️ مسابقه بین {challenger_name} و {user.first_name} بر سر {bet} سانتی‌متر آغاز شد!\n"
-        f"🎰 تا {BET_WINDOW_SECONDS} ثانیه بقیهٔ اعضای گروه می‌تونن رو نتیجه شرط ببندن (شروع‌کننده = {challenger_name}):",
+        render_bet_message(active_bet_matches[match_id]),
         reply_markup=build_bet_keyboard(match_id)
     )
 
@@ -772,7 +784,9 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         msg = f"⚔️ مسابقه بین {challenger_name} و {user.first_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {user.first_name}: {val2}\n\n🤝 مساوی شد! هیچکس چیزی از دست نداد."
         msg += msg_item_log
         if bets:
-            msg += "\n\n🎰 چون مساوی شد، شرط‌بندی‌های تماشاگران باطل شد و هیچی از کسی کم/زیاد نشد."
+            for bettor_id, (_, amount, _) in bets.items():
+                db.update_size(bettor_id, chat_id, amount)  # refund the staked amount
+            msg += "\n\n🎰 چون مساوی شد، شرط‌بندی‌های تماشاگران باطل شد و سانتی که گذاشته بودن بهشون برگشت."
         msg += "\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
         keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{challenger_id}_{user.id}_{bet}")]]
         await query.edit_message_text(text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -830,15 +844,17 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
     msg += f"\n📉 {l_dname} {loser_name} شد {int(loser_size)} سانتی‌متر!"
 
     if bets:
+        # Bettors already had their stake deducted the moment they placed the bet (see
+        # place_bet_callback), so a correct guess pays back double the stake (stake + winnings)
+        # and a wrong guess pays back nothing - the staked amount is simply gone.
         correct_side = "win" if winner_id == challenger_id else "lose"
         msg += "\n\n🎰 نتیجهٔ شرط‌بندی‌ها:"
         for bettor_id, (side, amount, bettor_name) in bets.items():
             if side == correct_side:
-                db.update_size(bettor_id, chat_id, amount)
-                msg += f"\n✅ {bettor_name} (+{int(amount)})"
+                db.update_size(bettor_id, chat_id, amount * 2)
+                msg += f"\n✅ {bettor_name}: {int(amount)} گذاشت و {int(amount * 2)} گرفت (سود {int(amount)})"
             else:
-                db.update_size(bettor_id, chat_id, -amount)
-                msg += f"\n❌ {bettor_name} (-{int(amount)})"
+                msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"
 
     await query.edit_message_text(text=msg)
 
@@ -865,9 +881,30 @@ async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("شما قبلاً روی این مسابقه شرط بسته‌اید!", show_alert=True)
         return
 
+    chat_id = match_state["chat_id"]
+    user_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    if user_size < amount:
+        await query.answer(f"شما به اندازه کافی سانتی‌متر ندارید! سایز فعلی شما: {int(user_size)}", show_alert=True)
+        return
+
+    # Stake the bet immediately: deducted now, paid back double on a correct guess,
+    # gone for good on a wrong one (see the settlement logic in accept_challenge_callback).
+    db.update_size(user.id, chat_id, -amount)
     match_state["bets"][user.id] = (side, amount, user.first_name)
     side_fa = "برد" if side == "win" else "باخت"
-    await query.answer(f"شرط شما ثبت شد: {amount} سانت روی {side_fa} {match_state['challenger_name']}!", show_alert=True)
+    await query.answer(
+        f"{amount} سانت گذاشتید روی {side_fa} {match_state['challenger_name']}! "
+        f"اگه درست حدس بزنید {amount * 2} سانت می‌گیرید، وگرنه همین {amount} سانت از دست میره.",
+        show_alert=True
+    )
+
+    try:
+        await query.edit_message_text(
+            render_bet_message(match_state),
+            reply_markup=build_bet_keyboard(match_id)
+        )
+    except:
+        pass
 
 # Track rematch agreements: key = "p1_p2_bet", value = set of user_ids who agreed
 rematch_agreements = {}
