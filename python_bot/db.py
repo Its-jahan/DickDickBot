@@ -209,6 +209,19 @@ def get_global_top_users(limit=10):
         return c.fetchall()
 
 
+def get_random_victim(chat_id, exclude_user_id, min_size):
+    """Pick a random other user in the group with size > min_size. Returns (user_id, first_name, size) or None."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, first_name, size FROM users '
+            'WHERE chat_id = %s AND user_id != %s AND size > %s '
+            'ORDER BY random() LIMIT 1',
+            (chat_id, exclude_user_id, min_size)
+        )
+        return c.fetchone()
+
+
 def get_user_rank(user_id, chat_id):
     with get_connection() as conn:
         c = conn.cursor()
