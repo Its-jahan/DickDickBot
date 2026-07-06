@@ -1,54 +1,50 @@
-[@DickGrowerBot](https://t.me/DickGrowerBot)
-============================================
+# 🍆 DickDickBot (Python Edition)
 
-[![CI Build](https://github.com/kozalosev/DickGrowerBot/actions/workflows/ci-build.yaml/badge.svg?branch=main&event=push)](https://github.com/kozalosev/DickGrowerBot/actions/workflows/ci-build.yaml) [![@DickGrowerBot MAU](https://tgbotmau.quoi.dev/api/bot/DickGrowerBot/mau/badge?style=flat "@DickGrowerBot MAU")](https://tgbotmau.quoi.dev/?bot=DickGrowerBot)
+ربات تلگرامی برای رشد دودول، بازی در لیگ‌های گروهی و ایجاد چالش با دوستان! این ربات بر پایه پایتون و دیتابیس SQLite نوشته شده و کاملاً با گروه‌های تلگرامی سازگار است.
 
-A game bot for group chats that let its users grow their virtual "dicks" every day for some random count of centimeters (including negative values) and compete with friends and other chat members.
+## 🌟 ویژگی‌ها
 
-Additional mechanics
---------------------
-_(compared with some competitors)_
+- **لیگ‌های گروهی:** هر گروه لیدربرد و سایز مستقل خودش را دارد!
+- **چالش‌ها (PvP):** می‌توانید با دوستانتان شرط‌بندی کنید و تاس بریزید.
+- **اینلاین بات (`@dickchallengerbot`):** تمامی امکانات ربات بدون شلوغ کردن گروه از طریق دکمه‌های شیشه‌ای (Inline) در دسترس هستند.
+- **سیستم آیتم‌ها (Inventory):** امکان پیدا کردن آیتم‌های مختلف (ویاگرا، شیر موز، کاندوم و...) و استفاده از آن‌ها در چالش‌ها برای تغییر نتیجه.
+- **پرک‌های روزانه (Perks):** هر روز بعد از رشد دادن، یک لقب/پرک به شما داده می‌شود که روی شانس شما در چالش‌ها تأثیر می‌گذارد (مثلاً کص‌کش، خایه‌مال و غیره).
+- **اهدای سایز:** می‌توانید از سایز خودتان به دوستانتان اهدا کنید.
 
-* **The Dick of the Day** daily contest to grow a randomly chosen dick for a bit more.
-* A way to play the game without the necessity to add the bot into a group (via inline queries with a callback button).
-* Import from _@pipisabot_ and _@kraft28_bot_ (not tested! help of its users is required).
-* PvP fights with statistics.
+## 🎮 دستورات
 
-### Soon (but not very, I guess)
-* an option to show mercy and return the award for the battle back;
-* support for those who loses battles the most;
-* more perks;
-* achievements;
-* referral promo codes;
-* global monthly events;
-* a shop.
+- `/d` یا `/grow` یا `/dick` - رشد دادن دودول
+- `/c [عدد]` یا `/challenge [عدد]` - ایجاد یک چالش با شرط دلخواه
+- `/t` یا `/top` - نمایش لیدربرد گروه
+- `/i` یا `/inv` - نمایش کیف پول آیتم‌ها
+- `/u [نام آیتم]` یا `/use [نام آیتم]` - استفاده از یک آیتم در چالش بعدی
+- `/dd @username [مقدار]` - اهدای سایز به شخص دیگر
 
-Features
---------
-* true system random from the environment's chaos by usage of the `get_random()` syscall (`BCryptGenRandom` on Windows, or other alternatives on different OSes);
-* English and Russian translations;
-* Prometheus-like metrics.
+## 🚀 استقرار و نصب
 
-Technical stuff
----------------
-
-### Requirements to run
-* PostgreSQL;
-* _\[optional]_ Docker (it makes the configuration a lot easier);
-* _\[for webhook mode]_ a frontal proxy server with TLS support ([nginx-proxy](https://github.com/nginx-proxy/nginx-proxy), for example).
-
-### How to rebuild .sqlx queries?
-_(to build the application without a running RDBMS)_
-
-```shell
-cargo sqlx prepare -- --tests
+۱. کلون کردن ریپازیتوری:
+```bash
+git clone https://github.com/Its-jahan/DickDickBot.git
+cd DickDickBot/python_bot
 ```
 
-### Adjustment hints
+۲. نصب پیش‌نیازها:
+```bash
+pip install -r requirements.txt
+```
 
-It's most probably you want to change the value of the `GROW_SHRINK_RATIO` environment variable to make the players upset and disappointed more or less often.
+۳. تنظیم توکن در فایل `bot.py`:
+```python
+TOKEN = 'YOUR_BOT_TOKEN_HERE'
+```
 
-### How to disable a command?
+۴. اجرای ربات:
+```bash
+python bot.py
+```
+*(یا استفاده از فایل سرویس `dickbot.service` برای اجرای بک‌گراند)*
 
-Most of the command can be hidden from both lists: command hints and inline results. To do so, specify an environment variable like `DISABLE_CMD_STATS` (where `STATS` is a command key) with any value.
-Don't forget to pass this variable to the container by adding it to the `docker-compose.yml` file!
+## 📦 بکاپ‌گیری
+
+دیتابیس در فایل `dickbot.db` ذخیره می‌شود. حتماً به‌صورت دوره‌ای از آن بکاپ بگیرید.
+
