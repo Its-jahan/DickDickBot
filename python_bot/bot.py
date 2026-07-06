@@ -2,11 +2,18 @@ import logging
 import random
 import datetime
 from datetime import time
+from zoneinfo import ZoneInfo
 import math
 import asyncio
 from telegram import Update, Chat, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, InlineQueryHandler, CallbackQueryHandler
 from uuid import uuid4
+
+IRAN_TZ = ZoneInfo("Asia/Tehran")
+
+def tehran_today_str():
+    """The current date (YYYY-MM-DD) in Iran time, used as the daily reset key for growth."""
+    return datetime.datetime.now(IRAN_TZ).date().isoformat()
 
 import db
 
@@ -163,7 +170,7 @@ async def dick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     current_size, last_grown, current_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
     
-    today_str = datetime.date.today().isoformat()
+    today_str = tehran_today_str()
     if last_grown == today_str:
         await update.message.reply_text("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.")
         return
@@ -424,7 +431,7 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     _, initiator_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    today_str = datetime.date.today().isoformat()
+    today_str = tehran_today_str()
     if initiator_last_grown != today_str:
         await update.message.reply_text("فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن اجماع راه بندازن!")
         return
@@ -514,7 +521,7 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     _, voter_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    today_str = datetime.date.today().isoformat()
+    today_str = tehran_today_str()
     if voter_last_grown != today_str:
         await query.answer("فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن به اجماع رای بدن!", show_alert=True)
         return
@@ -951,7 +958,7 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     current_size, last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    today_str = datetime.date.today().isoformat()
+    today_str = tehran_today_str()
     if last_grown == today_str:
         await query.answer("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.", show_alert=True)
         return
@@ -1172,7 +1179,7 @@ if __name__ == '__main__':
     db.init_db()
     app = ApplicationBuilder().token(TOKEN).build()
     
-    app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0))
+    app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', start))
