@@ -62,6 +62,18 @@ TOKEN = '8802494355:AAFYiGyKph3R8wLiZoeDsELOPx07Q9ZvuVw'
 # Format: challenges[target_user_id] = challenger_user_id
 challenges = {}
 
+# Memory store for spectator betting on ongoing 1v1 matches.
+# match_id -> {"chat_id", "challenger_id", "challenger_name", "acceptor_id", "acceptor_name",
+#              "bets": {user_id: (side, amount, first_name)}}
+active_bet_matches = {}
+BET_AMOUNTS = [5, 10, 50, 100]
+BET_WINDOW_SECONDS = 45
+
+def build_bet_keyboard(match_id):
+    win_row = [InlineKeyboardButton(f"✅ می‌بره {amt}", callback_data=f"bet_{match_id}_win_{amt}") for amt in BET_AMOUNTS]
+    lose_row = [InlineKeyboardButton(f"❌ می‌بازه {amt}", callback_data=f"bet_{match_id}_lose_{amt}") for amt in BET_AMOUNTS]
+    return InlineKeyboardMarkup([win_row, lose_row])
+
 PERK_DESCRIPTIONS = {
     "عادی": "شما امروز پرک خاصی نگرفتید (عادی 👤).",
     "جاکش": "شما پرک **جاکش 🤡** گرفتید! (از بردهای چالش ۵۰٪ کمتر سایز میگیرید).",
@@ -353,6 +365,23 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 MIN_CONSENSUS_PLAYERS = 3
 CONSENSUS_STEAL_RATIO = 0.30
 
+def render_consensus_message(target_name, amount, required_votes, total_players, voters):
+    lines = [
+        f"⚖️ اجماع علیه {target_name}",
+        f"در صورت رای‌آوری، {int(amount)} سانتی‌متر از {target_name} کم می‌شود.",
+        f"برای موفقیت نیاز به {required_votes} رای موافق از {total_players} عضو گروه است.",
+    ]
+    if voters:
+        lines.append("\n🗳️ رای‌ها:")
+        lines.extend(f"{'✅' if choice == 'yes' else '❌'} {name}" for name, choice in voters)
+    return "\n".join(lines)
+
+def build_consensus_keyboard(vote_id, yes_count, no_count):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ موافقم ({yes_count})", callback_data=f"ejmavote_{vote_id}_yes"),
+        InlineKeyboardButton(f"❌ مخالفم ({no_count})", callback_data=f"ejmavote_{vote_id}_no"),
+    ]])
+
 async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -383,7 +412,7 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if remaining is not None:
         hours = max(1, int(remaining.total_seconds() // 3600))
         await update.message.reply_text(
-            f"اجماع قبلی علیه {target_first_name} شکست خورده بود! تا حدود {hours} ساعت دیگر نمی‌شود دوباره علیه او اجماع کرد."
+            f"{target_first_name} در حال حاضر در برابر اجماع محافظت‌شده است! تا حدود {hours} ساعت دیگر نمی‌شود دوباره علیه او اجماع کرد."
         )
         return
 
@@ -403,14 +432,12 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     required_votes = player_count // 2 + 1
     amount = max(1, round(target_size * CONSENSUS_STEAL_RATIO))
 
-    vote_id = db.create_consensus(chat_id, target_user_id, target_first_name, user.id, amount, required_votes)
+    vote_id = db.create_consensus(chat_id, target_user_id, target_first_name, user.id, user.first_name, amount, required_votes, player_count)
 
-    keyboard = [[InlineKeyboardButton(f"✅ رای به اجماع (1/{required_votes})", callback_data=f"ejmavote_{vote_id}")]]
+    voters = db.get_consensus_voters(vote_id)
     await update.message.reply_text(
-        f"⚖️ {user.first_name} درخواست اجماع علیه {target_first_name} داد!\n"
-        f"در صورت رای‌آوری، {int(amount)} سانتی‌متر از {target_first_name} (سایز فعلی: {int(target_size)}) کم می‌شود.\n"
-        f"برای موفقیت نیاز به {required_votes} رای از {player_count} عضو گروه است.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        render_consensus_message(target_first_name, amount, required_votes, player_count, voters),
+        reply_markup=build_consensus_keyboard(vote_id, 1, 0)
     )
 
 async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,16 +450,17 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     data = query.data.split('_')
-    if len(data) != 2 or data[0] != 'ejmavote':
+    if len(data) != 3 or data[0] != 'ejmavote':
         return
     vote_id = int(data[1])
+    choice = data[2]
 
     consensus = db.get_consensus(vote_id)
     if not consensus:
         await query.answer("این رای‌گیری وجود ندارد!", show_alert=True)
         return
 
-    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, status = consensus
+    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status = consensus
 
     if status != 'open':
         await query.answer("این رای‌گیری دیگر فعال نیست!", show_alert=True)
@@ -444,29 +472,43 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
 
     db.get_user(user.id, chat_id, user.username, user.first_name)
 
-    is_new_vote = db.cast_consensus_vote(vote_id, user.id)
+    is_new_vote = db.cast_consensus_vote(vote_id, user.id, user.first_name, choice)
     if not is_new_vote:
         await query.answer("شما قبلاً رای داده بودید!", show_alert=True)
         return
 
-    vote_count = db.count_consensus_votes(vote_id)
+    yes_count, no_count = db.get_consensus_vote_counts(vote_id)
+    voters = db.get_consensus_voters(vote_id)
 
-    if vote_count >= required_votes:
+    if yes_count >= required_votes:
         if db.resolve_consensus_success(vote_id):
             db.update_size(target_id, chat_id, -amount)
             new_size, _, _ = db.get_user(target_id, chat_id, None, None)
             await query.answer("اجماع موفق شد!")
-            await query.edit_message_text(
-                f"⚖️ اجماع علیه {target_name} با {vote_count} رای موفق شد!\n"
-                f"📉 {int(amount)} سانتی‌متر از {target_name} کم شد.\n"
-                f"اندازه جدید: {int(new_size)} سانتی‌متر."
-            )
+            msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
+            msg += f"\n\n🎉 اجماع با {yes_count} رای موافق موفق شد!"
+            msg += f"\n📉 {int(amount)} سانتی‌متر از {target_name} کم شد. اندازه جدید: {int(new_size)} سانتی‌متر."
+            msg += f"\n🛡️ {target_name} تا ۶ روز در برابر اجماع جدید محافظت می‌شود."
+            await query.edit_message_text(msg)
         return
 
-    await query.answer(f"رای شما ثبت شد! ({vote_count}/{required_votes})")
-    keyboard = [[InlineKeyboardButton(f"✅ رای به اجماع ({vote_count}/{required_votes})", callback_data=f"ejmavote_{vote_id}")]]
+    # Early failure: if the remaining eligible voters could never push "yes" to the required threshold, stop now.
+    remaining_pool = total_players - 1 - (yes_count + no_count)  # -1 excludes the target, who can't vote
+    if yes_count + remaining_pool < required_votes:
+        db.fail_open_consensus(chat_id, target_id)
+        await query.answer("اجماع شکست خورد!")
+        msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
+        msg += f"\n\n💔 اجماع دیگر شانسی برای رای‌آوری نداشت و شکست خورد!"
+        msg += f"\n🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود."
+        await query.edit_message_text(msg)
+        return
+
+    await query.answer(f"رای شما ({'موافق' if choice == 'yes' else 'مخالف'}) ثبت شد!")
     try:
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            render_consensus_message(target_name, amount, required_votes, total_players, voters),
+            reply_markup=build_consensus_keyboard(vote_id, yes_count, no_count)
+        )
     except:
         pass
 
@@ -554,14 +596,31 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
     challenger_info = db.get_user_info(challenger_id, chat_id)
     challenger_name = challenger_info[0] if challenger_info else "ناشناس"
         
-    await query.answer("چالش پذیرفته شد!")
-    await query.edit_message_text(f"⚔️ مسابقه بین {challenger_name} و {user.first_name} بر سر {bet} سانتی‌متر آغاز شد!\nدر حال ریختن تاس...")
-    
     val1 = random.randint(1, 6)
     val2 = random.randint(1, 6)
-    
-    await asyncio.sleep(2)
-    
+
+    match_id = str(uuid4())
+    active_bet_matches[match_id] = {
+        "chat_id": chat_id,
+        "challenger_id": challenger_id,
+        "challenger_name": challenger_name,
+        "acceptor_id": user.id,
+        "acceptor_name": user.first_name,
+        "bets": {},
+    }
+
+    await query.answer("چالش پذیرفته شد!")
+    await query.edit_message_text(
+        f"⚔️ مسابقه بین {challenger_name} و {user.first_name} بر سر {bet} سانتی‌متر آغاز شد!\n"
+        f"🎰 تا {BET_WINDOW_SECONDS} ثانیه بقیهٔ اعضای گروه می‌تونن رو نتیجه شرط ببندن (شروع‌کننده = {challenger_name}):",
+        reply_markup=build_bet_keyboard(match_id)
+    )
+
+    await asyncio.sleep(BET_WINDOW_SECONDS)
+
+    match_state = active_bet_matches.pop(match_id, None)
+    bets = match_state["bets"] if match_state else {}
+
     c_perk = challenger_row[2]
     
     # Active Items
@@ -636,6 +695,8 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
     else:
         msg = f"⚔️ مسابقه بین {challenger_name} و {user.first_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {user.first_name}: {val2}\n\n🤝 مساوی شد! هیچکس چیزی از دست نداد."
         msg += msg_item_log
+        if bets:
+            msg += "\n\n🎰 چون مساوی شد، شرط‌بندی‌های تماشاگران باطل شد و هیچی از کسی کم/زیاد نشد."
         msg += "\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
         keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{challenger_id}_{user.id}_{bet}")]]
         await query.edit_message_text(text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -677,18 +738,56 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         msg += f"\n({winner_perk} باعث شد برنده {winner_gain} سانت گیرش بیاد)"
     if loser_perk == "لاشی" and loser_loss > 0:
         msg += f"\n(لاشی باعث شد بازنده فقط {loser_loss} سانت از دست بده)"
-    
+
     # Fetch new stats
     winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
     loser_size, _, _ = db.get_user(loser_id, chat_id, None, None)
-    
+
     w_dname = get_dick_name(winner_size)
     l_dname = get_dick_name(loser_size)
-    
+
     msg += f"\n\n📈 {w_dname} {winner_name} شد {int(winner_size)} سانتی‌متر!"
     msg += f"\n📉 {l_dname} {loser_name} شد {int(loser_size)} سانتی‌متر!"
-    
+
+    if bets:
+        correct_side = "win" if winner_id == challenger_id else "lose"
+        msg += "\n\n🎰 نتیجهٔ شرط‌بندی‌ها:"
+        for bettor_id, (side, amount, bettor_name) in bets.items():
+            if side == correct_side:
+                db.update_size(bettor_id, chat_id, amount)
+                msg += f"\n✅ {bettor_name} (+{int(amount)})"
+            else:
+                db.update_size(bettor_id, chat_id, -amount)
+                msg += f"\n❌ {bettor_name} (-{int(amount)})"
+
     await query.edit_message_text(text=msg)
+
+async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    data = query.data.split('_')
+    if len(data) != 4 or data[0] != 'bet':
+        return
+    match_id, side, amount_str = data[1], data[2], data[3]
+    amount = int(amount_str)
+
+    match_state = active_bet_matches.get(match_id)
+    if not match_state:
+        await query.answer("زمان شرط‌بندی این مسابقه تموم شده یا نامعتبره!", show_alert=True)
+        return
+
+    if user.id in (match_state["challenger_id"], match_state["acceptor_id"]):
+        await query.answer("شرکت‌کننده‌های مسابقه نمی‌تونن روی مسابقه خودشون شرط ببندن!", show_alert=True)
+        return
+
+    if user.id in match_state["bets"]:
+        await query.answer("شما قبلاً روی این مسابقه شرط بسته‌اید!", show_alert=True)
+        return
+
+    match_state["bets"][user.id] = (side, amount, user.first_name)
+    side_fa = "برد" if side == "win" else "باخت"
+    await query.answer(f"شرط شما ثبت شد: {amount} سانت روی {side_fa} {match_state['challenger_name']}!", show_alert=True)
 
 # Track rematch agreements: key = "p1_p2_bet", value = set of user_ids who agreed
 rematch_agreements = {}
@@ -1044,6 +1143,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(grow_callback, pattern=r'^grow_self_'))
     app.add_handler(CallbackQueryHandler(use_item_callback, pattern=r'^useitem_'))
     app.add_handler(CallbackQueryHandler(consensus_vote_callback, pattern=r'^ejmavote_'))
+    app.add_handler(CallbackQueryHandler(place_bet_callback, pattern=r'^bet_'))
     app.add_handler(CallbackQueryHandler(show_top_callback, pattern=r'^showtop_'))
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))
     app.add_handler(CallbackQueryHandler(show_inv_callback, pattern=r'^showinv_'))

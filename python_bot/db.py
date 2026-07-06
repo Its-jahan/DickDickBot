@@ -89,19 +89,25 @@ def init_db():
                 initiator_id BIGINT,
                 amount DOUBLE PRECISION,
                 required_votes INTEGER,
+                total_players INTEGER,
                 status TEXT DEFAULT 'open',
                 created_at TIMESTAMPTZ DEFAULT now(),
                 resolved_at TIMESTAMPTZ
             )
         ''')
+        c.execute("ALTER TABLE consensus_votes ADD COLUMN IF NOT EXISTS total_players INTEGER")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS consensus_vote_casts (
                 vote_id INTEGER REFERENCES consensus_votes(id),
                 user_id BIGINT,
+                first_name TEXT,
+                choice TEXT DEFAULT 'yes',
                 PRIMARY KEY (vote_id, user_id)
             )
         ''')
+        c.execute("ALTER TABLE consensus_vote_casts ADD COLUMN IF NOT EXISTS first_name TEXT")
+        c.execute("ALTER TABLE consensus_vote_casts ADD COLUMN IF NOT EXISTS choice TEXT DEFAULT 'yes'")
 
 
 def set_last_chat(user_id, chat_id):
@@ -328,18 +334,26 @@ def get_group_player_count(chat_id):
 
 
 def get_consensus_protection_remaining(chat_id, target_id):
-    """Returns a timedelta if the target is still protected after a failed consensus, else None."""
+    """Returns a timedelta if the target is still protected, else None.
+    A failed consensus grants 3 days of protection; a succeeded one grants 6 days
+    (so a target can't be hit by consensus over and over)."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT resolved_at + interval '3 days' - now() FROM consensus_votes "
-            "WHERE chat_id = %s AND target_id = %s AND status = 'failed' "
-            "AND resolved_at + interval '3 days' > now() "
-            "ORDER BY resolved_at DESC LIMIT 1",
-            (chat_id, target_id)
+            """
+            SELECT MAX(protect_until) - now() FROM (
+                SELECT resolved_at + interval '3 days' AS protect_until FROM consensus_votes
+                WHERE chat_id = %s AND target_id = %s AND status = 'failed'
+                UNION ALL
+                SELECT resolved_at + interval '6 days' AS protect_until FROM consensus_votes
+                WHERE chat_id = %s AND target_id = %s AND status = 'succeeded'
+            ) t
+            WHERE protect_until > now()
+            """,
+            (chat_id, target_id, chat_id, target_id)
         )
         row = c.fetchone()
-        return row[0] if row else None
+        return row[0] if row and row[0] else None
 
 
 def get_open_consensus(chat_id, target_id):
@@ -362,18 +376,18 @@ def fail_open_consensus(chat_id, target_id):
         )
 
 
-def create_consensus(chat_id, target_id, target_name, initiator_id, amount, required_votes):
+def create_consensus(chat_id, target_id, target_name, initiator_id, initiator_name, amount, required_votes, total_players):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO consensus_votes (chat_id, target_id, target_name, initiator_id, amount, required_votes, status) "
-            "VALUES (%s, %s, %s, %s, %s, %s, 'open') RETURNING id",
-            (chat_id, target_id, target_name, initiator_id, amount, required_votes)
+            "INSERT INTO consensus_votes (chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, 'open') RETURNING id",
+            (chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players)
         )
         vote_id = c.fetchone()[0]
         c.execute(
-            'INSERT INTO consensus_vote_casts (vote_id, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
-            (vote_id, initiator_id)
+            'INSERT INTO consensus_vote_casts (vote_id, user_id, first_name, choice) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING',
+            (vote_id, initiator_id, initiator_name, 'yes')
         )
         return vote_id
 
@@ -382,29 +396,40 @@ def get_consensus(vote_id):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'SELECT chat_id, target_id, target_name, initiator_id, amount, required_votes, status '
+            'SELECT chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status '
             'FROM consensus_votes WHERE id = %s',
             (vote_id,)
         )
         return c.fetchone()
 
 
-def cast_consensus_vote(vote_id, user_id):
+def cast_consensus_vote(vote_id, user_id, first_name, choice):
     """Returns True if this vote was newly recorded, False if the user already voted."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'INSERT INTO consensus_vote_casts (vote_id, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
-            (vote_id, user_id)
+            'INSERT INTO consensus_vote_casts (vote_id, user_id, first_name, choice) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING',
+            (vote_id, user_id, first_name, choice)
         )
         return c.rowcount > 0
 
 
-def count_consensus_votes(vote_id):
+def get_consensus_vote_counts(vote_id):
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM consensus_vote_casts WHERE vote_id = %s', (vote_id,))
-        return c.fetchone()[0]
+        c.execute("SELECT choice, COUNT(*) FROM consensus_vote_casts WHERE vote_id = %s GROUP BY choice", (vote_id,))
+        counts = dict(c.fetchall())
+        return counts.get('yes', 0), counts.get('no', 0)
+
+
+def get_consensus_voters(vote_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT first_name, choice FROM consensus_vote_casts WHERE vote_id = %s ORDER BY user_id',
+            (vote_id,)
+        )
+        return c.fetchall()
 
 
 def resolve_consensus_success(vote_id):
