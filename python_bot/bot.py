@@ -155,6 +155,25 @@ ITEM_DESCRIPTIONS = {
     "اسپری": "فعالش کن تا تاس حریفت رو تو چالش یکی کم کنی."
 }
 
+# Challenge items are "activated" for your next challenge; direct items are applied
+# straight onto a target's size (need someone to target, so no plain "استفاده از X" button).
+CHALLENGE_ITEMS = ["کاندوم", "شیر موز", "سوزن", "طلسم", "اسپری"]
+DIRECT_ITEMS = ["ویاگرا", "قرص اورژانسی", "زعفرون"]
+
+def apply_direct_item(item_name, target_user_id, target_name, chat_id):
+    """Applies a direct item's effect to a target and returns the result message."""
+    if item_name == "ویاگرا":
+        db.update_size(target_user_id, chat_id, 40)
+        return f"شما با ویاگرا ۴۰ سانت به {target_name} اضافه کردید!"
+    elif item_name == "قرص اورژانسی":
+        db.update_size(target_user_id, chat_id, -40)
+        return f"شما با قرص اورژانسی ۴۰ سانت از {target_name} کم کردید!"
+    elif item_name == "زعفرون":
+        loss = random.randint(50, 150)
+        db.update_size(target_user_id, chat_id, -loss)
+        return f"شما با زعفرون {loss} سانت از {target_name} کم کردید!"
+    return "آیتم نامشخص."
+
 def get_target_user(update: Update, text: str, chat_id: int):
     """Helper to find the target user of a command (either by reply or username)"""
     target_user_id = None
@@ -264,14 +283,12 @@ async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!", show_alert=True)
         return
 
-    challenge_items = ["کاندوم", "شیر موز", "سوزن", "طلسم", "اسپری"]
-    direct_items = ["ویاگرا", "قرص اورژانسی", "زعفرون"]
 
-    if item_name in direct_items:
+    if item_name in DIRECT_ITEMS:
         await query.answer(f"برای استفاده از {item_name} باید تو گروه بنویسی:\n/use {item_name} @username", show_alert=True)
         return
         
-    if item_name in challenge_items:
+    if item_name in CHALLENGE_ITEMS:
         current_active = db.get_user_active_item(user.id, chat_id)
         if current_active:
             await query.answer("شما از قبل یک آیتم چالشی فعال دارید! اول در یک چالش شرکت کنید.", show_alert=True)
@@ -284,10 +301,46 @@ async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         db.set_user_active_item(user.id, chat_id, item_name)
         await query.answer(f"آیتم {item_name} با موفقیت فعال شد! تو چالش بعدی اعمال میشه.", show_alert=True)
-        
+
         # update inventory message
         msg, reply_markup = build_inventory_view(user.id, chat_id)
         await query.edit_message_text(msg, reply_markup=reply_markup)
+
+async def use_direct_item_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirms a direct item picked from the "@username" inline flow and applies it."""
+    query = update.callback_query
+    user = query.from_user
+
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
+        return
+
+    data = query.data.split('_')
+    if len(data) != 4 or data[0] != 'udi':
+        return
+    actor_id, target_id, item_name = int(data[1]), int(data[2]), data[3]
+
+    if user.id != actor_id:
+        await query.answer("این دکمه مال شما نیست!", show_alert=True)
+        return
+
+    _, _, user_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+    if user_perk == "کون‌سوخته":
+        await query.answer("شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!", show_alert=True)
+        return
+
+    success = db.use_inventory(user.id, chat_id, item_name)
+    if not success:
+        await query.answer("این آیتم رو دیگه ندارید!", show_alert=True)
+        return
+
+    target_info = db.get_user_info(target_id, chat_id)
+    target_name = target_info[0] if target_info else "ناشناس"
+
+    msg = apply_direct_item(item_name, target_id, target_name, chat_id)
+    await query.answer("انجام شد!")
+    await query.edit_message_text(msg)
 
 async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -319,10 +372,8 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"شما آیتم '{item_name}' را در این گروه ندارید!")
         return
         
-    challenge_items = ["کاندوم", "شیر موز", "سوزن", "طلسم", "اسپری"]
-    direct_items = ["ویاگرا", "قرص اورژانسی", "زعفرون"]
     
-    if item_name in challenge_items:
+    if item_name in CHALLENGE_ITEMS:
         current_active = db.get_user_active_item(user.id, chat_id)
         if current_active:
             await update.message.reply_text("شما از قبل یک آیتم چالشی فعال دارید! اول در یک چالش شرکت کنید.")
@@ -336,23 +387,13 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await update.message.reply_text("آیتم چالشی فعال شد! 🤫 (به دلیل بسته بودن پی‌وی اینجا اعلام کردم)")
             
-    elif item_name in direct_items:
+    elif item_name in DIRECT_ITEMS:
         target_user_id, target_first_name = get_target_user(update, text, chat_id)
         if not target_user_id:
             await update.message.reply_text("باید روی یک نفر ریپلای کنید یا یوزرنیمش رو منشن کنید!")
             return
-            
-        if item_name == "ویاگرا":
-            db.update_size(target_user_id, chat_id, 40)
-            msg = f"شما با ویاگرا ۴۰ سانت به {target_first_name} اضافه کردید!"
-        elif item_name == "قرص اورژانسی":
-            db.update_size(target_user_id, chat_id, -40)
-            msg = f"شما با قرص اورژانسی ۴۰ سانت از {target_first_name} کم کردید!"
-        elif item_name == "زعفرون":
-            loss = random.randint(50, 150)
-            db.update_size(target_user_id, chat_id, -loss)
-            msg = f"شما با زعفرون {loss} سانت از {target_first_name} کم کردید!"
-            
+
+        msg = apply_direct_item(item_name, target_user_id, target_first_name, chat_id)
         db.use_inventory(user.id, chat_id, item_name)
         await update.message.reply_text(msg)
     else:
@@ -1085,9 +1126,69 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.inline_query.from_user
     query = update.inline_query.query.strip()
-    
+
+    # Telegram inline queries never carry "replying to X" context - the bot only ever
+    # sees the typed query text, never which message (if any) you're replying to. So
+    # targeting someone for a direct item has to be done by typing @username in the
+    # inline query itself: "@dickchallengerbot @username" lists your direct items to
+    # use on them, each with a confirm button that applies the effect once tapped.
+    if query.startswith('@') and len(query) > 1:
+        target_username = query[1:].split()[0]
+        last_chat = db.get_last_chat(user.id)
+        results = []
+
+        if not last_chat:
+            results = [InlineQueryResultArticle(
+                id=str(uuid4()),
+                title="⚠️ گروه شما شناخته نشده",
+                description="اول یه بار تو گروه از ربات استفاده کن",
+                input_message_content=InputTextMessageContent("⚠️ اول باید یه بار تو گروه از ربات استفاده کنی تا گروهت رو بشناسه.")
+            )]
+        else:
+            target_row = db.find_user_by_username(target_username, last_chat)
+            if not target_row:
+                results = [InlineQueryResultArticle(
+                    id=str(uuid4()),
+                    title="❌ این فرد پیدا نشد",
+                    description=f"@{target_username} تو این گروه شناخته نشده",
+                    input_message_content=InputTextMessageContent(f"❌ @{target_username} تو این گروه پیدا نشد.")
+                )]
+            elif target_row[0] == user.id:
+                results = [InlineQueryResultArticle(
+                    id=str(uuid4()),
+                    title="❌ نمی‌شه رو خودت استفاده کنی",
+                    description="یه نفر دیگه رو هدف بگیر",
+                    input_message_content=InputTextMessageContent("❌ نمی‌تونی آیتم رو روی خودت استفاده کنی!")
+                )]
+            else:
+                target_id, target_name, _ = target_row
+                owned_direct = [(n, q) for n, q in db.get_inventory(user.id, last_chat) if n in DIRECT_ITEMS]
+                if not owned_direct:
+                    results = [InlineQueryResultArticle(
+                        id=str(uuid4()),
+                        title="🎒 شما آیتمی ندارید",
+                        description="هیچ آیتم قابل‌استفاده‌ای روی این فرد ندارید",
+                        input_message_content=InputTextMessageContent(f"🎒 شما هیچ آیتمی برای استفاده روی {target_name} ندارید.")
+                    )]
+                else:
+                    for item_name, qty in owned_direct:
+                        results.append(InlineQueryResultArticle(
+                            id=str(uuid4()),
+                            title=f"{item_name} ({qty} عدد) روی {target_name}",
+                            description=ITEM_DESCRIPTIONS.get(item_name, ''),
+                            input_message_content=InputTextMessageContent(
+                                f"💊 {user.first_name} می‌خواد از {item_name} روی {target_name} استفاده کنه...\nبرای تایید دکمه زیر رو بزن:"
+                            ),
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                                f"✅ تایید استفاده از {item_name}", callback_data=f"udi_{user.id}_{target_id}_{item_name}"
+                            )]])
+                        ))
+
+        await update.inline_query.answer(results, cache_time=0)
+        return
+
     # We don't have chat_id in inline query, but buttons will resolve it on click
-    
+
     bet = 10
     is_number = False
     if query.isdigit() and int(query) > 0:
@@ -1272,6 +1373,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(use_item_callback, pattern=r'^useitem_'))
     app.add_handler(CallbackQueryHandler(consensus_vote_callback, pattern=r'^ejmavote_'))
     app.add_handler(CallbackQueryHandler(place_bet_callback, pattern=r'^bet_'))
+    app.add_handler(CallbackQueryHandler(use_direct_item_inline_callback, pattern=r'^udi_'))
     app.add_handler(CallbackQueryHandler(show_top_callback, pattern=r'^showtop_'))
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))
     app.add_handler(CallbackQueryHandler(show_inv_callback, pattern=r'^showinv_'))
