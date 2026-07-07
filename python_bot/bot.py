@@ -64,6 +64,25 @@ def build_top_text(chat_id):
         msg += f"{i}. {first_name} ({title}): {int(size)} سانتی‌متر\n"
     return msg
 
+def build_inventory_view(user_id, chat_id):
+    """Builds (message_text, keyboard) for a user's inventory in a group. Returns (None, None) if empty."""
+    items = db.get_inventory(user_id, chat_id)
+    active_item = db.get_user_active_item(user_id, chat_id)
+    if not items and not active_item:
+        return None, None
+
+    msg = "🎒 **آیتم‌های شما در این گروه:**\n\n"
+    keyboard = []
+    for item_name, qty in items:
+        desc = ITEM_DESCRIPTIONS.get(item_name, '')
+        msg += f"- {item_name}: {qty} عدد\n  └ {desc}\n"
+        keyboard.append([InlineKeyboardButton(f"استفاده از {item_name}", callback_data=f"useitem_{user_id}_{item_name}")])
+    if active_item:
+        msg += f"\n🔥 آیتم فعال برای چالش بعدی: **{active_item}**"
+
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    return msg, reply_markup
+
 # Setup Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -212,25 +231,12 @@ async def inventory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db.track_chat(chat_id)
     db.get_user(user.id, chat_id, user.username, user.first_name)
-    
-    items = db.get_inventory(user.id, chat_id)
-    active_item = db.get_user_active_item(user.id, chat_id)
-    
-    if not items and not active_item:
+
+    msg, reply_markup = build_inventory_view(user.id, chat_id)
+    if not msg:
         await update.message.reply_text("کیف پول شما در این گروه خالی است!")
         return
-        
-    msg = "🎒 **آیتم‌های شما در این گروه:**\n\n"
-    keyboard = []
-    
-    for item_name, qty in items:
-        msg += f"- {item_name}: {qty} عدد\n"
-        keyboard.append([InlineKeyboardButton(f"استفاده از {item_name}", callback_data=f"useitem_{user.id}_{item_name}")])
-        
-    if active_item:
-        msg += f"\n🔥 آیتم فعال برای چالش بعدی: **{active_item}**"
-        
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
     await update.message.reply_text(msg, reply_markup=reply_markup)
 
 async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,15 +286,7 @@ async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"آیتم {item_name} با موفقیت فعال شد! تو چالش بعدی اعمال میشه.", show_alert=True)
         
         # update inventory message
-        items = db.get_inventory(user.id, chat_id)
-        msg = "🎒 **آیتم‌های شما در این گروه:**\n\n"
-        keyboard = []
-        for i_name, qty in items:
-            msg += f"- {i_name}: {qty} عدد\n"
-            keyboard.append([InlineKeyboardButton(f"استفاده از {i_name}", callback_data=f"useitem_{user.id}_{i_name}")])
-        msg += f"\n🔥 آیتم فعال برای چالش بعدی: **{item_name}**"
-        
-        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        msg, reply_markup = build_inventory_view(user.id, chat_id)
         await query.edit_message_text(msg, reply_markup=reply_markup)
 
 async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,6 +1122,26 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نمایش برترین‌ها 👁️", callback_data=f"showtop_{user.id}")]])
         )
 
+    # Inventory: same trick - render the actual items with "استفاده از X" buttons
+    # directly, so an item can be activated with one tap instead of two.
+    inv_text, inv_keyboard = build_inventory_view(user.id, last_chat) if last_chat else (None, None)
+    if inv_text:
+        inv_article = InlineQueryResultArticle(
+            id=str(uuid4()),
+            title="🎒 آیتم‌های من",
+            description="استفاده مستقیم از آیتم‌هات",
+            input_message_content=InputTextMessageContent(inv_text),
+            reply_markup=inv_keyboard
+        )
+    else:
+        inv_article = InlineQueryResultArticle(
+            id=str(uuid4()),
+            title="🎒 آیتم‌های من",
+            description="آیتم‌هات رو تو این گروه ببین",
+            input_message_content=InputTextMessageContent(f"🎒 {user.first_name} می‌خواد کیف پولش رو چک کنه..."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نمایش آیتم‌ها 👁️", callback_data=f"showinv_{user.id}")]])
+        )
+
     results = [
         InlineQueryResultArticle(
             id=str(uuid4()),
@@ -1140,13 +1158,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             input_message_content=InputTextMessageContent(f"📏 {user.first_name} می‌خواد سایز دودولش رو ببینه..."),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نمایش سایز 👁️", callback_data=f"showsize_{user.id}")]])
         ),
-        InlineQueryResultArticle(
-            id=str(uuid4()),
-            title="🎒 آیتم‌های من",
-            description="آیتم‌هات رو تو این گروه ببین",
-            input_message_content=InputTextMessageContent(f"🎒 {user.first_name} می‌خواد کیف پولش رو چک کنه..."),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نمایش آیتم‌ها 👁️", callback_data=f"showinv_{user.id}")]])
-        ),
+        inv_article,
         chal_article,
         InlineQueryResultArticle(
             id=str(uuid4()),
@@ -1230,24 +1242,11 @@ async def show_inv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # chat_id already resolved above
     db.get_user(user.id, chat_id, user.username, user.first_name)
-    items = db.get_inventory(user.id, chat_id)
-    active_item = db.get_user_active_item(user.id, chat_id)
-    
-    if not items and not active_item:
+    msg, reply_markup = build_inventory_view(user.id, chat_id)
+    if not msg:
         await query.edit_message_text("🎒 کیف پول شما در این گروه خالی است!")
         return
-        
-    msg = "🎒 **آیتم‌های شما در این گروه:**\n\n"
-    keyboard = []
-    for item_name, qty in items:
-        desc = ITEM_DESCRIPTIONS.get(item_name, '')
-        msg += f"- {item_name}: {qty} عدد\n  └ {desc}\n"
-        keyboard.append([InlineKeyboardButton(f"استفاده از {item_name}", callback_data=f"useitem_{user.id}_{item_name}")])
-        
-    if active_item:
-        msg += f"\n🔥 آیتم فعال برای چالش بعدی: **{active_item}**"
-        
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
     await query.edit_message_text(msg, reply_markup=reply_markup)
 
 if __name__ == '__main__':
