@@ -359,7 +359,10 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # item name might be multiple words
     item_name = " ".join([p for p in parts[1:] if not p.startswith('@')])
-    
+
+    if item_name not in CHALLENGE_ITEMS and item_name not in DIRECT_ITEMS:
+        return  # not a real item name at all - stay silent instead of replying
+
     # check if user has item
     items = db.get_inventory(user.id, chat_id)
     has_item = False
@@ -396,8 +399,6 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = apply_direct_item(item_name, target_user_id, target_first_name, chat_id)
         db.use_inventory(user.id, chat_id, item_name)
         await update.message.reply_text(msg)
-    else:
-        await update.message.reply_text("آیتم نامشخص.")
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
