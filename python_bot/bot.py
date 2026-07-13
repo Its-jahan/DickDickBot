@@ -473,7 +473,7 @@ async def consensus_timeout_job(context: ContextTypes.DEFAULT_TYPE):
     consensus = db.get_consensus(vote_id)
     if not consensus:
         return
-    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status = consensus
+    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status, _ = consensus
     if status != 'open':
         return  # already resolved (success or early failure) by a vote before the deadline
 
@@ -532,12 +532,19 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if db.get_open_consensus(chat_id, target_user_id):
-        db.fail_open_consensus(chat_id, target_user_id, target_first_name)
-        await update.message.reply_text(
-            f"اجماع قبلی علیه {target_first_name} به حد نصاب رای نرسیده بود و شکست خورد!\n"
-            f"تا ۳ روز دیگر نمی‌شود علیه او اجماع جدیدی راه انداخت."
-        )
+    existing_open = db.get_open_consensus(chat_id, target_user_id)
+    if existing_open:
+        _, elapsed_seconds = existing_open
+        if elapsed_seconds >= CONSENSUS_VOTE_WINDOW_SECONDS:
+            db.fail_open_consensus(chat_id, target_user_id, target_first_name)
+            await update.message.reply_text(
+                f"اجماع قبلی علیه {target_first_name} به حد نصاب رای نرسیده بود و شکست خورد!\n"
+                f"تا ۳ روز دیگر نمی‌شود علیه او اجماع جدیدی راه انداخت."
+            )
+        else:
+            await update.message.reply_text(
+                f"یک اجماع علیه {target_first_name} هم‌اکنون در حال رای‌گیری است! صبر کنید تا نتیجه‌اش مشخص شود."
+            )
         return
 
     player_count = db.get_active_today_count(chat_id, today_str)
@@ -582,10 +589,23 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("این رای‌گیری وجود ندارد!", show_alert=True)
         return
 
-    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status = consensus
+    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status, elapsed_seconds = consensus
 
     if status != 'open':
         await query.answer("این رای‌گیری دیگر فعال نیست!", show_alert=True)
+        return
+
+    if elapsed_seconds >= CONSENSUS_VOTE_WINDOW_SECONDS:
+        db.fail_open_consensus(chat_id, target_id, target_name)
+        await query.answer("مهلت این اجماع تمام شده بود!", show_alert=True)
+        voters = db.get_consensus_voters(vote_id)
+        msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
+        msg += "\n\n⏰ مهلت یک‌ساعتهٔ اجماع تمام شد و به حد نصاب نرسید! اجماع شکست خورد."
+        msg += f"\n🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود."
+        try:
+            await query.edit_message_text(msg)
+        except:
+            pass
         return
 
     if user.id == target_id:

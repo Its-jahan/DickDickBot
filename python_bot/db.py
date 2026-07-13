@@ -380,10 +380,12 @@ def get_consensus_protection_remaining(chat_id, target_id):
 
 
 def get_open_consensus(chat_id, target_id):
+    """Returns (id, seconds_since_created) for an open consensus against this target, or None."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT id FROM consensus_votes WHERE chat_id = %s AND target_id = %s AND status = 'open'",
+            "SELECT id, EXTRACT(EPOCH FROM (now() - created_at)) FROM consensus_votes "
+            "WHERE chat_id = %s AND target_id = %s AND status = 'open'",
             (chat_id, target_id)
         )
         return c.fetchone()
@@ -417,10 +419,13 @@ def create_consensus(chat_id, target_id, target_name, initiator_id, initiator_na
 
 
 def get_consensus(vote_id):
+    """Returns (chat_id, target_id, target_name, initiator_id, amount, required_votes,
+    total_players, status, seconds_since_created) or None."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'SELECT chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status '
+            'SELECT chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status, '
+            'EXTRACT(EPOCH FROM (now() - created_at)) '
             'FROM consensus_votes WHERE id = %s',
             (vote_id,)
         )
