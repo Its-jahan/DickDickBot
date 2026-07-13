@@ -109,6 +109,19 @@ def init_db():
         c.execute("ALTER TABLE consensus_vote_casts ADD COLUMN IF NOT EXISTS first_name TEXT")
         c.execute("ALTER TABLE consensus_vote_casts ADD COLUMN IF NOT EXISTS choice TEXT DEFAULT 'yes'")
 
+        # One row per protected target. Editable directly in Supabase's Table Editor:
+        # delete a row to lift the protection early, or edit protected_until to change its length.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS consensus_protection (
+                chat_id BIGINT,
+                target_id BIGINT,
+                target_name TEXT,
+                protected_until TIMESTAMPTZ,
+                reason TEXT,
+                PRIMARY KEY (chat_id, target_id)
+            )
+        ''')
+
 
 def set_last_chat(user_id, chat_id):
     with get_connection() as conn:
@@ -338,27 +351,32 @@ def get_active_today_count(chat_id, today_str):
         return c.fetchone()[0]
 
 
-def get_consensus_protection_remaining(chat_id, target_id):
-    """Returns a timedelta if the target is still protected, else None.
-    A failed consensus grants 3 days of protection; a succeeded one grants 6 days
-    (so a target can't be hit by consensus over and over)."""
+def set_consensus_protection(chat_id, target_id, target_name, days, reason):
+    """Upserts a row in consensus_protection - editable directly in Supabase's Table
+    Editor to lift a protection early (delete the row) or extend/shorten it (edit
+    protected_until)."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            """
-            SELECT MAX(protect_until) - now() FROM (
-                SELECT resolved_at + interval '3 days' AS protect_until FROM consensus_votes
-                WHERE chat_id = %s AND target_id = %s AND status = 'failed'
-                UNION ALL
-                SELECT resolved_at + interval '6 days' AS protect_until FROM consensus_votes
-                WHERE chat_id = %s AND target_id = %s AND status = 'succeeded'
-            ) t
-            WHERE protect_until > now()
-            """,
-            (chat_id, target_id, chat_id, target_id)
+            "INSERT INTO consensus_protection (chat_id, target_id, target_name, protected_until, reason) "
+            "VALUES (%s, %s, %s, now() + make_interval(days => %s), %s) "
+            "ON CONFLICT (chat_id, target_id) DO UPDATE SET "
+            "target_name = EXCLUDED.target_name, protected_until = EXCLUDED.protected_until, reason = EXCLUDED.reason",
+            (chat_id, target_id, target_name, days, reason)
+        )
+
+
+def get_consensus_protection_remaining(chat_id, target_id):
+    """Returns a timedelta if the target is still protected (per consensus_protection), else None."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT protected_until - now() FROM consensus_protection "
+            "WHERE chat_id = %s AND target_id = %s AND protected_until > now()",
+            (chat_id, target_id)
         )
         row = c.fetchone()
-        return row[0] if row and row[0] else None
+        return row[0] if row else None
 
 
 def get_open_consensus(chat_id, target_id):
@@ -371,7 +389,7 @@ def get_open_consensus(chat_id, target_id):
         return c.fetchone()
 
 
-def fail_open_consensus(chat_id, target_id):
+def fail_open_consensus(chat_id, target_id, target_name):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
@@ -379,6 +397,7 @@ def fail_open_consensus(chat_id, target_id):
             "WHERE chat_id = %s AND target_id = %s AND status = 'open'",
             (chat_id, target_id)
         )
+    set_consensus_protection(chat_id, target_id, target_name, 3, 'failed')
 
 
 def create_consensus(chat_id, target_id, target_name, initiator_id, initiator_name, amount, required_votes, total_players):
@@ -437,12 +456,16 @@ def get_consensus_voters(vote_id):
         return c.fetchall()
 
 
-def resolve_consensus_success(vote_id):
-    """Atomically flips an open consensus to succeeded. Returns True only for the caller that won the race."""
+def resolve_consensus_success(vote_id, chat_id, target_id, target_name):
+    """Atomically flips an open consensus to succeeded and grants 6 days of protection.
+    Returns True only for the caller that won the race."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
             "UPDATE consensus_votes SET status = 'succeeded', resolved_at = now() WHERE id = %s AND status = 'open'",
             (vote_id,)
         )
-        return c.rowcount > 0
+        won = c.rowcount > 0
+    if won:
+        set_consensus_protection(chat_id, target_id, target_name, 6, 'succeeded')
+    return won

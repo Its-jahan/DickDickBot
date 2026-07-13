@@ -477,7 +477,7 @@ async def consensus_timeout_job(context: ContextTypes.DEFAULT_TYPE):
     if status != 'open':
         return  # already resolved (success or early failure) by a vote before the deadline
 
-    db.fail_open_consensus(chat_id, target_id)
+    db.fail_open_consensus(chat_id, target_id, target_name)
     voters = db.get_consensus_voters(vote_id)
     msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
     msg += "\n\n⏰ مهلت یک‌ساعتهٔ اجماع تمام شد و به حد نصاب نرسید! اجماع شکست خورد."
@@ -533,7 +533,7 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if db.get_open_consensus(chat_id, target_user_id):
-        db.fail_open_consensus(chat_id, target_user_id)
+        db.fail_open_consensus(chat_id, target_user_id, target_first_name)
         await update.message.reply_text(
             f"اجماع قبلی علیه {target_first_name} به حد نصاب رای نرسیده بود و شکست خورد!\n"
             f"تا ۳ روز دیگر نمی‌شود علیه او اجماع جدیدی راه انداخت."
@@ -607,7 +607,7 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
     voters = db.get_consensus_voters(vote_id)
 
     if yes_count >= required_votes:
-        if db.resolve_consensus_success(vote_id):
+        if db.resolve_consensus_success(vote_id, chat_id, target_id, target_name):
             db.update_size(target_id, chat_id, -amount)
             new_size, _, _ = db.get_user(target_id, chat_id, None, None)
             await query.answer("اجماع موفق شد!")
@@ -621,7 +621,7 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
     # Early failure: if the remaining eligible voters could never push "yes" to the required threshold, stop now.
     remaining_pool = total_players - 1 - (yes_count + no_count)  # -1 excludes the target, who can't vote
     if yes_count + remaining_pool < required_votes:
-        db.fail_open_consensus(chat_id, target_id)
+        db.fail_open_consensus(chat_id, target_id, target_name)
         await query.answer("اجماع شکست خورد!")
         msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
         msg += f"\n\n💔 اجماع دیگر شانسی برای رای‌آوری نداشت و شکست خورد!"
