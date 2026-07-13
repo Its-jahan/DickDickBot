@@ -212,6 +212,11 @@ def get_user(user_id, chat_id, username, first_name):
                 params.append(first_name)
             params.extend([user_id, chat_id])
             c.execute(f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s AND chat_id = %s', params)
+        # A NULL size should never happen through normal gameplay (columns default to 0),
+        # but guard against a stray row (e.g. a manual DB edit) crashing every numeric
+        # comparison callers make against this value.
+        if row[0] is None:
+            row = (0.0,) + row[1:]
         return row
 
 
@@ -270,14 +275,20 @@ def find_user_by_username(username, chat_id):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute('SELECT user_id, first_name, size FROM users WHERE username = %s AND chat_id = %s', (username, chat_id))
-        return c.fetchone()
+        row = c.fetchone()
+        if row and row[2] is None:
+            row = (row[0], row[1], 0.0)
+        return row
 
 
 def get_user_info(user_id, chat_id):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute('SELECT first_name, size FROM users WHERE user_id = %s AND chat_id = %s', (user_id, chat_id))
-        return c.fetchone()
+        row = c.fetchone()
+        if row and row[1] is None:
+            row = (row[0], 0.0)
+        return row
 
 
 def get_top_users(chat_id, limit=None):
@@ -285,9 +296,9 @@ def get_top_users(chat_id, limit=None):
     with get_connection() as conn:
         c = conn.cursor()
         if limit:
-            c.execute('SELECT first_name, size FROM users WHERE chat_id = %s ORDER BY size DESC LIMIT %s', (chat_id, limit))
+            c.execute('SELECT first_name, size FROM users WHERE chat_id = %s ORDER BY size DESC NULLS LAST LIMIT %s', (chat_id, limit))
         else:
-            c.execute('SELECT first_name, size FROM users WHERE chat_id = %s ORDER BY size DESC', (chat_id,))
+            c.execute('SELECT first_name, size FROM users WHERE chat_id = %s ORDER BY size DESC NULLS LAST', (chat_id,))
         return c.fetchall()
 
 
