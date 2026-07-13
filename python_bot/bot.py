@@ -11,6 +11,10 @@ from uuid import uuid4
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
+# Dedicated OS-entropy-backed RNG for match-deciding dice rolls, so the outcome can't
+# be tied to any in-process PRNG state - each roll is drawn fresh from the OS.
+_dice_rng = random.SystemRandom()
+
 def tehran_today_str():
     """The current date (YYYY-MM-DD) in Iran time, used as the daily reset key for growth."""
     return datetime.datetime.now(IRAN_TZ).date().isoformat()
@@ -411,6 +415,29 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg)
 
+async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    db.track_chat(chat_id)
+    text = update.message.text
+
+    target_user_id, target_first_name = get_target_user(update, text, chat_id)
+    if not target_user_id:
+        target_user_id, target_first_name = user.id, user.first_name
+        db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    wins, losses = db.get_win_loss(target_user_id, chat_id)
+    total = wins + losses
+    if total == 0:
+        await update.message.reply_text(f"{target_first_name} هنوز هیچ چالشی رو تموم نکرده!")
+        return
+
+    win_rate = round(wins / total * 100)
+    await update.message.reply_text(
+        f"🎲 آمار چالش‌های {target_first_name} در این گروه:\n"
+        f"✅ برد: {wins}\n❌ باخت: {losses}\n📊 وین‌ریت: {win_rate}٪ (از {total} چالش)"
+    )
+
 async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -751,8 +778,8 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
     challenger_info = db.get_user_info(challenger_id, chat_id)
     challenger_name = challenger_info[0] if challenger_info else "ناشناس"
         
-    val1 = random.randint(1, 6)
-    val2 = random.randint(1, 6)
+    val1 = _dice_rng.randint(1, 6)
+    val2 = _dice_rng.randint(1, 6)
 
     match_id = str(uuid4())
     active_bet_matches[match_id] = {
@@ -891,7 +918,8 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
 
     db.update_size(loser_id, chat_id, -loser_loss)
     db.update_size(winner_id, chat_id, winner_gain)
-    
+    db.record_match_result(winner_id, loser_id, chat_id)
+
     msg += f"\n💰 شرط اصلی: {bet} سانت"
     msg += msg_item_log
     
@@ -1039,9 +1067,9 @@ async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await asyncio.sleep(2)
     
-    val1 = random.randint(1, 6)
-    val2 = random.randint(1, 6)
-    
+    val1 = _dice_rng.randint(1, 6)
+    val2 = _dice_rng.randint(1, 6)
+
     if val1 > val2:
         winner_id, loser_id = p1_id, p2_id
         winner_name, loser_name = p1_name, p2_name
@@ -1057,7 +1085,8 @@ async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db.update_size(loser_id, chat_id, -bet)
     db.update_size(winner_id, chat_id, bet)
-    
+    db.record_match_result(winner_id, loser_id, chat_id)
+
     winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
     loser_size, _, _ = db.get_user(loser_id, chat_id, None, None)
     
@@ -1396,6 +1425,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.Regex(r'^/(inv|inventory|i)\b'), inventory_cmd))
     app.add_handler(MessageHandler(filters.Regex(r'^/(use|u)\b'), use_item_cmd))
     app.add_handler(MessageHandler(filters.Regex(r'^/ejma\b'), consensus_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r'^/(wr|winrate)\b'), winrate_cmd))
 
     app.add_handler(CallbackQueryHandler(accept_challenge_callback, pattern=r'^chal_'))
     app.add_handler(CallbackQueryHandler(rematch_callback, pattern=r'^rematch_'))
