@@ -731,6 +731,21 @@ def build_football_keyboard(market_id, home_team, away_team, odds_home, odds_awa
     ]
     return InlineKeyboardMarkup(rows)
 
+def group_football_bets(bets):
+    """Merges bets placed by the same person, on the same side, at the exact same
+    locked-in odds into a single combined line (summed amount) - bets at different
+    odds (even by the same person) stay separate, since they're priced differently.
+    Returns (user_id, first_name, side, total_amount, odds), in first-seen order."""
+    groups = {}
+    order = []
+    for user_id, first_name, side, amount, odds in bets:
+        key = (user_id, side, odds)
+        if key not in groups:
+            groups[key] = [user_id, first_name, side, 0.0, odds]
+            order.append(key)
+        groups[key][3] += amount
+    return [tuple(groups[key]) for key in order]
+
 def render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets):
     lines = [
         f"⚽️ {home_team} {home_score} - {away_score} {away_team}",
@@ -859,7 +874,7 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
                 result = 'draw'
             db.finish_football_market(market_id, result)
 
-            bets = db.get_football_bets(market_id)
+            bets = group_football_bets(db.get_football_bets(market_id))
             win_lines, lose_lines = [], []
             for bettor_id, first_name, side, amount, odds in bets:
                 if result == 'draw':
@@ -902,7 +917,7 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
                 db.set_football_market_status(market_id, 'live')
                 status = 'live'
                 odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
-                bets = db.get_football_bets(market_id)
+                bets = group_football_bets(db.get_football_bets(market_id))
                 status_label = football_status_label(short) if short in football.LIVE_STATUSES else "قبل از شروع بازی"
                 text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
                 keyboard = build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away)
@@ -937,7 +952,7 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
 
         if status == 'live' and message_id:
             odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
-            bets = db.get_football_bets(market_id)
+            bets = group_football_bets(db.get_football_bets(market_id))
             status_label = football_status_label(short) if short in football.LIVE_STATUSES else "قبل از شروع بازی"
             text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
             keyboard = build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away)
