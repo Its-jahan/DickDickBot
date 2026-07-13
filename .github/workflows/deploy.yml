@@ -31,3 +31,5 @@ jobs:
             systemctl restart dickbot
             sleep 2
             systemctl is-active dickbot
+            echo "--- last 200 lines of dickbot journal (for diagnostics) ---"
+            journalctl -u dickbot -n 200 --no-pager || true
