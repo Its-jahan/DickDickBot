@@ -123,6 +123,36 @@ def init_db():
             )
         ''')
 
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS football_markets (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                fixture_id BIGINT,
+                home_team TEXT,
+                away_team TEXT,
+                status TEXT DEFAULT 'scheduled',
+                halftime_announced BOOLEAN DEFAULT FALSE,
+                result TEXT,
+                message_id BIGINT,
+                created_by BIGINT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS football_bets (
+                id SERIAL PRIMARY KEY,
+                market_id INTEGER REFERENCES football_markets(id),
+                user_id BIGINT,
+                first_name TEXT,
+                side TEXT,
+                amount DOUBLE PRECISION,
+                locked_odds DOUBLE PRECISION,
+                placed_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE (market_id, user_id)
+            )
+        ''')
+
 
 def get_last_chat(user_id):
     """Returns this user's one and only active group's chat_id, or None if they've
@@ -509,3 +539,90 @@ def resolve_consensus_success(vote_id, chat_id, target_id, target_name):
     if won:
         set_consensus_protection(chat_id, target_id, target_name, 6, 'succeeded')
     return won
+
+
+def create_football_market(chat_id, fixture_id, home_team, away_team, created_by):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO football_markets (chat_id, fixture_id, home_team, away_team, created_by) '
+            'VALUES (%s, %s, %s, %s, %s) RETURNING id',
+            (chat_id, fixture_id, home_team, away_team, created_by)
+        )
+        return c.fetchone()[0]
+
+
+def set_football_market_message(market_id, message_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE football_markets SET message_id = %s WHERE id = %s', (message_id, market_id))
+
+
+def get_football_market(market_id):
+    """Returns (chat_id, fixture_id, home_team, away_team, status, halftime_announced,
+    result, message_id, created_by) or None."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT chat_id, fixture_id, home_team, away_team, status, halftime_announced, '
+            'result, message_id, created_by FROM football_markets WHERE id = %s',
+            (market_id,)
+        )
+        return c.fetchone()
+
+
+def get_active_football_markets():
+    """Returns (id, chat_id, fixture_id, home_team, away_team, status, halftime_announced,
+    message_id) for every market that hasn't finished yet, for the polling job to check."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id "
+            "FROM football_markets WHERE status != 'finished'"
+        )
+        return c.fetchall()
+
+
+def set_football_market_status(market_id, status):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE football_markets SET status = %s WHERE id = %s', (status, market_id))
+
+
+def mark_football_halftime_announced(market_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE football_markets SET halftime_announced = TRUE WHERE id = %s', (market_id,))
+
+
+def finish_football_market(market_id, result):
+    """result is 'home', 'away', or 'draw'."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE football_markets SET status = 'finished', result = %s WHERE id = %s",
+            (result, market_id)
+        )
+
+
+def place_football_bet(market_id, user_id, first_name, side, amount, odds):
+    """Returns True if the bet was newly recorded, False if this user already bet on this market."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO football_bets (market_id, user_id, first_name, side, amount, locked_odds) '
+            'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (market_id, user_id) DO NOTHING',
+            (market_id, user_id, first_name, side, amount, odds)
+        )
+        return c.rowcount > 0
+
+
+def get_football_bets(market_id):
+    """Returns (user_id, first_name, side, amount, locked_odds) for every bet on this market."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, first_name, side, amount, locked_odds FROM football_bets WHERE market_id = %s',
+            (market_id,)
+        )
+        return c.fetchall()
