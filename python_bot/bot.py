@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import datetime
 from datetime import time
@@ -20,6 +21,7 @@ def tehran_today_str():
     return datetime.datetime.now(IRAN_TZ).date().isoformat()
 
 import db
+import football
 
 async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE):
     chat_ids = db.get_all_chats()
@@ -696,6 +698,242 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         )
     except:
         pass
+
+FOOTBALL_POLL_INTERVAL_SECONDS = int(os.environ.get('FOOTBALL_POLL_INTERVAL_SECONDS', '120'))
+
+async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id):
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ('creator', 'administrator')
+    except Exception:
+        return False
+
+def encode_odds(odds):
+    return int(round(odds * 100))
+
+def decode_odds(odds_cents):
+    return odds_cents / 100
+
+def football_status_label(short):
+    return {
+        '1H': 'نیمهٔ اول', 'HT': 'نیمه‌وقت', '2H': 'نیمهٔ دوم',
+        'ET': 'وقت اضافه', 'BT': 'استراحت وقت اضافه', 'P': 'پنالتی',
+    }.get(short, 'زنده')
+
+def build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away):
+    rows = [
+        [
+            InlineKeyboardButton(f"⚽️ {home_team} {amt} (×{odds_home:.2f})", callback_data=f"fbet_{market_id}_h_{amt}_{encode_odds(odds_home)}"),
+            InlineKeyboardButton(f"⚽️ {away_team} {amt} (×{odds_away:.2f})", callback_data=f"fbet_{market_id}_a_{amt}_{encode_odds(odds_away)}"),
+        ]
+        for amt in BET_AMOUNTS
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets):
+    lines = [
+        f"⚽️ {home_team} {home_score} - {away_score} {away_team}",
+        f"🕐 {status_label}" + (f" (دقیقه {elapsed}')" if elapsed else ""),
+        f"📊 ضریب زنده: {home_team} ×{odds_home:.2f}  |  {away_team} ×{odds_away:.2f}",
+    ]
+    if bets:
+        lines.append("\n📋 شرط‌های ثبت‌شده:")
+        for bettor_id, first_name, side, amount, odds in bets:
+            side_name = home_team if side == 'home' else away_team
+            lines.append(f"- {first_name}: {int(amount)} سانت روی {side_name} (ضریب {odds:.2f})")
+    return "\n".join(lines)
+
+async def football_bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+
+    if not await is_group_admin(context, chat_id, user.id):
+        await update.message.reply_text("فقط ادمین‌های گروه می‌تونن بت فوتبالی راه بندازن!")
+        return
+
+    text = update.message.text
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or '-' not in parts[1]:
+        await update.message.reply_text(
+            "استفاده صحیح:\n/fbet تیم۱ - تیم۲\nمثال: /fbet اسپانیا - فرانسه"
+        )
+        return
+
+    team1_text, team2_text = parts[1].split('-', 1)
+    team1_text, team2_text = team1_text.strip(), team2_text.strip()
+    if not team1_text or not team2_text:
+        await update.message.reply_text("لطفا هر دو اسم تیم رو وارد کنید.")
+        return
+
+    await update.message.reply_text("🔎 در حال جستجوی بازی...")
+
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    fixture = None
+    try:
+        for offset in (0, 1):
+            date_str = (today + datetime.timedelta(days=offset)).isoformat()
+            fixture = await football.find_fixture(team1_text, team2_text, date_str)
+            if fixture:
+                break
+    except football.FootballApiError as e:
+        await update.message.reply_text(str(e))
+        return
+    except Exception as e:
+        logging.error(f"Football API error: {e}")
+        await update.message.reply_text("⚠️ خطا در ارتباط با سرویس اطلاعات فوتبال. بعدا دوباره امتحان کنید.")
+        return
+
+    if not fixture:
+        await update.message.reply_text(
+            f"❌ بازی‌ای بین «{team1_text}» و «{team2_text}» برای امروز یا فردا پیدا نشد."
+        )
+        return
+
+    db.create_football_market(chat_id, fixture['fixture_id'], fixture['home_team'], fixture['away_team'], user.id)
+    await update.message.reply_text(
+        f"✅ بازی {fixture['home_team']} - {fixture['away_team']} پیدا شد و بت‌گیری براش فعال شد!\n"
+        f"⏰ به محض شروع بازی، پیام شرط‌بندی همینجا فرستاده می‌شه."
+    )
+
+async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
+    markets = db.get_active_football_markets()
+    for market_id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id in markets:
+        try:
+            fstatus = await football.get_fixture_status(fixture_id)
+        except Exception as e:
+            logging.error(f"Football poll error for fixture {fixture_id}: {e}")
+            continue
+        if not fstatus:
+            continue
+
+        short = fstatus['status']
+        elapsed = fstatus['elapsed']
+        home_score = fstatus['home_score']
+        away_score = fstatus['away_score']
+
+        if short in football.FINISHED_STATUSES:
+            if home_score > away_score:
+                result = 'home'
+            elif away_score > home_score:
+                result = 'away'
+            else:
+                result = 'draw'
+            db.finish_football_market(market_id, result)
+
+            bets = db.get_football_bets(market_id)
+            win_lines, lose_lines = [], []
+            for bettor_id, first_name, side, amount, odds in bets:
+                if result == 'draw':
+                    db.update_size(bettor_id, chat_id, amount)  # full refund, nobody wins a 2-way market on a draw
+                elif side == result:
+                    payout = amount * odds
+                    db.update_size(bettor_id, chat_id, payout)
+                    win_lines.append(f"✅ {first_name}: {int(amount)} سانت با ضریب {odds:.2f} بست و {int(payout)} سانت گرفت (سود {int(payout - amount)})")
+                else:
+                    lose_lines.append(f"❌ {first_name}: {int(amount)} سانت از دست داد")
+
+            winner_name = home_team if result == 'home' else (away_team if result == 'away' else None)
+            msg = f"🏁 بازی {home_team} {home_score} - {away_score} {away_team} تموم شد!\n"
+            msg += f"🎉 به نفع {winner_name}!" if winner_name else "🤝 مساوی شد!"
+            if bets:
+                msg += "\n\n📋 شرط‌های ثبت‌شده:"
+                for bettor_id, first_name, side, amount, odds in bets:
+                    side_name = home_team if side == 'home' else away_team
+                    msg += f"\n- {first_name}: {int(amount)} سانت روی {side_name} (ضریب {odds:.2f})"
+                if result == 'draw':
+                    msg += "\n\n🎰 چون مساوی شد، همهٔ شرط‌ها باطل شد و سانتی که گذاشته بودن بهشون برگشت."
+                else:
+                    if win_lines:
+                        msg += "\n\n" + "\n".join(win_lines)
+                    if lose_lines:
+                        msg += "\n\n" + "\n".join(lose_lines)
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception as e:
+                logging.error(f"Failed to send football result to {chat_id}: {e}")
+            continue
+
+        if short in football.HALFTIME_STATUSES and not halftime_announced:
+            db.mark_football_halftime_announced(market_id)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏸️ نیمهٔ اول {home_team} - {away_team} تموم شد!\nنتیجه: {home_score} - {away_score}"
+                )
+            except Exception as e:
+                logging.error(f"Failed to send halftime message to {chat_id}: {e}")
+
+        if short in football.LIVE_STATUSES:
+            odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score)
+            bets = db.get_football_bets(market_id)
+            status_label = football_status_label(short)
+            text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
+            keyboard = build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away)
+
+            if status == 'scheduled':
+                db.set_football_market_status(market_id, 'live')
+                try:
+                    sent = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⚽️ بازی {home_team} - {away_team} شروع شد!\n\n" + text,
+                        reply_markup=keyboard
+                    )
+                    db.set_football_market_message(market_id, sent.message_id)
+                except Exception as e:
+                    logging.error(f"Failed to send football kickoff message to {chat_id}: {e}")
+            elif message_id:
+                try:
+                    await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
+                except Exception:
+                    pass  # unchanged content or message too old to edit - not fatal
+
+async def place_football_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
+        return
+
+    data = query.data.split('_')
+    if len(data) != 5 or data[0] != 'fbet':
+        return
+    market_id = int(data[1])
+    side = 'home' if data[2] == 'h' else 'away'
+    amount = int(data[3])
+    odds = decode_odds(int(data[4]))
+
+    market = db.get_football_market(market_id)
+    if not market:
+        await query.answer("این بازار وجود نداره!", show_alert=True)
+        return
+    m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id, created_by = market
+    if status != 'live':
+        await query.answer("این بازی الان قابل شرط‌بندی نیست!", show_alert=True)
+        return
+
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    user_size, _, _ = db.get_user(user.id, chat_id, None, None)
+    if user_size < amount:
+        await query.answer(f"شما به اندازه کافی سایز ندارید! سایز فعلی: {int(user_size)}", show_alert=True)
+        return
+
+    recorded = db.place_football_bet(market_id, user.id, user.first_name, side, amount, odds)
+    if not recorded:
+        await query.answer("شما قبلا روی این بازی شرط بسته‌اید!", show_alert=True)
+        return
+
+    db.update_size(user.id, chat_id, -amount)
+    side_name = home_team if side == 'home' else away_team
+    await query.answer(
+        f"{amount} سانت روی {side_name} با ضریب {odds:.2f} بستید! در صورت برد {int(amount * odds)} سانت می‌گیرید.",
+        show_alert=True
+    )
 
 async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1452,7 +1690,8 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     
     app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
-    
+    app.job_queue.run_repeating(poll_football_markets, interval=FOOTBALL_POLL_INTERVAL_SECONDS, first=10)
+
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', start))
     
@@ -1464,6 +1703,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.Regex(r'^/(use|u)\b'), use_item_cmd))
     app.add_handler(MessageHandler(filters.Regex(r'^/ejma\b'), consensus_cmd))
     app.add_handler(MessageHandler(filters.Regex(r'^/(wr|winrate)\b'), winrate_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r'^/fbet\b'), football_bet_cmd))
 
     app.add_handler(CallbackQueryHandler(accept_challenge_callback, pattern=r'^chal_'))
     app.add_handler(CallbackQueryHandler(rematch_callback, pattern=r'^rematch_'))
@@ -1475,6 +1715,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(show_top_callback, pattern=r'^showtop_'))
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))
     app.add_handler(CallbackQueryHandler(show_inv_callback, pattern=r'^showinv_'))
+    app.add_handler(CallbackQueryHandler(place_football_bet_callback, pattern=r'^fbet_'))
     
     app.add_handler(InlineQueryHandler(inline_query))
     
