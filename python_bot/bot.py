@@ -978,17 +978,16 @@ async def place_football_bet_callback(update: Update, context: ContextTypes.DEFA
         await query.answer(f"شما به اندازه کافی سایز ندارید! سایز فعلی: {int(user_size)}", show_alert=True)
         return
 
-    recorded = db.place_football_bet(market_id, user.id, user.first_name, side, amount, odds)
-    if not recorded:
-        await query.answer("شما قبلا روی این بازی شرط بسته‌اید!", show_alert=True)
-        return
-
+    db.place_football_bet(market_id, user.id, user.first_name, side, amount, odds)
     db.update_size(user.id, chat_id, -amount)
     side_name = home_team if side == 'home' else away_team
-    await query.answer(
-        f"{amount} سانت روی {side_name} با ضریب {odds:.2f} بستید! در صورت برد {int(amount * odds)} سانت می‌گیرید.",
-        show_alert=True
-    )
+
+    prior_bets = [b for b in db.get_football_bets(market_id) if b[0] == user.id]
+    total_staked = sum(b[3] for b in prior_bets)
+    msg = f"{amount} سانت روی {side_name} با ضریب {odds:.2f} بستید! در صورت برد {int(amount * odds)} سانت می‌گیرید."
+    if len(prior_bets) > 1:
+        msg += f"\nمجموع شرط‌های شما روی این بازی تا الان: {int(total_staked)} سانت."
+    await query.answer(msg, show_alert=True)
 
 async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user

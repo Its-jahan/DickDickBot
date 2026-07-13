@@ -154,10 +154,13 @@ def init_db():
                 side TEXT,
                 amount DOUBLE PRECISION,
                 locked_odds DOUBLE PRECISION,
-                placed_at TIMESTAMPTZ DEFAULT now(),
-                UNIQUE (market_id, user_id)
+                placed_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
+        # A user can now stack multiple bets on the same market (e.g. add more at a
+        # newer, tighter/looser odds as the match develops), so the old one-bet-per-user
+        # constraint is dropped for anyone upgrading from before this was allowed.
+        c.execute("ALTER TABLE football_bets DROP CONSTRAINT IF EXISTS football_bets_market_id_user_id_key")
 
 
 def get_last_chat(user_id):
@@ -621,15 +624,16 @@ def finish_football_market(market_id, result):
 
 
 def place_football_bet(market_id, user_id, first_name, side, amount, odds):
-    """Returns True if the bet was newly recorded, False if this user already bet on this market."""
+    """Records a new bet. A user can place any number of bets on the same market (e.g.
+    adding more later at whatever odds are current then) - each is its own independent
+    stake, locked at its own odds, settled independently."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
             'INSERT INTO football_bets (market_id, user_id, first_name, side, amount, locked_odds) '
-            'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (market_id, user_id) DO NOTHING',
+            'VALUES (%s, %s, %s, %s, %s, %s)',
             (market_id, user_id, first_name, side, amount, odds)
         )
-        return c.rowcount > 0
 
 
 def get_football_bets(market_id):
