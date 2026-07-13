@@ -794,8 +794,17 @@ async def football_bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     db.create_football_market(chat_id, fixture['fixture_id'], fixture['home_team'], fixture['away_team'], user.id)
+
+    kickoff_str = ""
+    try:
+        kickoff_dt = datetime.datetime.fromisoformat(fixture['kickoff_iso']).astimezone(IRAN_TZ)
+        kickoff_str = f"\n🕐 ساعت شروع: {kickoff_dt.strftime('%H:%M')} (به وقت ایران)"
+    except Exception:
+        pass
+
     await update.message.reply_text(
-        f"✅ بازی {fixture['home_team']} - {fixture['away_team']} پیدا شد و بت‌گیری براش فعال شد!\n"
+        f"✅ بازی {fixture['home_team']} - {fixture['away_team']} پیدا شد و بت‌گیری براش فعال شد!"
+        f"{kickoff_str}\n"
         f"⏰ به محض شروع بازی، پیام شرط‌بندی همینجا فرستاده می‌شه."
     )
 
