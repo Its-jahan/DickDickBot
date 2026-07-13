@@ -136,10 +136,14 @@ def init_db():
                 message_id BIGINT,
                 created_by BIGINT,
                 prior_home_prob DOUBLE PRECISION DEFAULT 0.5,
+                kickoff_at TIMESTAMPTZ,
+                match_started_announced BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
         c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS prior_home_prob DOUBLE PRECISION DEFAULT 0.5")
+        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS kickoff_at TIMESTAMPTZ")
+        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS match_started_announced BOOLEAN DEFAULT FALSE")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS football_bets (
@@ -543,13 +547,13 @@ def resolve_consensus_success(vote_id, chat_id, target_id, target_name):
     return won
 
 
-def create_football_market(chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob=0.5):
+def create_football_market(chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob=0.5, kickoff_at=None):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'INSERT INTO football_markets (chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob) '
-            'VALUES (%s, %s, %s, %s, %s, %s) RETURNING id',
-            (chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob)
+            'INSERT INTO football_markets (chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob, kickoff_at) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id',
+            (chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob, kickoff_at)
         )
         return c.fetchone()[0]
 
@@ -562,12 +566,13 @@ def set_football_market_message(market_id, message_id):
 
 def get_football_market(market_id):
     """Returns (chat_id, fixture_id, home_team, away_team, status, halftime_announced,
-    result, message_id, created_by, prior_home_prob) or None."""
+    result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced) or None."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
             'SELECT chat_id, fixture_id, home_team, away_team, status, halftime_announced, '
-            'result, message_id, created_by, prior_home_prob FROM football_markets WHERE id = %s',
+            'result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced '
+            'FROM football_markets WHERE id = %s',
             (market_id,)
         )
         return c.fetchone()
@@ -575,12 +580,13 @@ def get_football_market(market_id):
 
 def get_active_football_markets():
     """Returns (id, chat_id, fixture_id, home_team, away_team, status, halftime_announced,
-    message_id, prior_home_prob) for every market that hasn't finished yet, for the
-    polling job to check."""
+    message_id, prior_home_prob, kickoff_at, match_started_announced) for every market that
+    hasn't finished yet, for the polling job to check."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id, prior_home_prob "
+            "SELECT id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id, "
+            "prior_home_prob, kickoff_at, match_started_announced "
             "FROM football_markets WHERE status != 'finished'"
         )
         return c.fetchall()
@@ -596,6 +602,12 @@ def mark_football_halftime_announced(market_id):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute('UPDATE football_markets SET halftime_announced = TRUE WHERE id = %s', (market_id,))
+
+
+def mark_football_match_started(market_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE football_markets SET match_started_announced = TRUE WHERE id = %s', (market_id,))
 
 
 def finish_football_market(market_id, result):

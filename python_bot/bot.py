@@ -700,6 +700,7 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         pass
 
 FOOTBALL_POLL_INTERVAL_SECONDS = int(os.environ.get('FOOTBALL_POLL_INTERVAL_SECONDS', '120'))
+BETTING_OPENS_HOURS_BEFORE = 2
 
 async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id):
     try:
@@ -799,17 +800,25 @@ async def football_bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Football prematch odds error: {e}")
 
+    kickoff_dt = None
+    try:
+        kickoff_dt = datetime.datetime.fromisoformat(fixture['kickoff_iso'])
+    except Exception:
+        pass
+
     db.create_football_market(
         chat_id, fixture['fixture_id'], fixture['home_team'], fixture['away_team'], user.id,
-        prior_home_prob=prior_home_prob if prior_home_prob is not None else 0.5
+        prior_home_prob=prior_home_prob if prior_home_prob is not None else 0.5,
+        kickoff_at=kickoff_dt
     )
 
     kickoff_str = ""
-    try:
-        kickoff_dt = datetime.datetime.fromisoformat(fixture['kickoff_iso']).astimezone(IRAN_TZ)
-        kickoff_str = f"\n🕐 ساعت شروع: {kickoff_dt.strftime('%H:%M')} (به وقت ایران)"
-    except Exception:
-        pass
+    if kickoff_dt:
+        kickoff_local = kickoff_dt.astimezone(IRAN_TZ)
+        kickoff_str = (
+            f"\n🕐 ساعت شروع: {kickoff_local.strftime('%H:%M')} (به وقت ایران)"
+            f"\n🎰 از {BETTING_OPENS_HOURS_BEFORE} ساعت قبل از شروع بازی می‌شه شرط بست."
+        )
 
     if prior_home_prob is not None:
         opening_home, opening_away = football.compute_odds(0, 0, 0, prior_home_prob)
@@ -826,7 +835,8 @@ async def football_bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
     markets = db.get_active_football_markets()
-    for market_id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id, prior_home_prob in markets:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for market_id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id, prior_home_prob, kickoff_at, match_started_announced in markets:
         try:
             fstatus = await football.get_fixture_status(fixture_id)
         except Exception as e:
@@ -882,6 +892,39 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"Failed to send football result to {chat_id}: {e}")
             continue
 
+        # Open the betting window either BETTING_OPENS_HOURS_BEFORE kickoff, or right
+        # away if the match is already underway (e.g. the market was created late).
+        if status == 'scheduled':
+            should_open = short in football.LIVE_STATUSES
+            if not should_open and kickoff_at:
+                should_open = now >= kickoff_at - datetime.timedelta(hours=BETTING_OPENS_HOURS_BEFORE)
+            if should_open:
+                db.set_football_market_status(market_id, 'live')
+                status = 'live'
+                odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
+                bets = db.get_football_bets(market_id)
+                status_label = football_status_label(short) if short in football.LIVE_STATUSES else "قبل از شروع بازی"
+                text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
+                keyboard = build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away)
+                try:
+                    sent = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🎰 بت‌گیری برای بازی {home_team} - {away_team} باز شد!\n\n" + text,
+                        reply_markup=keyboard
+                    )
+                    db.set_football_market_message(market_id, sent.message_id)
+                    message_id = sent.message_id
+                except Exception as e:
+                    logging.error(f"Failed to send football betting-open message to {chat_id}: {e}")
+
+        if short in football.LIVE_STATUSES and not match_started_announced:
+            db.mark_football_match_started(market_id)
+            match_started_announced = True
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=f"⚽️ بازی {home_team} - {away_team} شروع شد!")
+            except Exception as e:
+                logging.error(f"Failed to send football kickoff message to {chat_id}: {e}")
+
         if short in football.HALFTIME_STATUSES and not halftime_announced:
             db.mark_football_halftime_announced(market_id)
             try:
@@ -892,29 +935,16 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logging.error(f"Failed to send halftime message to {chat_id}: {e}")
 
-        if short in football.LIVE_STATUSES:
+        if status == 'live' and message_id:
             odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
             bets = db.get_football_bets(market_id)
-            status_label = football_status_label(short)
+            status_label = football_status_label(short) if short in football.LIVE_STATUSES else "قبل از شروع بازی"
             text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
             keyboard = build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away)
-
-            if status == 'scheduled':
-                db.set_football_market_status(market_id, 'live')
-                try:
-                    sent = await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"⚽️ بازی {home_team} - {away_team} شروع شد!\n\n" + text,
-                        reply_markup=keyboard
-                    )
-                    db.set_football_market_message(market_id, sent.message_id)
-                except Exception as e:
-                    logging.error(f"Failed to send football kickoff message to {chat_id}: {e}")
-            elif message_id:
-                try:
-                    await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
-                except Exception:
-                    pass  # unchanged content or message too old to edit - not fatal
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
+            except Exception:
+                pass  # unchanged content or message too old to edit - not fatal
 
 async def place_football_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -937,7 +967,7 @@ async def place_football_bet_callback(update: Update, context: ContextTypes.DEFA
     if not market:
         await query.answer("این بازار وجود نداره!", show_alert=True)
         return
-    m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id, created_by, prior_home_prob = market
+    m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced = market
     if status != 'live':
         await query.answer("این بازی الان قابل شرط‌بندی نیست!", show_alert=True)
         return
