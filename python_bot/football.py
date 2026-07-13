@@ -100,19 +100,51 @@ MAX_ODDS = 50.0
 MATCH_LENGTH_MINUTES = 90
 
 
-def compute_odds(elapsed_minutes, home_score, away_score):
-    """Live 'smart' odds for a 2-way (home win / away win) market, Polymarket-style:
-    odds reflect an implied win probability that starts near 50/50 at kickoff and
-    converges toward certainty as the match approaches full time, driven by the
-    current goal difference. The same lead matters more with less time left to
-    overturn it, so a team's odds keep tightening the closer we get to the final
-    whistle - never a fixed, static price like a traditional pre-match line."""
+async def get_prematch_home_probability(fixture_id):
+    """Returns the home team's implied pre-match win probability (0-1), derived from
+    API-Football's own bookmaker odds for the 'Match Winner' market, normalized over
+    just Home/Away (the Draw price is dropped since our market is 2-way only). Returns
+    None if odds aren't available for this fixture (unsupported plan, no bookmaker has
+    posted a line yet, etc.) - callers should fall back to a neutral 50/50 prior."""
+    try:
+        data = await _get('/odds', {'fixture': fixture_id})
+    except Exception:
+        return None
+    response = data.get('response', [])
+    if not response:
+        return None
+    for bookmaker in response[0].get('bookmakers', []):
+        for bet in bookmaker.get('bets', []):
+            if bet.get('name') == 'Match Winner':
+                values = {v['value']: v['odd'] for v in bet.get('values', [])}
+                if 'Home' in values and 'Away' in values:
+                    try:
+                        p_home_raw = 1 / float(values['Home'])
+                        p_away_raw = 1 / float(values['Away'])
+                    except (ValueError, ZeroDivisionError):
+                        continue
+                    return p_home_raw / (p_home_raw + p_away_raw)
+    return None
+
+
+def compute_odds(elapsed_minutes, home_score, away_score, prior_home_prob=0.5):
+    """Live 'smart' odds for a 2-way (home win / away win) market, Polymarket-style.
+    prior_home_prob seeds the match's opening price (from real bookmaker odds when
+    available, 0.5 otherwise) - its influence fades out linearly as the match
+    progresses, while the current goal difference matters more and more, so by full
+    time the actual score fully determines the price regardless of pre-match
+    expectations. The same lead matters more with less time left to overturn it, so
+    a team's odds keep tightening the closer we get to the final whistle - never a
+    fixed, static price like a traditional pre-match line."""
     time_factor = min(max(elapsed_minutes, 0) / MATCH_LENGTH_MINUTES, 1.0)
     goal_diff = home_score - away_score
+    prior_home_prob = min(max(prior_home_prob, 0.01), 0.99)
+    prior_edge = math.log(prior_home_prob / (1 - prior_home_prob))
     # Amplify how much a goal difference matters as time runs out: x0.6 early on,
     # up to x3.0 by full time, so a 1-goal lead late in the match prices in as
     # much more decisive than the same lead at kickoff.
-    edge = goal_diff * (0.6 + 2.4 * time_factor)
+    goal_edge = goal_diff * (0.6 + 2.4 * time_factor)
+    edge = prior_edge * (1 - time_factor) + goal_edge
     p_home = 1 / (1 + math.exp(-edge))
     p_away = 1 - p_home
     odds_home = min(max(1 / p_home, MIN_ODDS), MAX_ODDS)

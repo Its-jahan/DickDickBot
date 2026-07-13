@@ -793,7 +793,16 @@ async def football_bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    db.create_football_market(chat_id, fixture['fixture_id'], fixture['home_team'], fixture['away_team'], user.id)
+    prior_home_prob = None
+    try:
+        prior_home_prob = await football.get_prematch_home_probability(fixture['fixture_id'])
+    except Exception as e:
+        logging.error(f"Football prematch odds error: {e}")
+
+    db.create_football_market(
+        chat_id, fixture['fixture_id'], fixture['home_team'], fixture['away_team'], user.id,
+        prior_home_prob=prior_home_prob if prior_home_prob is not None else 0.5
+    )
 
     kickoff_str = ""
     try:
@@ -802,15 +811,22 @@ async def football_bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    if prior_home_prob is not None:
+        opening_home, opening_away = football.compute_odds(0, 0, 0, prior_home_prob)
+        odds_str = f"\n📊 ضریب اولیه (بر اساس قدرت تیم‌ها): {fixture['home_team']} ×{opening_home:.2f}  |  {fixture['away_team']} ×{opening_away:.2f}"
+    else:
+        odds_str = "\n📊 ضریب اولیه بازار در دسترس نبود؛ با شانس برابر (۲.۰۰ / ۲.۰۰) شروع می‌شه."
+
     await update.message.reply_text(
         f"✅ بازی {fixture['home_team']} - {fixture['away_team']} پیدا شد و بت‌گیری براش فعال شد!"
-        f"{kickoff_str}\n"
+        f"{kickoff_str}"
+        f"{odds_str}\n"
         f"⏰ به محض شروع بازی، پیام شرط‌بندی همینجا فرستاده می‌شه."
     )
 
 async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
     markets = db.get_active_football_markets()
-    for market_id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id in markets:
+    for market_id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id, prior_home_prob in markets:
         try:
             fstatus = await football.get_fixture_status(fixture_id)
         except Exception as e:
@@ -877,7 +893,7 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"Failed to send halftime message to {chat_id}: {e}")
 
         if short in football.LIVE_STATUSES:
-            odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score)
+            odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
             bets = db.get_football_bets(market_id)
             status_label = football_status_label(short)
             text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
@@ -921,7 +937,7 @@ async def place_football_bet_callback(update: Update, context: ContextTypes.DEFA
     if not market:
         await query.answer("این بازار وجود نداره!", show_alert=True)
         return
-    m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id, created_by = market
+    m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id, created_by, prior_home_prob = market
     if status != 'live':
         await query.answer("این بازی الان قابل شرط‌بندی نیست!", show_alert=True)
         return
