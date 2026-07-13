@@ -774,7 +774,13 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
     if user_size < bet:
         await query.answer(f"شما حداقل {bet} سانتی‌متر برای شرکت در این گروه نیاز دارید!", show_alert=True)
         return
-        
+
+    # Stake both sides' bet immediately the moment the match actually starts, so nobody
+    # can accept multiple challenges at once using the same not-yet-deducted size (each
+    # acceptance now truly locks that amount, and later checks see the reduced balance).
+    db.update_size(challenger_id, chat_id, -bet)
+    db.update_size(user.id, chat_id, -bet)
+
     challenger_info = db.get_user_info(challenger_id, chat_id)
     challenger_name = challenger_info[0] if challenger_info else "ناشناس"
         
@@ -877,6 +883,10 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         winner_milk, loser_milk = u_milk, c_milk
         msg = f"⚔️ مسابقه بین {challenger_name} و {user.first_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {user.first_name}: {val2}\n\n🎉 {user.first_name} برنده چالش شد!"
     else:
+        # Refund the escrowed main bet to both sides since nobody actually won or lost it.
+        db.update_size(challenger_id, chat_id, bet)
+        db.update_size(user.id, chat_id, bet)
+
         msg = f"⚔️ مسابقه بین {challenger_name} و {user.first_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {user.first_name}: {val2}\n\n🤝 مساوی شد! هیچکس چیزی از دست نداد."
         msg += msg_item_log
         if bets:
@@ -916,8 +926,11 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         else:
             msg_item_log += f"- کاندوم {loser_name} عمل نکرد (احتمال ۵۰٪)!\n"
 
-    db.update_size(loser_id, chat_id, -loser_loss)
-    db.update_size(winner_id, chat_id, winner_gain)
+    # Both sides already had `bet` deducted at acceptance time (escrow). The winner gets
+    # their own stake back plus their net winnings; the loser gets back whatever their
+    # final loss (after perks/items) came out short of their already-staked bet.
+    db.update_size(winner_id, chat_id, winner_gain + bet)
+    db.update_size(loser_id, chat_id, bet - loser_loss)
     db.record_match_result(winner_id, loser_id, chat_id)
 
     msg += f"\n💰 شرط اصلی: {bet} سانت"
@@ -1056,17 +1069,33 @@ async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Both agreed! Re-roll!
     del rematch_agreements[key]
-    
+
     p1_info = db.get_user_info(p1_id, chat_id)
     p2_info = db.get_user_info(p2_id, chat_id)
     p1_name = p1_info[0] if p1_info else "نفر ۱"
     p2_name = p2_info[0] if p2_info else "نفر ۲"
-    
+
+    p1_size, _, _ = db.get_user(p1_id, chat_id, None, None)
+    p2_size, _, _ = db.get_user(p2_id, chat_id, None, None)
+    if p1_size < bet or p2_size < bet:
+        short_name = p1_name if p1_size < bet else p2_name
+        await query.answer(f"{short_name} دیگه به اندازه کافی سایز برای این شرط نداره! ریمچ لغو شد.", show_alert=True)
+        try:
+            await query.edit_message_text(f"🔄 ریمچ بین {p1_name} و {p2_name} لغو شد؛ {short_name} دیگه به اندازه کافی سایز نداره.")
+        except:
+            pass
+        return
+
+    # Stake both sides' bet immediately, same as a fresh challenge, so this can't be
+    # combined with another pending challenge/rematch to over-commit past real balance.
+    db.update_size(p1_id, chat_id, -bet)
+    db.update_size(p2_id, chat_id, -bet)
+
     await query.answer("هر دو موافقت کردن! تاس‌ها دوباره ریخته میشه...")
     await query.edit_message_text(f"🔄 ریمچ بین {p1_name} و {p2_name}!\nدر حال ریختن تاس...")
-    
+
     await asyncio.sleep(2)
-    
+
     val1 = _dice_rng.randint(1, 6)
     val2 = _dice_rng.randint(1, 6)
 
@@ -1077,14 +1106,17 @@ async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         winner_id, loser_id = p2_id, p1_id
         winner_name, loser_name = p2_name, p1_name
     else:
-        # Tie again!
+        # Tie again! Refund the escrowed bet since neither side actually lost it.
+        db.update_size(p1_id, chat_id, bet)
+        db.update_size(p2_id, chat_id, bet)
         msg = f"🔄 ریمچ بین {p1_name} و {p2_name}\n🎲 تاس {p1_name}: {val1}\n🎲 تاس {p2_name}: {val2}\n\n🤝 دوباره مساوی شد!\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
         keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{p1_id}_{p2_id}_{bet}")]]
         await query.edit_message_text(text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    
-    db.update_size(loser_id, chat_id, -bet)
-    db.update_size(winner_id, chat_id, bet)
+
+    # Both sides already had `bet` staked above; the winner gets their stake back plus
+    # the loser's stake, the loser's stake simply stays gone (no further deduction).
+    db.update_size(winner_id, chat_id, bet * 2)
     db.record_match_result(winner_id, loser_id, chat_id)
 
     winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
