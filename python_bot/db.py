@@ -44,9 +44,15 @@ def init_db():
                 last_grown TEXT DEFAULT '',
                 perk TEXT DEFAULT 'عادی',
                 active_item TEXT DEFAULT '',
+                joined_at TIMESTAMPTZ DEFAULT now(),
                 PRIMARY KEY (user_id, chat_id)
             )
         ''')
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ")
+        # Backfill pre-existing players as if they joined a month ago, so this migration
+        # doesn't retroactively block everyone's /dd the moment it ships.
+        c.execute("UPDATE users SET joined_at = now() - interval '30 days' WHERE joined_at IS NULL")
+        c.execute("ALTER TABLE users ALTER COLUMN joined_at SET DEFAULT now()")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS chats (
@@ -203,6 +209,23 @@ def get_user(user_id, chat_id, username, first_name):
             params.extend([user_id, chat_id])
             c.execute(f'UPDATE users SET {", ".join(updates)} WHERE user_id = %s AND chat_id = %s', params)
         return row
+
+
+DONATION_MIN_DAYS = 7
+
+
+def get_donation_wait_remaining(user_id, chat_id):
+    """Returns a timedelta if this user still needs to wait before they can use /dd in this
+    group (within DONATION_MIN_DAYS of their first activity here), else None."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT joined_at + make_interval(days => %s) - now() FROM users "
+            "WHERE user_id = %s AND chat_id = %s AND joined_at + make_interval(days => %s) > now()",
+            (DONATION_MIN_DAYS, user_id, chat_id, DONATION_MIN_DAYS)
+        )
+        row = c.fetchone()
+        return row[0] if row else None
 
 
 def get_global_user(user_id, username, first_name):

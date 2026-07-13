@@ -418,12 +418,21 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
     db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    wait_remaining = db.get_donation_wait_remaining(user.id, chat_id)
+    if wait_remaining is not None:
+        days = max(1, int(wait_remaining.total_seconds() // 86400) + 1)
+        await update.message.reply_text(
+            f"تازه به این گروه پیوسته‌اید! تا {days} روز دیگر می‌توانید سایز اهدا کنید."
+        )
+        return
+
     target_user_id, target_first_name = get_target_user(update, text, chat_id)
-    
+
     if not target_user_id:
         await update.message.reply_text("استفاده صحیح:\n/dd @username <مقدار>\nیا ریپلای کردن روی پیام شخص و تایپ /dd <مقدار>")
         return
-        
+
     if target_user_id == user.id:
         await update.message.reply_text("نمی‌توانید به خودتان اهدا کنید!")
         return
