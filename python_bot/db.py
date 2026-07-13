@@ -45,6 +45,8 @@ def init_db():
                 perk TEXT DEFAULT 'عادی',
                 active_item TEXT DEFAULT '',
                 joined_at TIMESTAMPTZ DEFAULT now(),
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
                 PRIMARY KEY (user_id, chat_id)
             )
         ''')
@@ -53,6 +55,8 @@ def init_db():
         # doesn't retroactively block everyone's /dd the moment it ships.
         c.execute("UPDATE users SET joined_at = now() - interval '30 days' WHERE joined_at IS NULL")
         c.execute("ALTER TABLE users ALTER COLUMN joined_at SET DEFAULT now()")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS chats (
@@ -226,6 +230,23 @@ def get_donation_wait_remaining(user_id, chat_id):
         )
         row = c.fetchone()
         return row[0] if row else None
+
+
+def record_match_result(winner_id, loser_id, chat_id):
+    """Increments the winner's wins and the loser's losses for a decided (non-tie) challenge/rematch."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET wins = wins + 1 WHERE user_id = %s AND chat_id = %s", (winner_id, chat_id))
+        c.execute("UPDATE users SET losses = losses + 1 WHERE user_id = %s AND chat_id = %s", (loser_id, chat_id))
+
+
+def get_win_loss(user_id, chat_id):
+    """Returns (wins, losses) for a user in a group, defaulting to (0, 0) if they have no row."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT wins, losses FROM users WHERE user_id = %s AND chat_id = %s", (user_id, chat_id))
+        row = c.fetchone()
+        return row if row else (0, 0)
 
 
 def get_global_user(user_id, username, first_name):
