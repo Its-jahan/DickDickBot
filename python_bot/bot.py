@@ -38,6 +38,8 @@ def roll_nonzero(low, high):
     return delta
 
 def get_dick_name(size):
+    if size is None:
+        size = 0
     if size < 0:
         return "شاه کص"
     elif size < 100:
@@ -56,6 +58,7 @@ def build_top_text(chat_id):
         return None
     msg = "🏆 برترین‌های این گروه:\n\n"
     for i, (first_name, size) in enumerate(rows, 1):
+        size = size or 0
         d_name = get_dick_name(size)
         if i == 1:
             title = f"🥇 {d_name} طلا"
