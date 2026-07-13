@@ -1234,9 +1234,12 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not last_chat:
             results = [InlineQueryResultArticle(
                 id=str(uuid4()),
-                title="⚠️ گروه شما شناخته نشده",
-                description="اول یه بار تو گروه از ربات استفاده کن",
-                input_message_content=InputTextMessageContent("⚠️ اول باید یه بار تو گروه از ربات استفاده کنی تا گروهت رو بشناسه.")
+                title="⚠️ گروه شما مشخص نیست",
+                description="یا هنوز تو گروهی بازی نکردید، یا عضو چند گروه هستید",
+                input_message_content=InputTextMessageContent(
+                    "⚠️ نمی‌تونم مطمئن بشم منظورتون کدوم گروهه (یا هنوز تو هیچ گروهی بازی نکردید، یا عضو چند گروه هستید که ربات توشونه).\n"
+                    "برای استفادهٔ مطمئن از آیتم مستقیم، داخل خودِ گروه از `/u نام_آیتم @username` استفاده کنید."
+                )
             )]
         else:
             target_row = db.find_user_by_username(target_username, last_chat)
