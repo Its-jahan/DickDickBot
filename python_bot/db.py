@@ -1,7 +1,17 @@
+import datetime
 import os
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 
 import psycopg2
+
+IRAN_TZ = ZoneInfo("Asia/Tehran")
+
+
+def _tehran_today_str():
+    """The current date (YYYY-MM-DD) in Iran time - the daily key growth stamps into
+    last_grown, and therefore the day a rolled perk is valid for."""
+    return datetime.datetime.now(IRAN_TZ).date().isoformat()
 
 # Connection string for the Supabase Postgres database.
 # Grab it from your Supabase project: Settings -> Database -> Connection string
@@ -236,6 +246,11 @@ def get_user(user_id, chat_id, username, first_name):
         # comparison callers make against this value.
         if row[0] is None:
             row = (0.0,) + row[1:]
+        # Perks only last the day they were rolled (Iran time). A perk is granted
+        # together with the daily growth, so last_grown IS the perk's date: past
+        # Tehran midnight it reads back as عادی until the user grows again.
+        if row[2] != 'عادی' and row[1] != _tehran_today_str():
+            row = row[:2] + ('عادی',)
         return row
 
 
