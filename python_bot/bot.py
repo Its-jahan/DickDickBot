@@ -147,7 +147,6 @@ PERK_DESCRIPTIONS = {
     "جقی": "موقع چالش ممکنه عدد تاس رو رندوم به شدت بالا یا پایین ببره!",
     "کیرکلفت": "شما پرک **کیرکلفت 💪** گرفتید! (یه رشد اضافه هم بلافاصله گیرت اومد).",
     "کص‌شانس": "شما پرک **کص‌شانس 🍀** گرفتید! (امروز شانس پیدا کردن آیتم دو برابره).",
-    "خایه‌سنگی": "شما پرک **خایه‌سنگی 🛡️** گرفتید! (اگه امروز تو چالش ببازید، هیچی از دست نمی‌دید).",
     "کیرشکسته": "شما پرک **کیرشکسته 💔** گرفتید! (یه مقدار سانت هم بلافاصله از دست دادید).",
     "کون‌سوخته": "شما پرک **کون‌سوخته 🔥** گرفتید! (امروز نمی‌تونید از هیچ آیتمی استفاده کنید).",
     "حروم‌دست": "شما پرک **حروم‌دست 🎲** گرفتید! (تاس‌های امروزتون تو چالش ۲ عدد کمتر محاسبه میشه)."
@@ -1219,17 +1218,12 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         
     if loser_perk == "لاشی":
         loser_loss = int(bet * 0.5)
-    elif loser_perk == "خایه‌سنگی":
-        loser_loss = 0
 
     if winner_milk:
-        if loser_perk == "خایه‌سنگی":
-            msg_item_log += f"- شیر موز {winner_name} به خایه‌سنگی {loser_name} نخورد و هیچی نتونست بدزده!\n"
-        else:
-            extra = random.randint(5, 15)
-            winner_gain += extra
-            loser_loss += extra
-            msg_item_log += f"- {winner_name} به لطف شیر موز {extra} سانت بیشتر دزدید!\n"
+        extra = random.randint(5, 15)
+        winner_gain += extra
+        loser_loss += extra
+        msg_item_log += f"- {winner_name} به لطف شیر موز {extra} سانت بیشتر دزدید!\n"
         
     if loser_condom:
         if random.random() < 0.5:
@@ -1240,8 +1234,8 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
             msg_item_log += f"- کاندوم {loser_name} عمل نکرد (احتمال ۵۰٪)!\n"
 
     # Zero-sum guard: the winner only ever receives what the loser actually lost, so
-    # anything that shields the loser (خایه‌سنگی، لاشی، کاندوم) shrinks the winner's
-    # take to match instead of minting size out of thin air.
+    # anything that shields the loser (لاشی، کاندوم) shrinks the winner's take to
+    # match instead of minting size out of thin air.
     winner_gain = min(winner_gain, loser_loss)
 
     # Both sides already had `bet` deducted at acceptance time (escrow). The winner gets
@@ -1258,8 +1252,6 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         msg += f"\n({winner_perk} باعث شد برنده {winner_gain} سانت گیرش بیاد)"
     if loser_perk == "لاشی" and loser_loss > 0:
         msg += f"\n(لاشی باعث شد بازنده فقط {loser_loss} سانت از دست بده و برنده هم فقط همون‌قدر بگیره)"
-    if loser_perk == "خایه‌سنگی":
-        msg += "\n(خایه‌سنگی باعث شد بازنده هیچی از دست نده و برنده هم هیچی گیرش نیاد)"
 
     # Fetch new stats
     winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
@@ -1488,7 +1480,7 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     perk_pool = [
         "عادی", "عادی", "عادی", "عادی", "عادی", "عادی", "عادی",
         "جاکش", "کص‌کش", "حرومزاده", "لاشی", "خایه‌مال", "کون‌گشاد", "زن جنده", "جقی",
-        "کیرکلفت", "کص‌شانس", "خایه‌سنگی", "کیرشکسته", "کون‌سوخته", "حروم‌دست"
+        "کیرکلفت", "کص‌شانس", "کیرشکسته", "کون‌سوخته", "حروم‌دست"
     ]
     new_perk = random.choice(perk_pool)
     db.set_user_perk(user.id, chat_id, new_perk)
