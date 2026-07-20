@@ -1104,7 +1104,16 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         render_bet_message(match_state),
         reply_markup=build_bet_keyboard(match_id)
     )
-    db.set_pvp_match_message(match_id, query.message.message_id)
+    # query.message is None for a callback on a genuinely inline-posted message (the
+    # "via @dickchallengerbot" flow) - only inline_message_id is available then. Reading
+    # query.message.message_id unconditionally crashed this handler for every such
+    # challenge, right after the betting-window message was already shown but before the
+    # resolution job below got scheduled - leaving the match stuck forever with no dice
+    # ever rolled. Persist whichever id is actually available.
+    if query.message:
+        db.set_pvp_match_message(match_id, message_id=query.message.message_id)
+    else:
+        db.set_pvp_match_message(match_id, inline_message_id=query.inline_message_id)
 
     # Resolved by a scheduled job rather than an inline sleep here, so a bot restart
     # mid-window (e.g. a deploy landing right in the middle of the 20s betting window)
@@ -1113,11 +1122,15 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         pvp_resolve_job, when=BET_WINDOW_SECONDS, data={"match_id": match_id}, name=f"pvp_resolve_{match_id}"
     )
 
-async def deliver_pvp_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, text, reply_markup=None):
+async def deliver_pvp_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, text, reply_markup=None, inline_message_id=None):
     """Edits the original match message if possible, falling back to a fresh message
-    (e.g. the old message can no longer be edited after a restart)."""
+    (e.g. the old message can no longer be edited after a restart, or there was never a
+    normal message_id to begin with - just an inline_message_id)."""
     try:
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+        if inline_message_id:
+            await context.bot.edit_message_text(inline_message_id=inline_message_id, text=text, reply_markup=reply_markup)
+        else:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
     except Exception:
         try:
             await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
@@ -1136,7 +1149,7 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
     match = db.get_pvp_match(match_id)
     if not match:
         return
-    chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet, message_id, _status = match
+    chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet, message_id, inline_message_id, _status = match
     bet = int(bet)
     bets = {}
 
@@ -1233,7 +1246,7 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
                 msg += "\n\n🎰 چون مساوی شد، شرط‌بندی‌های تماشاگران باطل شد و سانتی که گذاشته بودن بهشون برگشت."
             msg += "\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
             keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{challenger_id}_{acceptor_id}_{bet}")]]
-            await deliver_pvp_message(context, chat_id, message_id, msg, InlineKeyboardMarkup(keyboard))
+            await deliver_pvp_message(context, chat_id, message_id, msg, InlineKeyboardMarkup(keyboard), inline_message_id=inline_message_id)
             return
 
         winner_gain = bet
@@ -1305,7 +1318,7 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
                 else:
                     msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"
 
-        await deliver_pvp_message(context, chat_id, message_id, msg)
+        await deliver_pvp_message(context, chat_id, message_id, msg, inline_message_id=inline_message_id)
     except Exception:
         logging.exception(f"Failed to resolve PvP match {match_id}; refunding escrowed bets")
         db.update_size(challenger_id, chat_id, bet)
@@ -1315,7 +1328,8 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         await deliver_pvp_message(
             context, chat_id, message_id,
             f"⚠️ مشکلی در تعیین نتیجهٔ مسابقهٔ {challenger_name} و {acceptor_name} پیش اومد؛ "
-            f"شرط اصلی و شرط‌های تماشاگران بهشون برگردونده شد."
+            f"شرط اصلی و شرط‌های تماشاگران بهشون برگردونده شد.",
+            inline_message_id=inline_message_id
         )
 
 async def pvp_resolve_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1343,10 +1357,10 @@ async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     amount = int(amount_str)
 
     match = db.get_pvp_match(match_id)
-    if not match or match[7] != 'pending':
+    if not match or match[8] != 'pending':
         await query.answer("زمان شرط‌بندی این مسابقه تموم شده یا نامعتبره!", show_alert=True)
         return
-    chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, match_bet, _message_id, _status = match
+    chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, match_bet, _message_id, _inline_message_id, _status = match
 
     if user.id in (challenger_id, acceptor_id):
         await query.answer("شرکت‌کننده‌های مسابقه نمی‌تونن روی مسابقه خودشون شرط ببندن!", show_alert=True)

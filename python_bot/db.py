@@ -186,10 +186,12 @@ def init_db():
                 acceptor_name TEXT,
                 bet DOUBLE PRECISION,
                 message_id BIGINT,
+                inline_message_id TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
+        c.execute("ALTER TABLE pvp_matches ADD COLUMN IF NOT EXISTS inline_message_id TEXT")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS pvp_match_bets (
@@ -702,20 +704,23 @@ def create_pvp_match(match_id, chat_id, challenger_id, challenger_name, acceptor
         )
 
 
-def set_pvp_match_message(match_id, message_id):
+def set_pvp_match_message(match_id, message_id=None, inline_message_id=None):
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('UPDATE pvp_matches SET message_id = %s WHERE id = %s', (message_id, match_id))
+        c.execute(
+            'UPDATE pvp_matches SET message_id = %s, inline_message_id = %s WHERE id = %s',
+            (message_id, inline_message_id, match_id)
+        )
 
 
 def get_pvp_match(match_id):
     """Returns (chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet,
-    message_id, status) or None."""
+    message_id, inline_message_id, status) or None."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'SELECT chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet, message_id, status '
-            'FROM pvp_matches WHERE id = %s',
+            'SELECT chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet, '
+            'message_id, inline_message_id, status FROM pvp_matches WHERE id = %s',
             (match_id,)
         )
         return c.fetchone()
