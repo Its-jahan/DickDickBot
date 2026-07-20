@@ -172,6 +172,36 @@ def init_db():
         # constraint is dropped for anyone upgrading from before this was allowed.
         c.execute("ALTER TABLE football_bets DROP CONSTRAINT IF EXISTS football_bets_market_id_user_id_key")
 
+        # Persists PvP challenge matches (and spectator bets on them) so a match that's
+        # mid-way through its 20-second betting window survives a bot restart instead of
+        # being orphaned forever with the escrowed bet gone and the message stuck showing
+        # stale buttons - see resolve_pvp_match / recover_stuck_pvp_matches in bot.py.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS pvp_matches (
+                id UUID PRIMARY KEY,
+                chat_id BIGINT,
+                challenger_id BIGINT,
+                challenger_name TEXT,
+                acceptor_id BIGINT,
+                acceptor_name TEXT,
+                bet DOUBLE PRECISION,
+                message_id BIGINT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS pvp_match_bets (
+                match_id UUID REFERENCES pvp_matches(id),
+                user_id BIGINT,
+                first_name TEXT,
+                side TEXT,
+                amount DOUBLE PRECISION,
+                PRIMARY KEY (match_id, user_id)
+            )
+        ''')
+
 
 def get_last_chat(user_id):
     """Returns this user's one and only active group's chat_id, or None if they've
@@ -660,3 +690,76 @@ def get_football_bets(market_id):
             (market_id,)
         )
         return c.fetchall()
+
+
+def create_pvp_match(match_id, chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO pvp_matches (id, chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+            (match_id, chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet)
+        )
+
+
+def set_pvp_match_message(match_id, message_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE pvp_matches SET message_id = %s WHERE id = %s', (message_id, match_id))
+
+
+def get_pvp_match(match_id):
+    """Returns (chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet,
+    message_id, status) or None."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet, message_id, status '
+            'FROM pvp_matches WHERE id = %s',
+            (match_id,)
+        )
+        return c.fetchone()
+
+
+def claim_pvp_match(match_id):
+    """Atomically flips a pending match straight to 'resolved' so the scheduled job and
+    the startup-recovery sweep can never both settle (or double-pay) the same match.
+    Returns True only for the caller that won the race."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE pvp_matches SET status = 'resolved' WHERE id = %s AND status = 'pending'", (match_id,))
+        return c.rowcount > 0
+
+
+def place_pvp_bet(match_id, user_id, first_name, side, amount):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO pvp_match_bets (match_id, user_id, first_name, side, amount) VALUES (%s, %s, %s, %s, %s)',
+            (match_id, user_id, first_name, side, amount)
+        )
+
+
+def get_pvp_bets(match_id):
+    """Returns (user_id, side, amount, first_name) for every bet on this match."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, side, amount, first_name FROM pvp_match_bets WHERE match_id = %s',
+            (match_id,)
+        )
+        return c.fetchall()
+
+
+def get_stale_pending_pvp_matches(window_seconds):
+    """Returns the id of every match whose betting window closed before this call was
+    made - i.e. the process died before ever running (or scheduling) its resolution,
+    leaving it orphaned mid-flight. Picked up once at startup to settle them instead of
+    leaving the group staring at a dead betting message forever."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id FROM pvp_matches WHERE status = 'pending' AND created_at < now() - make_interval(secs => %s)",
+            (window_seconds,)
+        )
+        return [r[0] for r in c.fetchall()]
