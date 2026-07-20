@@ -104,10 +104,6 @@ TOKEN = '8802494355:AAFYiGyKph3R8wLiZoeDsELOPx07Q9ZvuVw'
 # Format: challenges[target_user_id] = challenger_user_id
 challenges = {}
 
-# Memory store for spectator betting on ongoing 1v1 matches.
-# match_id -> {"chat_id", "challenger_id", "challenger_name", "acceptor_id", "acceptor_name",
-#              "bet", "bets": {user_id: (side, amount, first_name)}}
-active_bet_matches = {}
 BET_AMOUNTS = [5, 10, 50, 100]
 BET_WINDOW_SECONDS = 20
 
@@ -1092,16 +1088,12 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
 
     challenger_info = db.get_user_info(challenger_id, chat_id)
     challenger_name = challenger_info[0] if challenger_info else "ناشناس"
-        
-    val1 = _dice_rng.randint(1, 6)
-    val2 = _dice_rng.randint(1, 6)
 
     match_id = str(uuid4())
-    active_bet_matches[match_id] = {
-        "chat_id": chat_id,
-        "challenger_id": challenger_id,
+    db.create_pvp_match(match_id, chat_id, challenger_id, challenger_name, user.id, user.first_name, bet)
+
+    match_state = {
         "challenger_name": challenger_name,
-        "acceptor_id": user.id,
         "acceptor_name": user.first_name,
         "bet": bet,
         "bets": {},
@@ -1109,174 +1101,236 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
 
     await query.answer("چالش پذیرفته شد!")
     await query.edit_message_text(
-        render_bet_message(active_bet_matches[match_id]),
+        render_bet_message(match_state),
         reply_markup=build_bet_keyboard(match_id)
     )
+    db.set_pvp_match_message(match_id, query.message.message_id)
 
-    await asyncio.sleep(BET_WINDOW_SECONDS)
+    # Resolved by a scheduled job rather than an inline sleep here, so a bot restart
+    # mid-window (e.g. a deploy landing right in the middle of the 20s betting window)
+    # can't silently kill this handler and leave the match orphaned - see resolve_pvp_match.
+    context.job_queue.run_once(
+        pvp_resolve_job, when=BET_WINDOW_SECONDS, data={"match_id": match_id}, name=f"pvp_resolve_{match_id}"
+    )
 
-    match_state = active_bet_matches.pop(match_id, None)
-    bets = match_state["bets"] if match_state else {}
+async def deliver_pvp_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, text, reply_markup=None):
+    """Edits the original match message if possible, falling back to a fresh message
+    (e.g. the old message can no longer be edited after a restart)."""
+    try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logging.error(f"Failed to deliver PvP match result to {chat_id}: {e}")
 
-    c_perk = challenger_row[2]
-    
-    # Active Items
-    c_item = db.get_user_active_item(challenger_id, chat_id)
-    u_item = db.get_user_active_item(user.id, chat_id)
-    
-    # Clear active items
-    db.clear_user_active_item(challenger_id, chat_id)
-    db.clear_user_active_item(user.id, chat_id)
-    
-    # Process Item Interactions
-    # Spray: reduces opponent dice by 1
-    if c_item == "اسپری": val2 = max(1, val2 - 1)
-    if u_item == "اسپری": val1 = max(1, val1 - 1)
-    
-    # Apply Dice Perks
-    if c_perk == "کون‌گشاد": val1 = max(1, val1 - 1)
-    elif c_perk == "زن جنده": val1 = min(6, val1 + 1)
-    elif c_perk == "حروم‌دست": val1 = max(1, val1 - 2)
+async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
+    """Settles a PvP match's dice roll BET_WINDOW_SECONDS after acceptance. This is the
+    single place both the normal post-acceptance job and the startup recovery sweep (for
+    matches orphaned by a bot restart mid-window) call to decide a winner - it reads
+    perks/items fresh from the DB instead of capturing them at accept-time, so it behaves
+    identically whether it fires right on schedule or late, after a restart."""
+    if not db.claim_pvp_match(match_id):
+        return  # already resolved (race with another caller), or doesn't exist
 
-    if user_perk == "کون‌گشاد": val2 = max(1, val2 - 1)
-    elif user_perk == "زن جنده": val2 = min(6, val2 + 1)
-    elif user_perk == "حروم‌دست": val2 = max(1, val2 - 2)
-    
-    msg_item_log = ""
-    if c_item or u_item:
-        msg_item_log += "\n🎒 **گزارش آیتم‌ها:**\n"
-        
-    if c_item == "اسپری": msg_item_log += f"- {challenger_name} اسپری زد و تاس حریف کم شد.\n"
-    if u_item == "اسپری": msg_item_log += f"- {user.first_name} اسپری زد و تاس حریف کم شد.\n"
-    
-    # Needle pierces condom
-    c_condom = True if c_item == "کاندوم" else False
-    u_condom = True if u_item == "کاندوم" else False
-    
-    if c_item == "سوزن" and u_condom:
-        u_condom = False
-        msg_item_log += f"- {challenger_name} سوزن داشت و کاندوم {user.first_name} پاره شد!\n"
-    if u_item == "سوزن" and c_condom:
-        c_condom = False
-        msg_item_log += f"- {user.first_name} سوزن داشت و کاندوم {challenger_name} پاره شد!\n"
-        
-    # Shield blocks milk
-    c_milk = True if c_item == "شیر موز" else False
-    u_milk = True if u_item == "شیر موز" else False
-    
-    if c_item == "طلسم" and u_milk:
-        u_milk = False
-        msg_item_log += f"- {challenger_name} با طلسم اثر شیر موز {user.first_name} را باطل کرد!\n"
-    if u_item == "طلسم" and c_milk:
-        c_milk = False
-        msg_item_log += f"- {user.first_name} با طلسم اثر شیر موز {challenger_name} را باطل کرد!\n"
-
-    winner_id, loser_id = None, None
-    winner_name, loser_name = "", ""
-    winner_perk, loser_perk = "", ""
-    winner_condom, loser_condom = False, False
-    winner_milk, loser_milk = False, False
-
-    if val1 > val2:
-        winner_id, loser_id = challenger_id, user.id
-        winner_name, loser_name = challenger_name, user.first_name
-        winner_perk, loser_perk = c_perk, user_perk
-        winner_condom, loser_condom = c_condom, u_condom
-        winner_milk, loser_milk = c_milk, u_milk
-        msg = f"⚔️ مسابقه بین {challenger_name} و {user.first_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {user.first_name}: {val2}\n\n🎉 {challenger_name} برنده چالش شد!"
-    elif val2 > val1:
-        winner_id, loser_id = user.id, challenger_id
-        winner_name, loser_name = user.first_name, challenger_name
-        winner_perk, loser_perk = user_perk, c_perk
-        winner_condom, loser_condom = u_condom, c_condom
-        winner_milk, loser_milk = u_milk, c_milk
-        msg = f"⚔️ مسابقه بین {challenger_name} و {user.first_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {user.first_name}: {val2}\n\n🎉 {user.first_name} برنده چالش شد!"
-    else:
-        # Refund the escrowed main bet to both sides since nobody actually won or lost it.
-        db.update_size(challenger_id, chat_id, bet)
-        db.update_size(user.id, chat_id, bet)
-
-        msg = f"⚔️ مسابقه بین {challenger_name} و {user.first_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {user.first_name}: {val2}\n\n🤝 مساوی شد! هیچکس چیزی از دست نداد."
-        msg += msg_item_log
-        if bets:
-            for bettor_id, (_, amount, _) in bets.items():
-                db.update_size(bettor_id, chat_id, amount)  # refund the staked amount
-            msg += "\n\n🎰 چون مساوی شد، شرط‌بندی‌های تماشاگران باطل شد و سانتی که گذاشته بودن بهشون برگشت."
-        msg += "\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
-        keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{challenger_id}_{user.id}_{bet}")]]
-        await query.edit_message_text(text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    match = db.get_pvp_match(match_id)
+    if not match:
         return
-        
-    winner_gain = bet
-    loser_loss = bet
-    
-    if winner_perk == "کص‌کش":
-        winner_gain = int(bet * 1.2)
-        loser_loss = winner_gain
-    elif winner_perk == "جاکش":
-        winner_gain = int(bet * 0.5)
-        
-    if loser_perk == "لاشی":
-        loser_loss = int(bet * 0.5)
+    chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet, message_id, _status = match
+    bet = int(bet)
+    bets = {}
 
-    if winner_milk:
-        extra = random.randint(5, 15)
-        winner_gain += extra
-        loser_loss += extra
-        msg_item_log += f"- {winner_name} به لطف شیر موز {extra} سانت بیشتر دزدید!\n"
-        
-    if loser_condom:
-        if random.random() < 0.5:
-            loser_loss = 0
-            winner_gain = 0
-            msg_item_log += f"- {loser_name} کاندوم داشت و سایزش کم نشد! (برنده هم چیزی نگرفت)\n"
+    try:
+        bets = {uid: (side, amount, name) for uid, side, amount, name in db.get_pvp_bets(match_id)}
+
+        _, _, c_perk = db.get_user(challenger_id, chat_id, None, None)
+        _, _, user_perk = db.get_user(acceptor_id, chat_id, None, None)
+
+        val1 = _dice_rng.randint(1, 6)
+        val2 = _dice_rng.randint(1, 6)
+
+        # Active Items
+        c_item = db.get_user_active_item(challenger_id, chat_id)
+        u_item = db.get_user_active_item(acceptor_id, chat_id)
+
+        # Clear active items
+        db.clear_user_active_item(challenger_id, chat_id)
+        db.clear_user_active_item(acceptor_id, chat_id)
+
+        # Process Item Interactions
+        # Spray: reduces opponent dice by 1
+        if c_item == "اسپری": val2 = max(1, val2 - 1)
+        if u_item == "اسپری": val1 = max(1, val1 - 1)
+
+        # Apply Dice Perks
+        if c_perk == "کون‌گشاد": val1 = max(1, val1 - 1)
+        elif c_perk == "زن جنده": val1 = min(6, val1 + 1)
+        elif c_perk == "حروم‌دست": val1 = max(1, val1 - 2)
+
+        if user_perk == "کون‌گشاد": val2 = max(1, val2 - 1)
+        elif user_perk == "زن جنده": val2 = min(6, val2 + 1)
+        elif user_perk == "حروم‌دست": val2 = max(1, val2 - 2)
+
+        msg_item_log = ""
+        if c_item or u_item:
+            msg_item_log += "\n🎒 **گزارش آیتم‌ها:**\n"
+
+        if c_item == "اسپری": msg_item_log += f"- {challenger_name} اسپری زد و تاس حریف کم شد.\n"
+        if u_item == "اسپری": msg_item_log += f"- {acceptor_name} اسپری زد و تاس حریف کم شد.\n"
+
+        # Needle pierces condom
+        c_condom = True if c_item == "کاندوم" else False
+        u_condom = True if u_item == "کاندوم" else False
+
+        if c_item == "سوزن" and u_condom:
+            u_condom = False
+            msg_item_log += f"- {challenger_name} سوزن داشت و کاندوم {acceptor_name} پاره شد!\n"
+        if u_item == "سوزن" and c_condom:
+            c_condom = False
+            msg_item_log += f"- {acceptor_name} سوزن داشت و کاندوم {challenger_name} پاره شد!\n"
+
+        # Shield blocks milk
+        c_milk = True if c_item == "شیر موز" else False
+        u_milk = True if u_item == "شیر موز" else False
+
+        if c_item == "طلسم" and u_milk:
+            u_milk = False
+            msg_item_log += f"- {challenger_name} با طلسم اثر شیر موز {acceptor_name} را باطل کرد!\n"
+        if u_item == "طلسم" and c_milk:
+            c_milk = False
+            msg_item_log += f"- {acceptor_name} با طلسم اثر شیر موز {challenger_name} را باطل کرد!\n"
+
+        winner_id, loser_id = None, None
+        winner_name, loser_name = "", ""
+        winner_perk, loser_perk = "", ""
+        winner_condom, loser_condom = False, False
+        winner_milk, loser_milk = False, False
+
+        if val1 > val2:
+            winner_id, loser_id = challenger_id, acceptor_id
+            winner_name, loser_name = challenger_name, acceptor_name
+            winner_perk, loser_perk = c_perk, user_perk
+            winner_condom, loser_condom = c_condom, u_condom
+            winner_milk, loser_milk = c_milk, u_milk
+            msg = f"⚔️ مسابقه بین {challenger_name} و {acceptor_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {acceptor_name}: {val2}\n\n🎉 {challenger_name} برنده چالش شد!"
+        elif val2 > val1:
+            winner_id, loser_id = acceptor_id, challenger_id
+            winner_name, loser_name = acceptor_name, challenger_name
+            winner_perk, loser_perk = user_perk, c_perk
+            winner_condom, loser_condom = u_condom, c_condom
+            winner_milk, loser_milk = u_milk, c_milk
+            msg = f"⚔️ مسابقه بین {challenger_name} و {acceptor_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {acceptor_name}: {val2}\n\n🎉 {acceptor_name} برنده چالش شد!"
         else:
-            msg_item_log += f"- کاندوم {loser_name} عمل نکرد (احتمال ۵۰٪)!\n"
+            # Refund the escrowed main bet to both sides since nobody actually won or lost it.
+            db.update_size(challenger_id, chat_id, bet)
+            db.update_size(acceptor_id, chat_id, bet)
 
-    # Zero-sum guard: the winner only ever receives what the loser actually lost, so
-    # anything that shields the loser (لاشی، کاندوم) shrinks the winner's take to
-    # match instead of minting size out of thin air.
-    winner_gain = min(winner_gain, loser_loss)
+            msg = f"⚔️ مسابقه بین {challenger_name} و {acceptor_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {acceptor_name}: {val2}\n\n🤝 مساوی شد! هیچکس چیزی از دست نداد."
+            msg += msg_item_log
+            if bets:
+                for bettor_id, (_, amount, _) in bets.items():
+                    db.update_size(bettor_id, chat_id, amount)  # refund the staked amount
+                msg += "\n\n🎰 چون مساوی شد، شرط‌بندی‌های تماشاگران باطل شد و سانتی که گذاشته بودن بهشون برگشت."
+            msg += "\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
+            keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{challenger_id}_{acceptor_id}_{bet}")]]
+            await deliver_pvp_message(context, chat_id, message_id, msg, InlineKeyboardMarkup(keyboard))
+            return
 
-    # Both sides already had `bet` deducted at acceptance time (escrow). The winner gets
-    # their own stake back plus their net winnings; the loser gets back whatever their
-    # final loss (after perks/items) came out short of their already-staked bet.
-    db.update_size(winner_id, chat_id, winner_gain + bet)
-    db.update_size(loser_id, chat_id, bet - loser_loss)
-    db.record_match_result(winner_id, loser_id, chat_id)
+        winner_gain = bet
+        loser_loss = bet
 
-    msg += f"\n💰 شرط اصلی: {bet} سانت"
-    msg += msg_item_log
-    
-    if winner_perk in ["کص‌کش", "جاکش"] and winner_gain > 0:
-        msg += f"\n({winner_perk} باعث شد برنده {winner_gain} سانت گیرش بیاد)"
-    if loser_perk == "لاشی" and loser_loss > 0:
-        msg += f"\n(لاشی باعث شد بازنده فقط {loser_loss} سانت از دست بده و برنده هم فقط همون‌قدر بگیره)"
+        if winner_perk == "کص‌کش":
+            winner_gain = int(bet * 1.2)
+            loser_loss = winner_gain
+        elif winner_perk == "جاکش":
+            winner_gain = int(bet * 0.5)
 
-    # Fetch new stats
-    winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
-    loser_size, _, _ = db.get_user(loser_id, chat_id, None, None)
+        if loser_perk == "لاشی":
+            loser_loss = int(bet * 0.5)
 
-    w_dname = get_dick_name(winner_size)
-    l_dname = get_dick_name(loser_size)
+        if winner_milk:
+            extra = random.randint(5, 15)
+            winner_gain += extra
+            loser_loss += extra
+            msg_item_log += f"- {winner_name} به لطف شیر موز {extra} سانت بیشتر دزدید!\n"
 
-    msg += f"\n\n📈 {w_dname} {winner_name} شد {int(winner_size)} سانتی‌متر!"
-    msg += f"\n📉 {l_dname} {loser_name} شد {int(loser_size)} سانتی‌متر!"
-
-    if bets:
-        # Bettors already had their stake deducted the moment they placed the bet (see
-        # place_bet_callback), so a correct guess pays back double the stake (stake + winnings)
-        # and a wrong guess pays back nothing - the staked amount is simply gone.
-        correct_side = "win" if winner_id == challenger_id else "lose"
-        msg += "\n\n🎰 نتیجهٔ شرط‌بندی‌ها:"
-        for bettor_id, (side, amount, bettor_name) in bets.items():
-            if side == correct_side:
-                db.update_size(bettor_id, chat_id, amount * 2)
-                msg += f"\n✅ {bettor_name}: {int(amount)} گذاشت و {int(amount * 2)} گرفت (سود {int(amount)})"
+        if loser_condom:
+            if random.random() < 0.5:
+                loser_loss = 0
+                winner_gain = 0
+                msg_item_log += f"- {loser_name} کاندوم داشت و سایزش کم نشد! (برنده هم چیزی نگرفت)\n"
             else:
-                msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"
+                msg_item_log += f"- کاندوم {loser_name} عمل نکرد (احتمال ۵۰٪)!\n"
 
-    await query.edit_message_text(text=msg)
+        # Zero-sum guard: the winner only ever receives what the loser actually lost, so
+        # anything that shields the loser (لاشی، کاندوم) shrinks the winner's take to
+        # match instead of minting size out of thin air.
+        winner_gain = min(winner_gain, loser_loss)
+
+        # Both sides already had `bet` deducted at acceptance time (escrow). The winner gets
+        # their own stake back plus their net winnings; the loser gets back whatever their
+        # final loss (after perks/items) came out short of their already-staked bet.
+        db.update_size(winner_id, chat_id, winner_gain + bet)
+        db.update_size(loser_id, chat_id, bet - loser_loss)
+        db.record_match_result(winner_id, loser_id, chat_id)
+
+        msg += f"\n💰 شرط اصلی: {bet} سانت"
+        msg += msg_item_log
+
+        if winner_perk in ["کص‌کش", "جاکش"] and winner_gain > 0:
+            msg += f"\n({winner_perk} باعث شد برنده {winner_gain} سانت گیرش بیاد)"
+        if loser_perk == "لاشی" and loser_loss > 0:
+            msg += f"\n(لاشی باعث شد بازنده فقط {loser_loss} سانت از دست بده و برنده هم فقط همون‌قدر بگیره)"
+
+        # Fetch new stats
+        winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
+        loser_size, _, _ = db.get_user(loser_id, chat_id, None, None)
+
+        w_dname = get_dick_name(winner_size)
+        l_dname = get_dick_name(loser_size)
+
+        msg += f"\n\n📈 {w_dname} {winner_name} شد {int(winner_size)} سانتی‌متر!"
+        msg += f"\n📉 {l_dname} {loser_name} شد {int(loser_size)} سانتی‌متر!"
+
+        if bets:
+            # Bettors already had their stake deducted the moment they placed the bet (see
+            # place_bet_callback), so a correct guess pays back double the stake (stake + winnings)
+            # and a wrong guess pays back nothing - the staked amount is simply gone.
+            correct_side = "win" if winner_id == challenger_id else "lose"
+            msg += "\n\n🎰 نتیجهٔ شرط‌بندی‌ها:"
+            for bettor_id, (side, amount, bettor_name) in bets.items():
+                if side == correct_side:
+                    db.update_size(bettor_id, chat_id, amount * 2)
+                    msg += f"\n✅ {bettor_name}: {int(amount)} گذاشت و {int(amount * 2)} گرفت (سود {int(amount)})"
+                else:
+                    msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"
+
+        await deliver_pvp_message(context, chat_id, message_id, msg)
+    except Exception:
+        logging.exception(f"Failed to resolve PvP match {match_id}; refunding escrowed bets")
+        db.update_size(challenger_id, chat_id, bet)
+        db.update_size(acceptor_id, chat_id, bet)
+        for bettor_id, (_, amount, _) in bets.items():
+            db.update_size(bettor_id, chat_id, amount)
+        await deliver_pvp_message(
+            context, chat_id, message_id,
+            f"⚠️ مشکلی در تعیین نتیجهٔ مسابقهٔ {challenger_name} و {acceptor_name} پیش اومد؛ "
+            f"شرط اصلی و شرط‌های تماشاگران بهشون برگردونده شد."
+        )
+
+async def pvp_resolve_job(context: ContextTypes.DEFAULT_TYPE):
+    await resolve_pvp_match(context, context.job.data["match_id"])
+
+async def recover_stuck_pvp_matches(context: ContextTypes.DEFAULT_TYPE):
+    """Runs once shortly after startup: settles any PvP match whose betting window had
+    already closed before the process died mid-flight (e.g. a deploy restart landing
+    right in the middle of someone's 20-second betting window), so it never gets left
+    showing a dead betting message forever."""
+    for match_id in db.get_stale_pending_pvp_matches(BET_WINDOW_SECONDS):
+        try:
+            await resolve_pvp_match(context, match_id)
+        except Exception as e:
+            logging.error(f"Failed to recover stuck PvP match {match_id}: {e}")
 
 async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1288,36 +1342,43 @@ async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     match_id, side, amount_str = data[1], data[2], data[3]
     amount = int(amount_str)
 
-    match_state = active_bet_matches.get(match_id)
-    if not match_state:
+    match = db.get_pvp_match(match_id)
+    if not match or match[7] != 'pending':
         await query.answer("زمان شرط‌بندی این مسابقه تموم شده یا نامعتبره!", show_alert=True)
         return
+    chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, match_bet, _message_id, _status = match
 
-    if user.id in (match_state["challenger_id"], match_state["acceptor_id"]):
+    if user.id in (challenger_id, acceptor_id):
         await query.answer("شرکت‌کننده‌های مسابقه نمی‌تونن روی مسابقه خودشون شرط ببندن!", show_alert=True)
         return
 
-    if user.id in match_state["bets"]:
+    existing_bets = db.get_pvp_bets(match_id)
+    if any(uid == user.id for uid, _, _, _ in existing_bets):
         await query.answer("شما قبلاً روی این مسابقه شرط بسته‌اید!", show_alert=True)
         return
 
-    chat_id = match_state["chat_id"]
     user_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     if user_size < amount:
         await query.answer(f"شما به اندازه کافی سانتی‌متر ندارید! سایز فعلی شما: {int(user_size)}", show_alert=True)
         return
 
     # Stake the bet immediately: deducted now, paid back double on a correct guess,
-    # gone for good on a wrong one (see the settlement logic in accept_challenge_callback).
+    # gone for good on a wrong one (see the settlement logic in resolve_pvp_match).
     db.update_size(user.id, chat_id, -amount)
-    match_state["bets"][user.id] = (side, amount, user.first_name)
+    db.place_pvp_bet(match_id, user.id, user.first_name, side, amount)
     side_fa = "برد" if side == "win" else "باخت"
     await query.answer(
-        f"{amount} سانت گذاشتید روی {side_fa} {match_state['challenger_name']}! "
+        f"{amount} سانت گذاشتید روی {side_fa} {challenger_name}! "
         f"اگه درست حدس بزنید {amount * 2} سانت می‌گیرید، وگرنه همین {amount} سانت از دست میره.",
         show_alert=True
     )
 
+    match_state = {
+        "challenger_name": challenger_name,
+        "acceptor_name": acceptor_name,
+        "bet": int(match_bet),
+        "bets": {uid: (s, a, n) for uid, s, a, n in db.get_pvp_bets(match_id)},
+    }
     try:
         await query.edit_message_text(
             render_bet_message(match_state),
@@ -1760,6 +1821,7 @@ if __name__ == '__main__':
     
     app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(poll_football_markets, interval=FOOTBALL_POLL_INTERVAL_SECONDS, first=10)
+    app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
 
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', start))
