@@ -1821,6 +1821,7 @@ if __name__ == '__main__':
     
     app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(poll_football_markets, interval=FOOTBALL_POLL_INTERVAL_SECONDS, first=10)
+    app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
 
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', start))
