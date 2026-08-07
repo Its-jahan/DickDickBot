@@ -83,6 +83,12 @@ def init_db():
         c.execute("ALTER TABLE users ALTER COLUMN joined_at SET DEFAULT now()")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0")
+        # Consecutive days of growth (see claim_daily_growth), the anti-spam clock for
+        # /dozdi, and how long a betrayed-the-king player wears the خائن mark.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS streak INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_theft_at TIMESTAMPTZ")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS traitor_until TIMESTAMPTZ")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS chats (
@@ -149,53 +155,77 @@ def init_db():
             )
         ''')
 
+        # The football betting feature was removed; drop its tables so they stop
+        # taking up space. Every bet that ever existed belonged to a market that had
+        # already finished and paid out, so nothing is owed to anyone here.
+        c.execute("DROP TABLE IF EXISTS football_bets")
+        c.execute("DROP TABLE IF EXISTS football_markets")
+
+        # The throne. One row per group: who currently wears the crown, who they took
+        # as a consort, and the date the crown last paid its tax (so the daily tax can
+        # only ever be collected once per Tehran day even if the job runs twice).
         c.execute('''
-            CREATE TABLE IF NOT EXISTS football_markets (
+            CREATE TABLE IF NOT EXISTS kingdom (
+                chat_id BIGINT PRIMARY KEY,
+                king_id BIGINT,
+                king_name TEXT,
+                crowned_at TIMESTAMPTZ,
+                consort_id BIGINT,
+                consort_name TEXT,
+                consort_since TIMESTAMPTZ,
+                last_consort_date TEXT DEFAULT '',
+                last_tax_date TEXT DEFAULT ''
+            )
+        ''')
+
+        # Daily co-op boss. One live boss per group at a time; every player may hit it
+        # once, and the reward is split by damage dealt if the group kills it in time.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS bosses (
                 id SERIAL PRIMARY KEY,
                 chat_id BIGINT,
-                fixture_id BIGINT,
-                home_team TEXT,
-                away_team TEXT,
-                status TEXT DEFAULT 'scheduled',
-                halftime_announced BOOLEAN DEFAULT FALSE,
-                result TEXT,
+                name TEXT,
+                max_hp INTEGER,
+                hp INTEGER,
+                status TEXT DEFAULT 'alive',
                 message_id BIGINT,
-                created_by BIGINT,
-                prior_home_prob DOUBLE PRECISION DEFAULT 0.5,
-                kickoff_at TIMESTAMPTZ,
-                match_started_announced BOOLEAN DEFAULT FALSE,
+                spawn_date TEXT,
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
-        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS prior_home_prob DOUBLE PRECISION DEFAULT 0.5")
-        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS kickoff_at TIMESTAMPTZ")
-        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS match_started_announced BOOLEAN DEFAULT FALSE")
-        # Last state the poller saw, so a bet can be priced from the server's own view
-        # of the match instead of whatever odds the tapped button happened to carry.
-        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS last_elapsed INTEGER DEFAULT 0")
-        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS last_home_score INTEGER DEFAULT 0")
-        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS last_away_score INTEGER DEFAULT 0")
-
         c.execute('''
-            CREATE TABLE IF NOT EXISTS football_bets (
-                id SERIAL PRIMARY KEY,
-                market_id INTEGER REFERENCES football_markets(id),
+            CREATE TABLE IF NOT EXISTS boss_hits (
+                boss_id INTEGER REFERENCES bosses(id),
                 user_id BIGINT,
                 first_name TEXT,
-                side TEXT,
-                amount DOUBLE PRECISION,
-                locked_odds DOUBLE PRECISION,
-                placed_at TIMESTAMPTZ DEFAULT now()
+                damage INTEGER,
+                PRIMARY KEY (boss_id, user_id)
             )
         ''')
-        # A user can now stack multiple bets on the same market (e.g. add more at a
-        # newer, tighter/looser odds as the match develops), so the old one-bet-per-user
-        # constraint is dropped for anyone upgrading from before this was allowed.
-        c.execute("ALTER TABLE football_bets DROP CONSTRAINT IF EXISTS football_bets_market_id_user_id_key")
-        # Per-bet settlement flag: settlement pays each bet and flips its own flag, so
-        # a crash part-way through the payout loop can be resumed without paying the
-        # already-paid bets a second time.
-        c.execute("ALTER TABLE football_bets ADD COLUMN IF NOT EXISTS settled BOOLEAN DEFAULT FALSE")
+
+        # Daily lottery. Tickets are keyed by the Tehran date they were bought for, so
+        # the midnight draw only ever looks at that day's pot.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS lottery_tickets (
+                chat_id BIGINT,
+                draw_date TEXT,
+                user_id BIGINT,
+                first_name TEXT,
+                tickets INTEGER DEFAULT 0,
+                PRIMARY KEY (chat_id, draw_date, user_id)
+            )
+        ''')
+
+        # Permanent badges. The PK is what makes each one award-once.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS achievements (
+                user_id BIGINT,
+                chat_id BIGINT,
+                code TEXT,
+                earned_at TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (user_id, chat_id, code)
+            )
+        ''')
 
         # Persists PvP challenge matches (and spectator bets on them) so a match that's
         # mid-way through its 20-second betting window survives a bot restart instead of
@@ -475,19 +505,6 @@ def try_deduct_size(user_id, chat_id, amount):
         return c.rowcount > 0
 
 
-def claim_daily_growth(user_id, chat_id, today_str):
-    """Atomically stamps today's growth date, returning True only for the first caller
-    of the day - a rapid double-tap on the grow button can't grow (or roll a perk) twice."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            'UPDATE users SET last_grown = %s '
-            'WHERE user_id = %s AND chat_id = %s AND last_grown IS DISTINCT FROM %s',
-            (today_str, user_id, chat_id, today_str)
-        )
-        return c.rowcount > 0
-
-
 def claim_challenge(nonce):
     """Atomically claims a challenge button by the nonce in its callback_data. Returns
     True only for the caller that won the race; everyone else tapping the same button
@@ -702,130 +719,16 @@ def resolve_consensus_success(vote_id, chat_id, target_id, target_name):
     return won
 
 
-def create_football_market(chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob=0.5, kickoff_at=None):
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            'INSERT INTO football_markets (chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob, kickoff_at) '
-            'VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id',
-            (chat_id, fixture_id, home_team, away_team, created_by, prior_home_prob, kickoff_at)
-        )
-        return c.fetchone()[0]
 
 
-def set_football_market_message(market_id, message_id):
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute('UPDATE football_markets SET message_id = %s WHERE id = %s', (message_id, market_id))
 
 
-def get_football_market(market_id):
-    """Returns (chat_id, fixture_id, home_team, away_team, status, halftime_announced,
-    result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced,
-    last_elapsed, last_home_score, last_away_score) or None."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            'SELECT chat_id, fixture_id, home_team, away_team, status, halftime_announced, '
-            'result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced, '
-            'COALESCE(last_elapsed, 0), COALESCE(last_home_score, 0), COALESCE(last_away_score, 0) '
-            'FROM football_markets WHERE id = %s',
-            (market_id,)
-        )
-        return c.fetchone()
 
 
-def set_football_market_state(market_id, elapsed, home_score, away_score):
-    """Records the latest polled match state, which is what bets are priced from."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            'UPDATE football_markets SET last_elapsed = %s, last_home_score = %s, last_away_score = %s WHERE id = %s',
-            (elapsed, home_score, away_score, market_id)
-        )
 
 
-def get_active_football_markets():
-    """Returns (id, chat_id, fixture_id, home_team, away_team, status, halftime_announced,
-    message_id, prior_home_prob, kickoff_at, match_started_announced) for every market that
-    hasn't finished yet, for the polling job to check."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            "SELECT id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id, "
-            "prior_home_prob, kickoff_at, match_started_announced "
-            "FROM football_markets WHERE status != 'finished'"
-        )
-        return c.fetchall()
 
 
-def set_football_market_status(market_id, status):
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute('UPDATE football_markets SET status = %s WHERE id = %s', (status, market_id))
-
-
-def mark_football_halftime_announced(market_id):
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute('UPDATE football_markets SET halftime_announced = TRUE WHERE id = %s', (market_id,))
-
-
-def mark_football_match_started(market_id):
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute('UPDATE football_markets SET match_started_announced = TRUE WHERE id = %s', (market_id,))
-
-
-def finish_football_market(market_id, result):
-    """result is 'home', 'away', or 'draw'."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            "UPDATE football_markets SET status = 'finished', result = %s WHERE id = %s",
-            (result, market_id)
-        )
-
-
-def place_football_bet(market_id, user_id, first_name, side, amount, odds):
-    """Records a new bet. A user can place any number of bets on the same market (e.g.
-    adding more later at whatever odds are current then) - each is its own independent
-    stake, locked at its own odds, settled independently."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            'INSERT INTO football_bets (market_id, user_id, first_name, side, amount, locked_odds) '
-            'VALUES (%s, %s, %s, %s, %s, %s)',
-            (market_id, user_id, first_name, side, amount, odds)
-        )
-
-
-def get_football_bets(market_id):
-    """Returns (user_id, first_name, side, amount, locked_odds) for every bet on this market."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            'SELECT user_id, first_name, side, amount, locked_odds FROM football_bets WHERE market_id = %s ORDER BY id',
-            (market_id,)
-        )
-        return c.fetchall()
-
-
-def claim_unsettled_football_bets(market_id):
-    """Atomically flips every not-yet-settled bet on this market to settled and returns
-    them as (id, user_id, first_name, side, amount, locked_odds). Settlement pays only
-    what this returns, so a poll that crashed part-way through (or two polls overlapping)
-    can never pay the same bet twice - and the market is only marked finished afterwards,
-    so a crash before that point simply retries the unpaid remainder next poll."""
-    with get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            'UPDATE football_bets SET settled = TRUE '
-            'WHERE market_id = %s AND COALESCE(settled, FALSE) = FALSE '
-            'RETURNING id, user_id, first_name, side, amount, locked_odds',
-            (market_id,)
-        )
-        return sorted(c.fetchall(), key=lambda r: r[0])
 
 
 def create_pvp_match(match_id, chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet):
@@ -907,6 +810,368 @@ def get_stale_pending_pvp_matches(window_seconds):
             (window_seconds,)
         )
         return [r[0] for r in c.fetchall()]
+
+
+# ---------------------------------------------------------------- streaks
+
+def claim_daily_growth_with_streak(user_id, chat_id, today_str, yesterday_str):
+    """Atomically stamps today's growth and rolls the streak forward in the same
+    statement: +1 if they also grew yesterday, otherwise back to 1. Returns the new
+    streak, or None if they had already grown today (so a double tap changes nothing)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET last_grown = %s, '
+            'streak = CASE WHEN last_grown = %s THEN COALESCE(streak, 0) + 1 ELSE 1 END '
+            'WHERE user_id = %s AND chat_id = %s AND last_grown IS DISTINCT FROM %s '
+            'RETURNING streak',
+            (today_str, yesterday_str, user_id, chat_id, today_str)
+        )
+        row = c.fetchone()
+        if not row:
+            return None
+        c.execute(
+            'UPDATE users SET best_streak = GREATEST(COALESCE(best_streak, 0), COALESCE(streak, 0)) '
+            'WHERE user_id = %s AND chat_id = %s',
+            (user_id, chat_id)
+        )
+        return row[0]
+
+
+def get_streak(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(streak, 0), COALESCE(best_streak, 0) FROM users WHERE user_id = %s AND chat_id = %s',
+                  (user_id, chat_id))
+        return c.fetchone() or (0, 0)
+
+
+def get_top_users_full(chat_id):
+    """Leaderboard rows with the extras the renderer decorates names with:
+    (user_id, first_name, size, streak)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, first_name, size, COALESCE(streak, 0) FROM users '
+            # user_id is the tie-break so equal sizes give a stable winner instead of
+            # whatever heap order Postgres happens to return - an unstable order here
+            # would re-crown (and so re-eject the consort) on every refresh.
+            'WHERE chat_id = %s ORDER BY size DESC NULLS LAST, user_id ASC',
+            (chat_id,)
+        )
+        return c.fetchall()
+
+
+# ---------------------------------------------------------------- theft
+
+def try_start_theft(user_id, chat_id, cooldown_seconds):
+    """Stamps the theft clock only if the cooldown has elapsed, so spamming /dozdi
+    can't get two attempts in. Returns (True, None) when the attempt may proceed, or
+    (False, seconds_remaining) when it's still on cooldown."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET last_theft_at = now() '
+            'WHERE user_id = %s AND chat_id = %s '
+            'AND (last_theft_at IS NULL OR last_theft_at < now() - make_interval(secs => %s))',
+            (user_id, chat_id, cooldown_seconds)
+        )
+        if c.rowcount > 0:
+            return True, None
+        c.execute(
+            'SELECT EXTRACT(EPOCH FROM (last_theft_at + make_interval(secs => %s) - now())) '
+            'FROM users WHERE user_id = %s AND chat_id = %s',
+            (cooldown_seconds, user_id, chat_id)
+        )
+        row = c.fetchone()
+        return False, int(row[0]) if row and row[0] else 0
+
+
+def mark_traitor(user_id, chat_id, days):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET traitor_until = now() + make_interval(days => %s) WHERE user_id = %s AND chat_id = %s',
+            (days, user_id, chat_id)
+        )
+
+
+def is_traitor(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT 1 FROM users WHERE user_id = %s AND chat_id = %s AND traitor_until > now()',
+            (user_id, chat_id)
+        )
+        return c.fetchone() is not None
+
+
+# ---------------------------------------------------------------- kingdom
+
+def get_kingdom(chat_id):
+    """Returns (king_id, king_name, consort_id, consort_name, last_consort_date,
+    last_tax_date) for a group, or None if no one has been crowned there yet."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT king_id, king_name, consort_id, consort_name, '
+            "COALESCE(last_consort_date, ''), COALESCE(last_tax_date, '') "
+            'FROM kingdom WHERE chat_id = %s',
+            (chat_id,)
+        )
+        return c.fetchone()
+
+
+def crown_king(chat_id, king_id, king_name):
+    """Crowns a new king. A change of ruler empties the throne's other seat too - the
+    consort belongs to the crown, not to the person, so a new king starts unpartnered."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO kingdom (chat_id, king_id, king_name, crowned_at) VALUES (%s, %s, %s, now()) '
+            'ON CONFLICT (chat_id) DO UPDATE SET king_id = EXCLUDED.king_id, '
+            'king_name = EXCLUDED.king_name, crowned_at = now(), '
+            'consort_id = CASE WHEN kingdom.king_id IS DISTINCT FROM EXCLUDED.king_id THEN NULL ELSE kingdom.consort_id END, '
+            'consort_name = CASE WHEN kingdom.king_id IS DISTINCT FROM EXCLUDED.king_id THEN NULL ELSE kingdom.consort_name END, '
+            # The once-a-day appointment limit belongs to the ruler, not the group: a
+            # brand-new king must be able to appoint on their coronation day even if
+            # the previous king already used the group's slot that morning.
+            "last_consort_date = CASE WHEN kingdom.king_id IS DISTINCT FROM EXCLUDED.king_id THEN '' ELSE kingdom.last_consort_date END",
+            (chat_id, king_id, king_name)
+        )
+
+
+def set_consort(chat_id, king_id, consort_id, consort_name, today_str):
+    """Seats a consort, but only for the current king and only once per Tehran day.
+    Returns True if it took effect."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE kingdom SET consort_id = %s, consort_name = %s, consort_since = now(), '
+            'last_consort_date = %s '
+            'WHERE chat_id = %s AND king_id = %s AND COALESCE(last_consort_date, %s) <> %s',
+            (consort_id, consort_name, today_str, chat_id, king_id, '', today_str)
+        )
+        return c.rowcount > 0
+
+
+def clear_consort(chat_id):
+    """Empties the consort seat and reports whether anyone was actually sitting in it,
+    so only the caller that really removed someone announces a betrayal/divorce."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE kingdom SET consort_id = NULL, consort_name = NULL, consort_since = NULL '
+            'WHERE chat_id = %s AND consort_id IS NOT NULL',
+            (chat_id,)
+        )
+        return c.rowcount > 0
+
+
+def mark_tax_collected(chat_id, today_str):
+    """Claims the day's tax for this group. Returns True only for the first caller, so
+    a re-run of the midnight job can't tax everyone twice."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE kingdom SET last_tax_date = %s WHERE chat_id = %s AND COALESCE(last_tax_date, %s) <> %s',
+            (today_str, chat_id, '', today_str)
+        )
+        return c.rowcount > 0
+
+
+def get_taxable_players(chat_id, king_id, min_size):
+    """Everyone in the group who can actually afford to be taxed."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, first_name, size FROM users '
+            'WHERE chat_id = %s AND user_id <> %s AND size >= %s',
+            (chat_id, king_id, min_size)
+        )
+        return c.fetchall()
+
+
+# ---------------------------------------------------------------- boss
+
+def spawn_boss(chat_id, name, hp, spawn_date):
+    """Creates the day's boss unless this group already has one alive or already had
+    one today. Returns the new boss id, or None if neither applies."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT 1 FROM bosses WHERE chat_id = %s AND (status = 'alive' OR spawn_date = %s)",
+            (chat_id, spawn_date)
+        )
+        if c.fetchone():
+            return None
+        c.execute(
+            'INSERT INTO bosses (chat_id, name, max_hp, hp, spawn_date) VALUES (%s, %s, %s, %s, %s) RETURNING id',
+            (chat_id, name, hp, hp, spawn_date)
+        )
+        return c.fetchone()[0]
+
+
+def set_boss_message(boss_id, message_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE bosses SET message_id = %s WHERE id = %s', (message_id, boss_id))
+
+
+def get_boss(boss_id):
+    """Returns (chat_id, name, max_hp, hp, status, message_id) or None."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT chat_id, name, max_hp, hp, status, message_id FROM bosses WHERE id = %s', (boss_id,))
+        return c.fetchone()
+
+
+def hit_boss(boss_id, user_id, first_name, damage):
+    """Records one player's single hit and applies it to the boss's HP in the same
+    transaction. Returns (accepted, remaining_hp): accepted is False when this player
+    has already hit this boss, in which case no damage is applied."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO boss_hits (boss_id, user_id, first_name, damage) VALUES (%s, %s, %s, %s) '
+            'ON CONFLICT (boss_id, user_id) DO NOTHING',
+            (boss_id, user_id, first_name, damage)
+        )
+        if c.rowcount == 0:
+            return False, None
+        c.execute(
+            "UPDATE bosses SET hp = GREATEST(0, hp - %s) WHERE id = %s AND status = 'alive' RETURNING hp",
+            (damage, boss_id)
+        )
+        row = c.fetchone()
+        if row is None:
+            # The boss died or escaped between the insert and the damage. Take the hit
+            # row back out rather than reporting a landed hit that dealt nothing, which
+            # would silently burn the player's single attack.
+            c.execute('DELETE FROM boss_hits WHERE boss_id = %s AND user_id = %s', (boss_id, user_id))
+            return False, None
+        return True, row[0]
+
+
+def claim_boss_kill(boss_id):
+    """Flips a boss to 'dead' exactly once, so only one hit triggers the payout."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE bosses SET status = 'dead' WHERE id = %s AND status = 'alive' AND hp <= 0", (boss_id,))
+        return c.rowcount > 0
+
+
+def get_boss_hits(boss_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, first_name, damage FROM boss_hits WHERE boss_id = %s ORDER BY damage DESC', (boss_id,))
+        return c.fetchall()
+
+
+def expire_bosses():
+    """Marks every still-alive boss as escaped. Returns (id, chat_id, name, message_id,
+    max_hp, hp) for each, so the group can be told it got away."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE bosses SET status = 'escaped' WHERE status = 'alive' "
+            'RETURNING id, chat_id, name, message_id, max_hp, hp'
+        )
+        return c.fetchall()
+
+
+# ---------------------------------------------------------------- lottery
+
+def buy_lottery_tickets(chat_id, draw_date, user_id, first_name, tickets):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO lottery_tickets (chat_id, draw_date, user_id, first_name, tickets) '
+            'VALUES (%s, %s, %s, %s, %s) '
+            'ON CONFLICT (chat_id, draw_date, user_id) DO UPDATE SET '
+            'tickets = lottery_tickets.tickets + EXCLUDED.tickets, first_name = EXCLUDED.first_name',
+            (chat_id, draw_date, user_id, first_name, tickets)
+        )
+
+
+def get_lottery_entries(chat_id, draw_date):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, first_name, tickets FROM lottery_tickets '
+            'WHERE chat_id = %s AND draw_date = %s AND tickets > 0 ORDER BY user_id',
+            (chat_id, draw_date)
+        )
+        return c.fetchall()
+
+
+def claim_lottery_draw(chat_id, draw_date):
+    """Deletes and returns the day's entries in one statement, so the draw can only
+    ever pay out once even if the midnight job runs twice."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'DELETE FROM lottery_tickets WHERE chat_id = %s AND draw_date = %s AND tickets > 0 '
+            'RETURNING user_id, first_name, tickets',
+            (chat_id, draw_date)
+        )
+        return sorted(c.fetchall(), key=lambda r: r[0])
+
+
+def get_lottery_chats(draw_date):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT DISTINCT chat_id FROM lottery_tickets WHERE draw_date = %s', (draw_date,))
+        return [r[0] for r in c.fetchall()]
+
+
+def get_pending_lottery_draws(before_date):
+    """Every (chat_id, draw_date) whose draw never happened - the midnight job was
+    missed (a restart, an outage), and the tickets were already paid for. Without this
+    sweep that pot would sit escrowed forever."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT DISTINCT chat_id, draw_date FROM lottery_tickets '
+            'WHERE draw_date < %s AND tickets > 0 ORDER BY draw_date',
+            (before_date,)
+        )
+        return c.fetchall()
+
+
+# ---------------------------------------------------------------- achievements
+
+def grant_achievement(user_id, chat_id, code):
+    """Returns True only the first time a player earns a badge, so the announcement
+    fires once and never again."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO achievements (user_id, chat_id, code) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
+            (user_id, chat_id, code)
+        )
+        return c.rowcount > 0
+
+
+def get_achievements(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT code FROM achievements WHERE user_id = %s AND chat_id = %s', (user_id, chat_id))
+        return [r[0] for r in c.fetchall()]
+
+
+def get_achievement_counts(chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, count(*) FROM achievements WHERE chat_id = %s GROUP BY user_id', (chat_id,))
+        return dict(c.fetchall())
+
+
+def get_all_players(chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, first_name, size FROM users WHERE chat_id = %s', (chat_id,))
+        return c.fetchall()
 
 
 def _retry_transient(fn):
