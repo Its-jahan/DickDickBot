@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 import os
 import random
@@ -7,6 +9,7 @@ from zoneinfo import ZoneInfo
 import math
 import asyncio
 from telegram import Update, Chat, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import Forbidden
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, InlineQueryHandler, CallbackQueryHandler
 from uuid import uuid4
 
@@ -29,8 +32,36 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE):
     for cid in chat_ids:
         try:
             await context.bot.send_message(chat_id=cid, text=msg)
+        except Forbidden as e:
+            # Kicked from the group / group deleted: stop trying it every night forever.
+            logging.info(f"Dropping unreachable chat {cid} from reminders: {e}")
+            db.remove_chat(cid)
         except Exception as e:
             logging.error(f"Failed to send reminder to {cid}: {e}")
+
+
+def cmd(pattern):
+    """Filter for a text command. Gating on UpdateType.MESSAGE matters: a bare
+    filters.Regex also fires for edited_message/channel_post updates, where
+    update.message is None - every one of those crashed its handler mid-flight
+    (the recurring "'NoneType' object has no attribute 'text'" in production,
+    which users experienced as the bot ignoring a command)."""
+    return filters.UpdateType.MESSAGE & filters.Regex(pattern)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler: without one, an exception in any handler is swallowed
+    with just a log line and the user gets dead silence - the single biggest source
+    of 'the bot ignores my commands' reports. Log it loudly and tell the user."""
+    logging.error("Unhandled exception while processing an update", exc_info=context.error)
+    try:
+        if isinstance(update, Update):
+            if update.callback_query:
+                await update.callback_query.answer("⚠️ یه مشکل موقت پیش اومد؛ چند لحظه دیگه دوباره امتحان کن.", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text("⚠️ یه مشکل موقت پیش اومد؛ چند لحظه دیگه دوباره امتحان کن.")
+    except Exception:
+        pass  # never let the error handler itself crash
 
 def roll_nonzero(low, high):
     """random.randint(low, high) but re-rolled until it's not 0 (growth must always change something)."""
@@ -100,12 +131,25 @@ logging.basicConfig(
 
 TOKEN = '8802494355:AAFYiGyKph3R8wLiZoeDsELOPx07Q9ZvuVw'
 
-# Memory store for active challenges
-# Format: challenges[target_user_id] = challenger_user_id
-challenges = {}
-
 BET_AMOUNTS = [5, 10, 50, 100]
+
+
+def sign_payload(payload):
+    """Short HMAC tag over a callback_data payload. Telegram's callback_data is
+    supplied by the client, so anything the bot *trusts* from it (a stake, a price)
+    has to be signed - otherwise a patched client can send `chal_<victim>_999999`
+    or a football bet at odds ×50 that the bot would honour."""
+    return hmac.new(TOKEN.encode(), payload.encode(), hashlib.sha256).hexdigest()[:10]
+
+
+def verify_payload(payload, tag):
+    return hmac.compare_digest(sign_payload(payload), tag)
+
+
 BET_WINDOW_SECONDS = 20
+# A rematch has no spectator betting window - just a short beat of "rolling the
+# dice..." before it settles through the same persisted path as a normal match.
+REMATCH_ROLL_SECONDS = 2
 
 def render_bet_message(match_state):
     lines = [
@@ -118,6 +162,15 @@ def render_bet_message(match_state):
             side_fa = "برد" if side == "win" else "باخت"
             lines.append(f"- {name}: {amount} سانت گذاشت روی {side_fa} {match_state['challenger_name']}")
     return "\n".join(lines)
+
+def build_challenge_data(challenger_id, bet):
+    """callback_data for a challenge button: the stake is signed so it can't be edited
+    by a patched client, and the nonce makes the button single-accept (see
+    db.claim_challenge). Stays well inside Telegram's 64-byte callback_data limit."""
+    nonce = uuid4().hex[:10]
+    payload = f"{challenger_id}_{int(bet)}_{nonce}"
+    return f"chal_{payload}_{sign_payload(payload)}"
+
 
 def build_bet_keyboard(match_id):
     # One row per amount (win/lose side by side) so labels stay readable on small screens,
@@ -190,12 +243,15 @@ def get_target_user(update: Update, text: str, chat_id: int):
         db.get_user(target_user_id, chat_id, update.message.reply_to_message.from_user.username, target_first_name)
     else:
         parts = text.split()
-        if len(parts) > 1:
-            target_username = parts[1]
-            row = db.find_user_by_username(target_username, chat_id)
+        # The target isn't always the first argument: "/use ویاگرا @user" puts the
+        # item name in parts[1]. Prefer an explicit @mention anywhere in the text,
+        # falling back to the first argument for the bare "/dd username 10" style.
+        candidates = [p for p in parts[1:] if p.startswith('@')] or parts[1:2]
+        if candidates:
+            row = db.find_user_by_username(candidates[0], chat_id)
             if row:
                 target_user_id, target_first_name, _ = row
-            
+
     return target_user_id, target_first_name
 
 def drop_item(user_id, chat_id, chance=0.3):
@@ -400,8 +456,12 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("باید روی یک نفر ریپلای کنید یا یوزرنیمش رو منشن کنید!")
             return
 
+        # Consume the item BEFORE applying its effect - the other order let a race
+        # (or a failed decrement) apply the effect for free.
+        if not db.use_inventory(user.id, chat_id, item_name):
+            await update.message.reply_text(f"شما آیتم '{item_name}' را در این گروه ندارید!")
+            return
         msg = apply_direct_item(item_name, target_user_id, target_first_name, chat_id)
-        db.use_inventory(user.id, chat_id, item_name)
         await update.message.reply_text(msg)
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -468,17 +528,16 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount_str = parts[-1] if len(parts) > 1 else ""
     try:
         amount = float(amount_str)
-        if amount <= 0: raise ValueError
+        # isfinite blocks "nan" (which passes every <= comparison and would poison
+        # both users' sizes into NaN forever) and "inf".
+        if not math.isfinite(amount) or amount <= 0: raise ValueError
     except ValueError:
         await update.message.reply_text("لطفا یک مقدار معتبر وارد کنید.")
         return
-        
-    user_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    if user_size < amount:
+
+    if not db.try_deduct_size(user.id, chat_id, amount):
         await update.message.reply_text("شما به اندازه کافی سانتی‌متر برای اهدا در این گروه ندارید!")
         return
-        
-    db.update_size(user.id, chat_id, -amount)
     db.update_size(target_user_id, chat_id, amount)
     
     new_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -627,6 +686,13 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
 
     v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status, elapsed_seconds = consensus
 
+    # A vote id is just a number in client-supplied callback_data: without this check a
+    # member of group B could vote on (and swing) a consensus running in group A, where
+    # they were never eligible.
+    if v_chat_id != chat_id:
+        await query.answer("این رای‌گیری مال این گروه نیست!", show_alert=True)
+        return
+
     if status != 'open':
         await query.answer("این رای‌گیری دیگر فعال نیست!", show_alert=True)
         return
@@ -675,7 +741,12 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     # Early failure: if the remaining eligible voters could never push "yes" to the required threshold, stop now.
-    remaining_pool = total_players - 1 - (yes_count + no_count)  # -1 excludes the target, who can't vote
+    # The target can't vote, so exclude them from the pool - but only if they're actually
+    # IN the pool (grew today); subtracting 1 unconditionally could declare failure one
+    # voter too early when the target wasn't part of the active count.
+    _, target_last_grown, _ = db.get_user(target_id, chat_id, None, None)
+    target_in_pool = 1 if target_last_grown == today_str else 0
+    remaining_pool = max(0, total_players - target_in_pool - (yes_count + no_count))
     if yes_count + remaining_pool < required_votes:
         db.fail_open_consensus(chat_id, target_id, target_name)
         await query.answer("اجماع شکست خورد!")
@@ -686,6 +757,12 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     await query.answer(f"رای شما ({'موافق' if choice == 'yes' else 'مخالف'}) ثبت شد!")
+    # Re-read the status: the one-hour timeout job may have resolved this vote while we
+    # were awaiting above, and re-attaching live buttons here would resurrect a vote
+    # that already failed and already granted the target its protection.
+    still_open = db.get_consensus(vote_id)
+    if not still_open or still_open[7] != 'open':
+        return
     try:
         await query.edit_message_text(
             render_consensus_message(target_name, amount, required_votes, total_players, voters),
@@ -860,6 +937,10 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
         home_score = fstatus['home_score']
         away_score = fstatus['away_score']
 
+        # Record what we just saw: bets are priced from this stored state, not from
+        # the odds baked into whatever button the user tapped.
+        db.set_football_market_state(market_id, elapsed, home_score, away_score)
+
         if short in football.FINISHED_STATUSES:
             if home_score > away_score:
                 result = 'home'
@@ -867,9 +948,14 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
                 result = 'away'
             else:
                 result = 'draw'
-            db.finish_football_market(market_id, result)
 
-            bets = group_football_bets(db.get_football_bets(market_id))
+            # Pay first, mark the market finished afterwards. Claiming the bets flips
+            # them to settled atomically, so a crash mid-payout leaves the market
+            # unfinished and the *unpaid* remainder is retried on the next poll,
+            # instead of the old order which lost every unpaid bet forever.
+            claimed = db.claim_unsettled_football_bets(market_id)
+            bets = group_football_bets([(uid, name, side, amount, odds)
+                                        for _bid, uid, name, side, amount, odds in claimed])
             win_lines, lose_lines = [], []
             for bettor_id, first_name, side, amount, odds in bets:
                 if result == 'draw':
@@ -880,6 +966,7 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
                     win_lines.append(f"✅ {first_name}: {int(amount)} سانت با ضریب {odds:.2f} بست و {int(payout)} سانت گرفت (سود {int(payout - amount)})")
                 else:
                     lose_lines.append(f"❌ {first_name}: {int(amount)} سانت از دست داد")
+            db.finish_football_market(market_id, result)
 
             winner_name = home_team if result == 'home' else (away_team if result == 'away' else None)
             msg = f"🏁 بازی {home_team} {home_score} - {away_score} {away_team} تموم شد!\n"
@@ -909,8 +996,6 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
             if not should_open and kickoff_at:
                 should_open = now >= kickoff_at - datetime.timedelta(hours=BETTING_OPENS_HOURS_BEFORE)
             if should_open:
-                db.set_football_market_status(market_id, 'live')
-                status = 'live'
                 odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
                 bets = group_football_bets(db.get_football_bets(market_id))
                 status_label = football_status_label(short) if short in football.LIVE_STATUSES else "قبل از شروع بازی"
@@ -922,10 +1007,16 @@ async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
                         text=f"🎰 بت‌گیری برای بازی {home_team} - {away_team} باز شد!\n\n" + text,
                         reply_markup=keyboard
                     )
-                    db.set_football_market_message(market_id, sent.message_id)
-                    message_id = sent.message_id
                 except Exception as e:
-                    logging.error(f"Failed to send football betting-open message to {chat_id}: {e}")
+                    # Only flip to 'live' once the buttons actually reached the group -
+                    # flipping first left the market permanently live with no message
+                    # (and so unbettable) whenever this send failed.
+                    logging.error(f"Failed to send football betting-open message to {chat_id}; will retry next poll: {e}")
+                    continue
+                db.set_football_market_message(market_id, sent.message_id)
+                message_id = sent.message_id
+                db.set_football_market_status(market_id, 'live')
+                status = 'live'
 
         if short in football.LIVE_STATUSES and not match_started_announced:
             db.mark_football_match_started(market_id)
@@ -968,28 +1059,61 @@ async def place_football_bet_callback(update: Update, context: ContextTypes.DEFA
     data = query.data.split('_')
     if len(data) != 5 or data[0] != 'fbet':
         return
-    market_id = int(data[1])
+    try:
+        market_id = int(data[1])
+        amount = int(data[3])
+    except ValueError:
+        return
+    if data[2] not in ('h', 'a'):
+        return
     side = 'home' if data[2] == 'h' else 'away'
-    amount = int(data[3])
-    odds = decode_odds(int(data[4]))
+    # callback_data is client-supplied: honour only the stakes the bot actually offers.
+    if amount not in BET_AMOUNTS:
+        await query.answer("مبلغ شرط نامعتبره!", show_alert=True)
+        return
 
     market = db.get_football_market(market_id)
     if not market:
         await query.answer("این بازار وجود نداره!", show_alert=True)
         return
-    m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced = market
+    (m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id,
+     created_by, prior_home_prob, kickoff_at, match_started_announced,
+     last_elapsed, last_home_score, last_away_score) = market
     if status != 'live':
         await query.answer("این بازی الان قابل شرط‌بندی نیست!", show_alert=True)
         return
-
-    db.get_user(user.id, chat_id, user.username, user.first_name)
-    user_size, _, _ = db.get_user(user.id, chat_id, None, None)
-    if user_size < amount:
-        await query.answer(f"شما به اندازه کافی سایز ندارید! سایز فعلی: {int(user_size)}", show_alert=True)
+    # A market belongs to the group it was opened in; don't let a button forwarded (or
+    # a callback forged) elsewhere settle against a different group's balances.
+    if m_chat_id != chat_id:
+        await query.answer("این بازار مال این گروه نیست!", show_alert=True)
         return
 
-    db.place_football_bet(market_id, user.id, user.first_name, side, amount, odds)
-    db.update_size(user.id, chat_id, -amount)
+    # Price the bet from the server's own latest view of the match, never from the odds
+    # encoded in the tapped button: those go stale between polls (a goal at 89' left a
+    # ×2.00 button live for up to two minutes) and, being client-supplied, could simply
+    # be edited to ×50.
+    odds_home, odds_away = football.compute_odds(last_elapsed, last_home_score, last_away_score, prior_home_prob)
+    odds = odds_home if side == 'home' else odds_away
+    shown_odds = decode_odds(int(data[4])) if data[4].isdigit() else odds
+    if abs(shown_odds - odds) > 0.005:
+        await query.answer(
+            f"ضریب همین الان تغییر کرد ({shown_odds:.2f} ← {odds:.2f})! دوباره بزن تا با ضریب جدید ثبت بشه.",
+            show_alert=True
+        )
+        return
+
+    user_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    # Escrow first with an atomic check-and-take (no double-spend window), then
+    # record the bet; if recording fails the stake is handed straight back.
+    if not db.try_deduct_size(user.id, chat_id, amount):
+        await query.answer(f"شما به اندازه کافی سایز ندارید! سایز فعلی: {int(user_size)}", show_alert=True)
+        return
+    try:
+        db.place_football_bet(market_id, user.id, user.first_name, side, amount, odds)
+    except Exception:
+        db.update_size(user.id, chat_id, amount)
+        raise
     side_name = home_team if side == 'home' else away_team
 
     prior_bets = [b for b in db.get_football_bets(market_id) if b[0] == user.id]
@@ -1032,9 +1156,9 @@ async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه ندارید! سایز فعلی شما: {int(user_size)}")
         return
         
-    keyboard = [[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=f"chal_{user.id}_{bet}")]]
+    keyboard = [[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=build_challenge_data(user.id, bet))]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await update.message.reply_text(
         f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر در این گروه ایجاد کرد!\nاولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود.",
         reply_markup=reply_markup
@@ -1050,41 +1174,61 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         return
     
     db.get_user(user.id, chat_id, user.username, user.first_name)
-    
+
     data = query.data.split('_')
-    if len(data) != 3 or data[0] != 'chal':
+    if len(data) != 5 or data[0] != 'chal':
         return
-        
-    challenger_id = int(data[1])
-    bet = int(data[2])
-    
+    challenger_id, bet_str, nonce, tag = data[1], data[2], data[3], data[4]
+    # Reject anything whose stake/challenger was edited client-side before trusting it.
+    if not verify_payload(f"{challenger_id}_{bet_str}_{nonce}", tag):
+        await query.answer("این دکمه معتبر نیست!", show_alert=True)
+        return
+    challenger_id, bet = int(challenger_id), int(bet_str)
+
+    # Claim the button before touching any money: only the first tapper wins the race,
+    # everyone else (including the same user double-tapping) bounces off here.
+    if not db.claim_challenge(nonce):
+        await query.answer("این چالش قبلاً پذیرفته شده!", show_alert=True)
+        return
+
+    def _release():
+        db.release_challenge(nonce)
+
     if user.id == challenger_id:
+        _release()
         await query.answer("شما نمی‌توانید چالش خودتان را بپذیرید!", show_alert=True)
         return
-        
+
     challenger_row = db.get_user(challenger_id, chat_id, None, None)
     if not challenger_row or challenger_row[0] < bet:
+        _release()
         await query.answer("شروع‌کننده چالش در حال حاضر سایز کافی ندارد!", show_alert=True)
         return
-        
+
     if challenger_row[2] == "حرومزاده":
+        _release()
         await query.answer("کیر شروع‌کننده امروز فیریز شده (پرک حرومزاده)! نمی‌تواند چالش انجام دهد.", show_alert=True)
         return
-        
+
     user_size, _, user_perk = db.get_user(user.id, chat_id, None, None)
     if user_perk == "حرومزاده":
+        _release()
         await query.answer("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش رو بپذیرید.", show_alert=True)
-        return
-        
-    if user_size < bet:
-        await query.answer(f"شما حداقل {bet} سانتی‌متر برای شرکت در این گروه نیاز دارید!", show_alert=True)
         return
 
     # Stake both sides' bet immediately the moment the match actually starts, so nobody
-    # can accept multiple challenges at once using the same not-yet-deducted size (each
-    # acceptance now truly locks that amount, and later checks see the reduced balance).
-    db.update_size(challenger_id, chat_id, -bet)
-    db.update_size(user.id, chat_id, -bet)
+    # can accept multiple challenges at once using the same not-yet-deducted size. The
+    # deductions are atomic check-and-take, so a concurrent stake elsewhere can't spend
+    # the same centimeters twice.
+    if not db.try_deduct_size(challenger_id, chat_id, bet):
+        _release()
+        await query.answer("شروع‌کننده چالش در حال حاضر سایز کافی ندارد!", show_alert=True)
+        return
+    if not db.try_deduct_size(user.id, chat_id, bet):
+        db.update_size(challenger_id, chat_id, bet)  # hand the challenger's stake back
+        _release()
+        await query.answer(f"شما حداقل {int(bet)} سانتی‌متر برای شرکت در این گروه نیاز دارید!", show_alert=True)
+        return
 
     challenger_info = db.get_user_info(challenger_id, chat_id)
     challenger_name = challenger_info[0] if challenger_info else "ناشناس"
@@ -1152,6 +1296,9 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
     chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet, message_id, inline_message_id, _status = match
     bet = int(bet)
     bets = {}
+    # Flipped the moment settlement money starts moving: past that point the except
+    # branch must never blanket-refund the escrow again (it would double-pay).
+    settled = False
 
     try:
         bets = {uid: (side, amount, name) for uid, side, amount, name in db.get_pvp_bets(match_id)}
@@ -1235,6 +1382,7 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
             msg = f"⚔️ مسابقه بین {challenger_name} و {acceptor_name}\n🎲 تاس {challenger_name}: {val1}\n🎲 تاس {acceptor_name}: {val2}\n\n🎉 {acceptor_name} برنده چالش شد!"
         else:
             # Refund the escrowed main bet to both sides since nobody actually won or lost it.
+            settled = True
             db.update_size(challenger_id, chat_id, bet)
             db.update_size(acceptor_id, chat_id, bet)
 
@@ -1245,7 +1393,7 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
                     db.update_size(bettor_id, chat_id, amount)  # refund the staked amount
                 msg += "\n\n🎰 چون مساوی شد، شرط‌بندی‌های تماشاگران باطل شد و سانتی که گذاشته بودن بهشون برگشت."
             msg += "\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
-            keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{challenger_id}_{acceptor_id}_{bet}")]]
+            keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=build_rematch_data(challenger_id, acceptor_id, bet))]]
             await deliver_pvp_message(context, chat_id, message_id, msg, InlineKeyboardMarkup(keyboard), inline_message_id=inline_message_id)
             return
 
@@ -1283,6 +1431,7 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         # Both sides already had `bet` deducted at acceptance time (escrow). The winner gets
         # their own stake back plus their net winnings; the loser gets back whatever their
         # final loss (after perks/items) came out short of their already-staked bet.
+        settled = True
         db.update_size(winner_id, chat_id, winner_gain + bet)
         db.update_size(loser_id, chat_id, bet - loser_loss)
         db.record_match_result(winner_id, loser_id, chat_id)
@@ -1320,6 +1469,12 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
 
         await deliver_pvp_message(context, chat_id, message_id, msg, inline_message_id=inline_message_id)
     except Exception:
+        if settled:
+            # Money already moved (payout or tie-refund done); refunding again here
+            # would mint size out of thin air. Log it - the failure was in the
+            # post-settlement reporting, not the settlement itself.
+            logging.exception(f"PvP match {match_id} settled but post-settlement reporting failed")
+            return
         logging.exception(f"Failed to resolve PvP match {match_id}; refunding escrowed bets")
         db.update_size(challenger_id, chat_id, bet)
         db.update_size(acceptor_id, chat_id, bet)
@@ -1346,6 +1501,22 @@ async def recover_stuck_pvp_matches(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Failed to recover stuck PvP match {match_id}: {e}")
 
+async def recover_expired_consensus(context: ContextTypes.DEFAULT_TYPE):
+    """Startup sweep for consensus votes whose one-hour timeout job died with the
+    process (the job queue is in-memory). Without this, a vote started before a deploy
+    keeps showing live buttons forever and never resolves on its own."""
+    for vote_id, chat_id, target_id, target_name in db.get_expired_open_consensus(CONSENSUS_VOTE_WINDOW_SECONDS):
+        try:
+            db.fail_open_consensus(chat_id, target_id, target_name)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(f"⏰ مهلت اجماع علیه {target_name} تموم شد و به حد نصاب نرسید؛ اجماع شکست خورد.\n"
+                      f"🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود.")
+            )
+        except Exception as e:
+            logging.error(f"Failed to expire stale consensus {vote_id}: {e}")
+
+
 async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
@@ -1354,7 +1525,17 @@ async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if len(data) != 4 or data[0] != 'bet':
         return
     match_id, side, amount_str = data[1], data[2], data[3]
-    amount = int(amount_str)
+    # callback_data is client-supplied: only the amounts the bot actually offers, and
+    # only the two real sides, are accepted.
+    if side not in ('win', 'lose'):
+        return
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        return
+    if amount not in BET_AMOUNTS:
+        await query.answer("مبلغ شرط نامعتبره!", show_alert=True)
+        return
 
     match = db.get_pvp_match(match_id)
     if not match or match[8] != 'pending':
@@ -1366,20 +1547,25 @@ async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("شرکت‌کننده‌های مسابقه نمی‌تونن روی مسابقه خودشون شرط ببندن!", show_alert=True)
         return
 
-    existing_bets = db.get_pvp_bets(match_id)
-    if any(uid == user.id for uid, _, _, _ in existing_bets):
-        await query.answer("شما قبلاً روی این مسابقه شرط بسته‌اید!", show_alert=True)
-        return
-
     user_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    if user_size < amount:
-        await query.answer(f"شما به اندازه کافی سانتی‌متر ندارید! سایز فعلی شما: {int(user_size)}", show_alert=True)
-        return
 
     # Stake the bet immediately: deducted now, paid back double on a correct guess,
     # gone for good on a wrong one (see the settlement logic in resolve_pvp_match).
-    db.update_size(user.id, chat_id, -amount)
-    db.place_pvp_bet(match_id, user.id, user.first_name, side, amount)
+    # The deduction is an atomic check-and-take so two rapid taps can't both pass a
+    # balance check first; a duplicate bet refunds the stake instead of losing it
+    # to a primary-key violation like before.
+    if not db.try_deduct_size(user.id, chat_id, amount):
+        await query.answer(f"شما به اندازه کافی سانتی‌متر ندارید! سایز فعلی شما: {int(user_size)}", show_alert=True)
+        return
+    try:
+        placed = db.place_pvp_bet(match_id, user.id, user.first_name, side, amount)
+    except Exception:
+        db.update_size(user.id, chat_id, amount)  # give the escrowed stake back
+        raise
+    if not placed:
+        db.update_size(user.id, chat_id, amount)
+        await query.answer("شما قبلاً روی این مسابقه شرط بسته‌اید!", show_alert=True)
+        return
     side_fa = "برد" if side == "win" else "باخت"
     await query.answer(
         f"{amount} سانت گذاشتید روی {side_fa} {challenger_name}! "
@@ -1401,38 +1587,58 @@ async def place_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except:
         pass
 
-# Track rematch agreements: key = "p1_p2_bet", value = set of user_ids who agreed
+# Who has agreed to a rematch, keyed by "p1_p2_bet_chat" -> {user_ids}. Entries expire
+# (REMATCH_AGREEMENT_TTL) so a one-sided agreement can't sit here for days and then
+# turn a single press by the other player into an instantly-started rematch.
 rematch_agreements = {}
+REMATCH_AGREEMENT_TTL = datetime.timedelta(minutes=10)
+
+
+def record_rematch_agreement(key, user_id):
+    """Adds a user's agreement and returns the set of currently-valid agreers."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for k, (agreed_at, _) in list(rematch_agreements.items()):
+        if now - agreed_at > REMATCH_AGREEMENT_TTL:
+            del rematch_agreements[k]
+    _, agreers = rematch_agreements.get(key, (now, set()))
+    agreers.add(user_id)
+    rematch_agreements[key] = (now, agreers)
+    return agreers
+
+
+def build_rematch_data(p1_id, p2_id, bet):
+    payload = f"{p1_id}_{p2_id}_{int(bet)}"
+    return f"rematch_{payload}_{sign_payload(payload)}"
+
 
 async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
-    
+
     chat_id = resolve_chat_id(query)
     if not chat_id:
         await query.answer("⚠️ خطا!", show_alert=True)
         return
-    
+
     data = query.data.split('_')
-    if len(data) != 4 or data[0] != 'rematch':
+    if len(data) != 5 or data[0] != 'rematch':
         return
-        
+    if not verify_payload(f"{data[1]}_{data[2]}_{data[3]}", data[4]):
+        await query.answer("این دکمه معتبر نیست!", show_alert=True)
+        return
+
     p1_id = int(data[1])
     p2_id = int(data[2])
     bet = int(data[3])
-    
+
     if user.id != p1_id and user.id != p2_id:
         await query.answer("شما عضو این چالش نیستید!", show_alert=True)
         return
-    
+
     key = f"{p1_id}_{p2_id}_{bet}_{chat_id}"
-    
-    if key not in rematch_agreements:
-        rematch_agreements[key] = set()
-    
-    rematch_agreements[key].add(user.id)
-    
-    if len(rematch_agreements[key]) < 2:
+    agreers = record_rematch_agreement(key, user.id)
+
+    if len(agreers) < 2:
         await query.answer("موافقت شما ثبت شد! منتظر موافقت طرف مقابل...", show_alert=True)
         # Get names
         p1_info = db.get_user_info(p1_id, chat_id)
@@ -1445,13 +1651,13 @@ async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         msg = f"🔄 ریمچ بین {p1_name} و {p2_name} (شرط: {bet} سانت)\n\n"
         msg += f"✅ {agreed_name} موافقت کرد\n⏳ منتظر {waiting_name}..."
-        keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{p1_id}_{p2_id}_{bet}")]]
+        keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=build_rematch_data(p1_id, p2_id, bet))]]
         try:
             await query.edit_message_text(text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
         except:
             pass
         return
-    
+
     # Both agreed! Re-roll!
     del rematch_agreements[key]
 
@@ -1460,62 +1666,45 @@ async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p1_name = p1_info[0] if p1_info else "نفر ۱"
     p2_name = p2_info[0] if p2_info else "نفر ۲"
 
-    p1_size, _, _ = db.get_user(p1_id, chat_id, None, None)
-    p2_size, _, _ = db.get_user(p2_id, chat_id, None, None)
-    if p1_size < bet or p2_size < bet:
-        short_name = p1_name if p1_size < bet else p2_name
-        await query.answer(f"{short_name} دیگه به اندازه کافی سایز برای این شرط نداره! ریمچ لغو شد.", show_alert=True)
+    # Stake both sides' bet immediately, same as a fresh challenge, so this can't be
+    # combined with another pending challenge/rematch to over-commit past real balance.
+    # Atomic check-and-take: no balance can be spent twice by concurrent stakes.
+    if not db.try_deduct_size(p1_id, chat_id, bet):
+        await query.answer(f"{p1_name} دیگه به اندازه کافی سایز برای این شرط نداره! ریمچ لغو شد.", show_alert=True)
         try:
-            await query.edit_message_text(f"🔄 ریمچ بین {p1_name} و {p2_name} لغو شد؛ {short_name} دیگه به اندازه کافی سایز نداره.")
+            await query.edit_message_text(f"🔄 ریمچ بین {p1_name} و {p2_name} لغو شد؛ {p1_name} دیگه به اندازه کافی سایز نداره.")
+        except:
+            pass
+        return
+    if not db.try_deduct_size(p2_id, chat_id, bet):
+        db.update_size(p1_id, chat_id, bet)  # hand p1's stake back
+        await query.answer(f"{p2_name} دیگه به اندازه کافی سایز برای این شرط نداره! ریمچ لغو شد.", show_alert=True)
+        try:
+            await query.edit_message_text(f"🔄 ریمچ بین {p1_name} و {p2_name} لغو شد؛ {p2_name} دیگه به اندازه کافی سایز نداره.")
         except:
             pass
         return
 
-    # Stake both sides' bet immediately, same as a fresh challenge, so this can't be
-    # combined with another pending challenge/rematch to over-commit past real balance.
-    db.update_size(p1_id, chat_id, -bet)
-    db.update_size(p2_id, chat_id, -bet)
+    # A rematch is settled through the same persisted path as a normal challenge
+    # (pvp_matches + resolve_pvp_match) instead of an in-process sleep: it now applies
+    # perks and items exactly like a first match, keeps the zero-sum guard, survives a
+    # restart mid-roll via recover_stuck_pvp_matches, and can't lose both stakes.
+    match_id = str(uuid4())
+    db.create_pvp_match(match_id, chat_id, p1_id, p1_name, p2_id, p2_name, bet)
 
     await query.answer("هر دو موافقت کردن! تاس‌ها دوباره ریخته میشه...")
-    await query.edit_message_text(f"🔄 ریمچ بین {p1_name} و {p2_name}!\nدر حال ریختن تاس...")
-
-    await asyncio.sleep(2)
-
-    val1 = _dice_rng.randint(1, 6)
-    val2 = _dice_rng.randint(1, 6)
-
-    if val1 > val2:
-        winner_id, loser_id = p1_id, p2_id
-        winner_name, loser_name = p1_name, p2_name
-    elif val2 > val1:
-        winner_id, loser_id = p2_id, p1_id
-        winner_name, loser_name = p2_name, p1_name
+    try:
+        await query.edit_message_text(f"🔄 ریمچ بین {p1_name} و {p2_name}!\nدر حال ریختن تاس...")
+    except:
+        pass
+    if query.message:
+        db.set_pvp_match_message(match_id, message_id=query.message.message_id)
     else:
-        # Tie again! Refund the escrowed bet since neither side actually lost it.
-        db.update_size(p1_id, chat_id, bet)
-        db.update_size(p2_id, chat_id, bet)
-        msg = f"🔄 ریمچ بین {p1_name} و {p2_name}\n🎲 تاس {p1_name}: {val1}\n🎲 تاس {p2_name}: {val2}\n\n🤝 دوباره مساوی شد!\n\nبرای ریمچ هر دو طرف باید دکمه زیر رو بزنن:"
-        keyboard = [[InlineKeyboardButton("🔄 موافقم با ریمچ!", callback_data=f"rematch_{p1_id}_{p2_id}_{bet}")]]
-        await query.edit_message_text(text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
+        db.set_pvp_match_message(match_id, inline_message_id=query.inline_message_id)
 
-    # Both sides already had `bet` staked above; the winner gets their stake back plus
-    # the loser's stake, the loser's stake simply stays gone (no further deduction).
-    db.update_size(winner_id, chat_id, bet * 2)
-    db.record_match_result(winner_id, loser_id, chat_id)
-
-    winner_size, _, _ = db.get_user(winner_id, chat_id, None, None)
-    loser_size, _, _ = db.get_user(loser_id, chat_id, None, None)
-    
-    w_dname = get_dick_name(winner_size)
-    l_dname = get_dick_name(loser_size)
-    
-    msg = f"🔄 ریمچ بین {p1_name} و {p2_name}\n🎲 تاس {p1_name}: {val1}\n🎲 تاس {p2_name}: {val2}\n\n🎉 {winner_name} برنده ریمچ شد!"
-    msg += f"\n💰 شرط: {bet} سانت"
-    msg += f"\n\n📈 {w_dname} {winner_name} شد {int(winner_size)} سانتی‌متر!"
-    msg += f"\n📉 {l_dname} {loser_name} شد {int(loser_size)} سانتی‌متر!"
-    
-    await query.edit_message_text(text=msg)
+    context.job_queue.run_once(
+        pvp_resolve_job, when=REMATCH_ROLL_SECONDS, data={"match_id": match_id}, name=f"pvp_resolve_{match_id}"
+    )
 
 async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1540,7 +1729,13 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last_grown == today_str:
         await query.answer("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.", show_alert=True)
         return
-        
+
+    # Atomically stamp today's date first: a rapid double-tap (or the same button in
+    # two clients) would otherwise pass the check above twice and grow twice.
+    if not db.claim_daily_growth(user.id, chat_id, today_str):
+        await query.answer("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.", show_alert=True)
+        return
+
     if current_size < 50:
         delta = roll_nonzero(-5, 20)
     elif current_size < 150:
@@ -1548,8 +1743,8 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         delta = roll_nonzero(-6, 10)
 
-    db.update_size(user.id, chat_id, delta, today_str)
-    
+    db.update_size(user.id, chat_id, delta)
+
     current_size = current_size + delta
     
     perk_pool = [
@@ -1608,7 +1803,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # targeting someone for a direct item has to be done by typing @username in the
     # inline query itself: "@dickchallengerbot @username" lists your direct items to
     # use on them, each with a confirm button that applies the effect once tapped.
-    if query.startswith('@') and len(query) > 1:
+    if query.startswith('@') and query[1:].split():
         target_username = query[1:].split()[0]
         last_chat = db.get_last_chat(user.id)
         results = []
@@ -1679,7 +1874,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title=f"⚔️ چالش ({bet} سانت)",
         description=f"ایجاد چالش با شرط {bet} سانتی‌متر",
         input_message_content=InputTextMessageContent(f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر ایجاد کرد!\nاولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود."),
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=f"chal_{user.id}_{bet}")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=build_challenge_data(user.id, bet))]])
     )
 
     # Leaderboard: render directly for the user's last active group so no extra
@@ -1836,19 +2031,22 @@ if __name__ == '__main__':
     app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(poll_football_markets, interval=FOOTBALL_POLL_INTERVAL_SECONDS, first=10)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
+    app.job_queue.run_once(recover_expired_consensus, when=7)
 
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('help', start))
-    
-    app.add_handler(MessageHandler(filters.Regex(r'^/(dick|grow|d)\b'), dick))
-    app.add_handler(MessageHandler(filters.Regex(r'^/(top|t)\b'), top))
-    app.add_handler(MessageHandler(filters.Regex(r'^/(donate|dd)\b'), donate))
-    app.add_handler(MessageHandler(filters.Regex(r'^/(challenge|c)\b'), challenge))
-    app.add_handler(MessageHandler(filters.Regex(r'^/(inv|inventory|i)\b'), inventory_cmd))
-    app.add_handler(MessageHandler(filters.Regex(r'^/(use|u)\b'), use_item_cmd))
-    app.add_handler(MessageHandler(filters.Regex(r'^/ejma\b'), consensus_cmd))
-    app.add_handler(MessageHandler(filters.Regex(r'^/(wr|winrate)\b'), winrate_cmd))
-    app.add_handler(MessageHandler(filters.Regex(r'^/fbet\b'), football_bet_cmd))
+    app.add_error_handler(on_error)
+
+    app.add_handler(CommandHandler('start', start, filters=filters.UpdateType.MESSAGE))
+    app.add_handler(CommandHandler('help', start, filters=filters.UpdateType.MESSAGE))
+
+    app.add_handler(MessageHandler(cmd(r'^/(dick|grow|d)\b'), dick))
+    app.add_handler(MessageHandler(cmd(r'^/(top|t)\b'), top))
+    app.add_handler(MessageHandler(cmd(r'^/(donate|dd)\b'), donate))
+    app.add_handler(MessageHandler(cmd(r'^/(challenge|c)\b'), challenge))
+    app.add_handler(MessageHandler(cmd(r'^/(inv|inventory|i)\b'), inventory_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(use|u)\b'), use_item_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/ejma\b'), consensus_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(wr|winrate)\b'), winrate_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/fbet\b'), football_bet_cmd))
 
     app.add_handler(CallbackQueryHandler(accept_challenge_callback, pattern=r'^chal_'))
     app.add_handler(CallbackQueryHandler(rematch_callback, pattern=r'^rematch_'))

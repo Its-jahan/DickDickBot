@@ -57,18 +57,31 @@ async def find_fixture(team1_query, team2_query, date_str):
     data = await _get('/fixtures', {'date': date_str})
     q1 = resolve_team_query(team1_query).lower()
     q2 = resolve_team_query(team2_query).lower()
+    fallback = None
     for item in data.get('response', []):
         home = item['teams']['home']['name']
         away = item['teams']['away']['name']
-        names = (home.lower(), away.lower())
-        if (q1 in names[0] or q1 in names[1]) and (q2 in names[0] or q2 in names[1]):
-            return {
-                'fixture_id': item['fixture']['id'],
-                'home_team': home,
-                'away_team': away,
-                'kickoff_iso': item['fixture']['date'],
-            }
-    return None
+        h, a = home.lower(), away.lower()
+        # Each query has to pin down a *different* side. Requiring only "q1 matches
+        # either team and q2 matches either team" let a single team satisfy both
+        # (e.g. "real - madrid" both matching "Real Madrid") and bind the market to
+        # whatever unrelated fixture that team was playing.
+        if not ((q1 in h and q2 in a) or (q1 in a and q2 in h)):
+            continue
+        found = {
+            'fixture_id': item['fixture']['id'],
+            'home_team': home,
+            'away_team': away,
+            'kickoff_iso': item['fixture']['date'],
+        }
+        # Prefer an exact name match over a substring one, so "Spain vs France"
+        # doesn't get hijacked by the women's/youth fixture ("Spain W") that happens
+        # to be listed first on the same day.
+        if {h, a} == {q1, q2}:
+            return found
+        if fallback is None:
+            fallback = found
+    return fallback
 
 
 # API-Football short status codes that mean "match is currently live".
