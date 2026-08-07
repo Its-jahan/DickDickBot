@@ -1,5 +1,8 @@
 import datetime
+import functools
 import os
+import time
+import types
 from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 
@@ -30,15 +33,28 @@ def get_connection():
             "Set the SUPABASE_DB_URL (or DATABASE_URL) environment variable to your "
             "Supabase Postgres connection string."
         )
-    conn = psycopg2.connect(DB_URL)
+    # TCP keepalives so a connection silently dropped by the Supabase pooler (the
+    # recurring "SSL connection has been closed unexpectedly" in production) is
+    # detected instead of hanging, and a connect_timeout so a network blip can't
+    # freeze a handler forever.
+    conn = psycopg2.connect(
+        DB_URL, connect_timeout=10,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+    )
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass  # connection already dead - let the original error propagate, not this one
         raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db():
@@ -154,6 +170,11 @@ def init_db():
         c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS prior_home_prob DOUBLE PRECISION DEFAULT 0.5")
         c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS kickoff_at TIMESTAMPTZ")
         c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS match_started_announced BOOLEAN DEFAULT FALSE")
+        # Last state the poller saw, so a bet can be priced from the server's own view
+        # of the match instead of whatever odds the tapped button happened to carry.
+        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS last_elapsed INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS last_home_score INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE football_markets ADD COLUMN IF NOT EXISTS last_away_score INTEGER DEFAULT 0")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS football_bets (
@@ -171,6 +192,10 @@ def init_db():
         # newer, tighter/looser odds as the match develops), so the old one-bet-per-user
         # constraint is dropped for anyone upgrading from before this was allowed.
         c.execute("ALTER TABLE football_bets DROP CONSTRAINT IF EXISTS football_bets_market_id_user_id_key")
+        # Per-bet settlement flag: settlement pays each bet and flips its own flag, so
+        # a crash part-way through the payout loop can be resumed without paying the
+        # already-paid bets a second time.
+        c.execute("ALTER TABLE football_bets ADD COLUMN IF NOT EXISTS settled BOOLEAN DEFAULT FALSE")
 
         # Persists PvP challenge matches (and spectator bets on them) so a match that's
         # mid-way through its 20-second betting window survives a bot restart instead of
@@ -204,6 +229,16 @@ def init_db():
             )
         ''')
 
+        # One row per accepted challenge button, keyed by the nonce in that button's
+        # callback_data, so a challenge can only ever be accepted once - even by two
+        # people tapping it in the same instant. See claim_challenge().
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS claimed_challenges (
+                nonce TEXT PRIMARY KEY,
+                claimed_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+
 
 def get_last_chat(user_id):
     """Returns this user's one and only active group's chat_id, or None if they've
@@ -224,6 +259,15 @@ def track_chat(chat_id):
         with get_connection() as conn:
             c = conn.cursor()
             c.execute('INSERT INTO chats (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING', (chat_id,))
+
+
+def remove_chat(chat_id):
+    """Forget a chat the bot can no longer post to (kicked, or the group was deleted),
+    so the nightly reminder stops erroring on it forever. The group's users rows stay -
+    if the bot is ever re-added, /d re-tracks the chat and everyone's sizes are intact."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM chats WHERE chat_id = %s', (chat_id,))
 
 
 def track_chat_instance(chat_instance, chat_id):
@@ -337,10 +381,12 @@ def set_user_perk(user_id, chat_id, perk):
 
 
 def find_user_by_username(username, chat_id):
+    # Telegram usernames are case-insensitive, so @Ali_Reza and @ali_reza are the same
+    # account - an exact match made targeting fail on any capitalization mismatch.
     username = username.replace('@', '')
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT user_id, first_name, size FROM users WHERE username = %s AND chat_id = %s', (username, chat_id))
+        c.execute('SELECT user_id, first_name, size FROM users WHERE lower(username) = lower(%s) AND chat_id = %s', (username, chat_id))
         row = c.fetchone()
         if row and row[2] is None:
             row = (row[0], row[1], 0.0)
@@ -402,18 +448,62 @@ def get_user_rank(user_id, chat_id):
 
 
 def update_size(user_id, chat_id, size_delta, current_date_str=None):
+    # A single relative UPDATE, not read-then-write: with concurrent_updates(True)
+    # two handlers settling money for the same user at once (e.g. a bet payout and
+    # a donation) must both land instead of one silently overwriting the other.
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT size FROM users WHERE user_id = %s AND chat_id = %s', (user_id, chat_id))
-        row = c.fetchone()
-        if row:
-            new_size = row[0] + size_delta
-            if current_date_str:
-                c.execute('UPDATE users SET size = %s, last_grown = %s WHERE user_id = %s AND chat_id = %s',
-                          (new_size, current_date_str, user_id, chat_id))
-            else:
-                c.execute('UPDATE users SET size = %s WHERE user_id = %s AND chat_id = %s',
-                          (new_size, user_id, chat_id))
+        if current_date_str:
+            c.execute('UPDATE users SET size = COALESCE(size, 0) + %s, last_grown = %s WHERE user_id = %s AND chat_id = %s',
+                      (size_delta, current_date_str, user_id, chat_id))
+        else:
+            c.execute('UPDATE users SET size = COALESCE(size, 0) + %s WHERE user_id = %s AND chat_id = %s',
+                      (size_delta, user_id, chat_id))
+
+
+def try_deduct_size(user_id, chat_id, amount):
+    """Atomically escrows `amount` out of a user's size, refusing (returns False) if
+    their balance is short or they have no row. The balance check and the deduction
+    are one UPDATE, so two concurrent stakes can never both spend the same centimeters."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET size = COALESCE(size, 0) - %s '
+            'WHERE user_id = %s AND chat_id = %s AND COALESCE(size, 0) >= %s',
+            (amount, user_id, chat_id, amount)
+        )
+        return c.rowcount > 0
+
+
+def claim_daily_growth(user_id, chat_id, today_str):
+    """Atomically stamps today's growth date, returning True only for the first caller
+    of the day - a rapid double-tap on the grow button can't grow (or roll a perk) twice."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET last_grown = %s '
+            'WHERE user_id = %s AND chat_id = %s AND last_grown IS DISTINCT FROM %s',
+            (today_str, user_id, chat_id, today_str)
+        )
+        return c.rowcount > 0
+
+
+def claim_challenge(nonce):
+    """Atomically claims a challenge button by the nonce in its callback_data. Returns
+    True only for the caller that won the race; everyone else tapping the same button
+    (including the same user double-tapping) gets False."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO claimed_challenges (nonce) VALUES (%s) ON CONFLICT (nonce) DO NOTHING', (nonce,))
+        return c.rowcount > 0
+
+
+def release_challenge(nonce):
+    """Un-claims a challenge whose acceptance couldn't be completed (e.g. the acceptor
+    turned out to be short on size), so the button stays tappable by someone else."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM claimed_challenges WHERE nonce = %s', (nonce,))
 
 
 def get_user_active_item(user_id, chat_id):
@@ -448,14 +538,16 @@ def get_inventory(user_id, chat_id):
 
 
 def use_inventory(user_id, chat_id, item_name):
+    # Check-and-decrement in one UPDATE so two concurrent uses of a last remaining
+    # item can't both succeed and drive the quantity negative.
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT quantity FROM inventory WHERE user_id = %s AND chat_id = %s AND item_name = %s AND quantity > 0', (user_id, chat_id, item_name))
-        row = c.fetchone()
-        if row:
-            c.execute('UPDATE inventory SET quantity = quantity - 1 WHERE user_id = %s AND chat_id = %s AND item_name = %s', (user_id, chat_id, item_name))
-            return True
-        return False
+        c.execute(
+            'UPDATE inventory SET quantity = quantity - 1 '
+            'WHERE user_id = %s AND chat_id = %s AND item_name = %s AND quantity > 0',
+            (user_id, chat_id, item_name)
+        )
+        return c.rowcount > 0
 
 
 def clear_user_active_item(user_id, chat_id):
@@ -510,6 +602,19 @@ def get_open_consensus(chat_id, target_id):
             (chat_id, target_id)
         )
         return c.fetchone()
+
+
+def get_expired_open_consensus(window_seconds):
+    """Open votes whose one-hour window has already elapsed - i.e. their timeout job was
+    lost to a restart. Returns (id, chat_id, target_id, target_name) for each."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, chat_id, target_id, target_name FROM consensus_votes "
+            "WHERE status = 'open' AND created_at < now() - make_interval(secs => %s)",
+            (window_seconds,)
+        )
+        return c.fetchall()
 
 
 def fail_open_consensus(chat_id, target_id, target_name):
@@ -616,16 +721,28 @@ def set_football_market_message(market_id, message_id):
 
 def get_football_market(market_id):
     """Returns (chat_id, fixture_id, home_team, away_team, status, halftime_announced,
-    result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced) or None."""
+    result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced,
+    last_elapsed, last_home_score, last_away_score) or None."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
             'SELECT chat_id, fixture_id, home_team, away_team, status, halftime_announced, '
-            'result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced '
+            'result, message_id, created_by, prior_home_prob, kickoff_at, match_started_announced, '
+            'COALESCE(last_elapsed, 0), COALESCE(last_home_score, 0), COALESCE(last_away_score, 0) '
             'FROM football_markets WHERE id = %s',
             (market_id,)
         )
         return c.fetchone()
+
+
+def set_football_market_state(market_id, elapsed, home_score, away_score):
+    """Records the latest polled match state, which is what bets are priced from."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE football_markets SET last_elapsed = %s, last_home_score = %s, last_away_score = %s WHERE id = %s',
+            (elapsed, home_score, away_score, market_id)
+        )
 
 
 def get_active_football_markets():
@@ -688,10 +805,27 @@ def get_football_bets(market_id):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'SELECT user_id, first_name, side, amount, locked_odds FROM football_bets WHERE market_id = %s',
+            'SELECT user_id, first_name, side, amount, locked_odds FROM football_bets WHERE market_id = %s ORDER BY id',
             (market_id,)
         )
         return c.fetchall()
+
+
+def claim_unsettled_football_bets(market_id):
+    """Atomically flips every not-yet-settled bet on this market to settled and returns
+    them as (id, user_id, first_name, side, amount, locked_odds). Settlement pays only
+    what this returns, so a poll that crashed part-way through (or two polls overlapping)
+    can never pay the same bet twice - and the market is only marked finished afterwards,
+    so a crash before that point simply retries the unpaid remainder next poll."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE football_bets SET settled = TRUE '
+            'WHERE market_id = %s AND COALESCE(settled, FALSE) = FALSE '
+            'RETURNING id, user_id, first_name, side, amount, locked_odds',
+            (market_id,)
+        )
+        return sorted(c.fetchall(), key=lambda r: r[0])
 
 
 def create_pvp_match(match_id, chat_id, challenger_id, challenger_name, acceptor_id, acceptor_name, bet):
@@ -737,12 +871,17 @@ def claim_pvp_match(match_id):
 
 
 def place_pvp_bet(match_id, user_id, first_name, side, amount):
+    """Returns True if the bet was recorded, False if this user already has a bet on
+    this match (two rapid taps used to raise a PK violation AFTER the stake was
+    already escrowed, silently eating the second stake)."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'INSERT INTO pvp_match_bets (match_id, user_id, first_name, side, amount) VALUES (%s, %s, %s, %s, %s)',
+            'INSERT INTO pvp_match_bets (match_id, user_id, first_name, side, amount) VALUES (%s, %s, %s, %s, %s) '
+            'ON CONFLICT (match_id, user_id) DO NOTHING',
             (match_id, user_id, first_name, side, amount)
         )
+        return c.rowcount > 0
 
 
 def get_pvp_bets(match_id):
@@ -768,3 +907,28 @@ def get_stale_pending_pvp_matches(window_seconds):
             (window_seconds,)
         )
         return [r[0] for r in c.fetchall()]
+
+
+def _retry_transient(fn):
+    """Re-runs a db function once when the connection died mid-operation (Supabase's
+    pooler occasionally drops connections: "SSL connection has been closed
+    unexpectedly" in production, which used to kill the whole handler and leave the
+    user's command silently unanswered). Every function here opens a fresh connection
+    and commits a single transaction, so when one fails it either fully applied or
+    fully rolled back - a single blind retry on a fresh connection is safe."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            time.sleep(0.3)
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+# Wrap every public db function (everything except the connection manager itself and
+# init_db, which must fail loudly at startup) in the transient-error retry above.
+for _name, _obj in list(globals().items()):
+    if (isinstance(_obj, types.FunctionType) and _obj.__module__ == __name__
+            and not _name.startswith('_') and _name not in ('get_connection', 'init_db')):
+        globals()[_name] = _retry_transient(_obj)
