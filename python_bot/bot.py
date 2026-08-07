@@ -1882,8 +1882,13 @@ THEFT_MIN_RATIO, THEFT_MAX_RATIO = 0.05, 0.15
 THEFT_LUCKY_PERK_BONUS = 0.10
 
 BOSS_SPAWN_HOUR = 20  # Tehran
-BOSS_HP_PER_PLAYER = 40
-BOSS_MIN_HP = 80
+# HP per active player has to sit well under the *average* damage one player deals
+# (randint(8,30) + streak up to 10, so 19-29), not near the maximum. At 40 the boss
+# needed every player to roll their theoretical best just to break even and was
+# mathematically unkillable; at 16 the kill depends on turnout, which is the point of
+# a co-op fight: ~85% if nine in ten play, ~45% at seven in ten, rarely at half.
+BOSS_HP_PER_PLAYER = 16
+BOSS_MIN_HP = 45
 BOSS_REWARD_BASE = 25
 BOSS_TOP_DAMAGE_BONUS = 25
 BOSS_NAMES = [
