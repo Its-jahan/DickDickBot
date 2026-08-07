@@ -1,16 +1,14 @@
 import hashlib
 import hmac
 import logging
-import os
 import random
 import datetime
 from datetime import time
 from zoneinfo import ZoneInfo
 import math
-import asyncio
-from telegram import Update, Chat, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import Forbidden
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, InlineQueryHandler, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, InlineQueryHandler, CallbackQueryHandler, TypeHandler
 from uuid import uuid4
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
@@ -24,7 +22,33 @@ def tehran_today_str():
     return datetime.datetime.now(IRAN_TZ).date().isoformat()
 
 import db
-import football
+
+async def midnight_tasks(context: ContextTypes.DEFAULT_TYPE):
+    """Everything that closes out a Tehran day, in the order that keeps the books
+    straight: settle yesterday's lottery, let the surviving bosses run, then collect
+    the crown's tax on the fresh day, and finally nudge everyone to come grow."""
+    today_str = tehran_today_str()
+    yesterday_str = (datetime.datetime.now(IRAN_TZ).date() - datetime.timedelta(days=1)).isoformat()
+
+    try:
+        await draw_lottery(context, yesterday_str)
+    except Exception:
+        logging.exception("lottery draw failed")
+    try:
+        await expire_bosses_job(context)
+    except Exception:
+        logging.exception("boss expiry failed")
+
+    for chat_id in db.get_all_chats():
+        try:
+            await collect_king_tax(context, chat_id, today_str)
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception:
+            logging.exception(f"king tax failed for {chat_id}")
+
+    await midnight_reminder(context)
+
 
 async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE):
     chat_ids = db.get_all_chats()
@@ -38,6 +62,39 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE):
             db.remove_chat(cid)
         except Exception as e:
             logging.error(f"Failed to send reminder to {cid}: {e}")
+
+
+async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Logs one line per update Telegram actually delivers. Registered in handler group
+    -1 so it runs before (and independently of) the real handlers.
+
+    Without this there is no way to tell "Telegram never delivered the message" apart
+    from "a handler ran and crashed" - the two very different causes behind the same
+    user-visible symptom of the bot ignoring a command. The bot previously logged only
+    its *outgoing* API calls, which is why a total absence of replies was ambiguous."""
+    try:
+        if update.message is not None:
+            logging.info("RX message chat=%s user=%s text=%r",
+                         update.message.chat.id,
+                         update.message.from_user.id if update.message.from_user else None,
+                         (update.message.text or update.message.caption or '')[:64])
+        elif update.edited_message is not None:
+            logging.info("RX edited_message chat=%s", update.edited_message.chat.id)
+        elif update.inline_query is not None:
+            logging.info("RX inline_query user=%s q=%r",
+                         update.inline_query.from_user.id, update.inline_query.query[:64])
+        elif update.callback_query is not None:
+            logging.info("RX callback_query user=%s data=%r",
+                         update.callback_query.from_user.id, update.callback_query.data)
+        elif update.my_chat_member is not None:
+            m = update.my_chat_member
+            logging.info("RX my_chat_member chat=%s %s -> %s",
+                         m.chat.id, m.old_chat_member.status, m.new_chat_member.status)
+        else:
+            logging.info("RX other update: %s",
+                         [k for k, v in update.to_dict().items() if k != 'update_id'])
+    except Exception:
+        logging.exception("failed to log an incoming update")
 
 
 def cmd(pattern):
@@ -86,11 +143,16 @@ def get_dick_name(size):
 
 def build_top_text(chat_id):
     """Build the group leaderboard message (every participant). Returns None if the group has no players."""
-    rows = db.get_top_users(chat_id)
+    rows = db.get_top_users_full(chat_id)
     if not rows:
         return None
+    kingdom = db.get_kingdom(chat_id)
+    king_id = kingdom[0] if kingdom else None
+    consort_id = kingdom[2] if kingdom else None
+    badge_counts = db.get_achievement_counts(chat_id)
+
     msg = "🏆 برترین‌های این گروه:\n\n"
-    for i, (first_name, size) in enumerate(rows, 1):
+    for i, (user_id, first_name, size, streak) in enumerate(rows, 1):
         size = size or 0
         d_name = get_dick_name(size)
         if i == 1:
@@ -101,7 +163,16 @@ def build_top_text(chat_id):
             title = f"🥉 {d_name} برنزی"
         else:
             title = f"💩 {d_name} رعیت"
-        msg += f"{i}. {first_name} ({title}): {int(size)} سانتی‌متر\n"
+        marks = ""
+        if user_id == king_id:
+            marks += " 👑"
+        if user_id == consort_id:
+            marks += " 💍"
+        if streak >= 3:
+            marks += f" 🔥{streak}"
+        if badge_counts.get(user_id):
+            marks += f" 🏅{badge_counts[user_id]}"
+        msg += f"{i}. {first_name}{marks} ({title}): {int(size)} سانتی‌متر\n"
     return msg
 
 def build_inventory_view(user_id, chat_id):
@@ -116,6 +187,10 @@ def build_inventory_view(user_id, chat_id):
     for item_name, qty in items:
         desc = ITEM_DESCRIPTIONS.get(item_name, '')
         msg += f"- {item_name}: {qty} عدد\n  └ {desc}\n"
+        # Passive items fire on their own, so offering an "use it" button for them
+        # would just be a button that says "you can't press this".
+        if item_name in PASSIVE_ITEMS:
+            continue
         keyboard.append([InlineKeyboardButton(f"استفاده از {item_name}", callback_data=f"useitem_{user_id}_{item_name}")])
     if active_item:
         msg += f"\n🔥 آیتم فعال برای چالش بعدی: **{active_item}**"
@@ -136,9 +211,9 @@ BET_AMOUNTS = [5, 10, 50, 100]
 
 def sign_payload(payload):
     """Short HMAC tag over a callback_data payload. Telegram's callback_data is
-    supplied by the client, so anything the bot *trusts* from it (a stake, a price)
-    has to be signed - otherwise a patched client can send `chal_<victim>_999999`
-    or a football bet at odds ×50 that the bot would honour."""
+    supplied by the client, so anything the bot *trusts* from it (a stake, an amount)
+    has to be signed - otherwise a patched client can simply send
+    `chal_<victim>_999999` and the bot would honour it."""
     return hmac.new(TOKEN.encode(), payload.encode(), hashlib.sha256).hexdigest()[:10]
 
 
@@ -209,13 +284,31 @@ ITEM_DESCRIPTIONS = {
     "شیر موز": "فعالش کن تا اگه تو چالش بردی ۵ تا ۱۵ سانت بیشتر از حریف بدزدی.",
     "سوزن": "فعالش کن تا کاندوم حریفت رو تو چالش پاره کنی.",
     "طلسم": "فعالش کن تا اثر شیر موز حریفت رو باطل کنی.",
-    "اسپری": "فعالش کن تا تاس حریفت رو تو چالش یکی کم کنی."
+    "اسپری": "فعالش کن تا تاس حریفت رو تو چالش یکی کم کنی.",
+    "قفل": "خودکار عمل می‌کنه: جلوی یه دزدی رو می‌گیره و بعدش مصرف می‌شه."
 }
 
 # Challenge items are "activated" for your next challenge; direct items are applied
-# straight onto a target's size (need someone to target, so no plain "استفاده از X" button).
+# straight onto a target's size (need someone to target, so no plain "استفاده از X"
+# button); passive items just sit in the bag and fire on their own when relevant.
 CHALLENGE_ITEMS = ["کاندوم", "شیر موز", "سوزن", "طلسم", "اسپری"]
 DIRECT_ITEMS = ["ویاگرا", "قرص اورژانسی", "زعفرون"]
+PASSIVE_ITEMS = ["قفل"]
+
+# Buying is the game's only real size *sink* - everything else (daily growth, boss
+# rewards, one-sided spectator books) only ever creates size. Prices are deliberately
+# steep enough that buying is a real trade-off against saving for a challenge.
+SHOP_PRICES = {
+    "ویاگرا": 60,
+    "قرص اورژانسی": 60,
+    "زعفرون": 220,
+    "کاندوم": 45,
+    "شیر موز": 45,
+    "سوزن": 35,
+    "طلسم": 35,
+    "اسپری": 30,
+    "قفل": 40,
+}
 
 def apply_direct_item(item_name, target_user_id, target_name, chat_id):
     """Applies a direct item's effect to a target and returns the result message."""
@@ -282,8 +375,35 @@ def resolve_chat_id(callback_query):
     
     return None
 
+HELP_TEXT = (
+    "🍆 **راهنمای بازی دودول**\n\n"
+    "**پایه**\n"
+    "🌱 /d — رشد روزانه (هر روز پیاپی، پاداش استریک بیشتر 🔥)\n"
+    "🏆 /t — لیدربرد گروه\n"
+    "🎒 /i — آیتم‌های من\n"
+    "💉 /u <آیتم> @کاربر — استفاده از آیتم\n"
+    "🎁 /dd @کاربر <مقدار> — اهدای سایز\n"
+    "📊 /wr — آمار برد و باخت\n\n"
+    "**رقابت**\n"
+    "⚔️ /c <مقدار> — ایجاد چالش\n"
+    "⚖️ /ejma @کاربر — رای‌گیری برای کم‌کردن سایز یکی\n"
+    "🥷 /dozdi @کاربر — دزدی از یکی (هر ۶ ساعت یک بار)\n\n"
+    "**سلطنت**\n"
+    "👑 /king — پادشاه و همسرش کیه و قوانین تاج\n"
+    "💍 /hamsar @کاربر — پادشاه همسر انتخاب می‌کنه\n"
+    "🗡️ /khianat @کاربر — همسر پادشاه خیانت می‌کنه!\n"
+    "💔 /talagh — پادشاه همسرش رو طلاق می‌ده\n\n"
+    "**اقتصاد و سرگرمی**\n"
+    "🏪 /shop — خرید آیتم با سانت\n"
+    "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
+    "🏅 /ach — نشان‌های من\n"
+    "🐉 هر شب ساعت ۲۰ یه باس میاد؛ همه با هم بزنیدش!\n\n"
+    "می‌تونید با @dickchallengerbot به صورت اینلاین هم بازی کنید."
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("سلام! به ربات رشد دودول خوش آمدید. برای شروع /dick یا /grow را بزنید. همچنین می‌توانید مرا با @username در هر چتی منشن کنید!")
+    await update.message.reply_text(HELP_TEXT)
 
 async def dick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -619,7 +739,13 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{target_first_name} سایز کافی برای اجماع ندارد!")
         return
 
-    remaining = db.get_consensus_protection_remaining(chat_id, target_user_id)
+    # The crown buys no shelter: the king is the one player the group can always
+    # gang up on, no matter how recently they were last targeted. Recompute it first,
+    # so a player who was dethroned an hour ago isn't still treated as the king.
+    kingdom, _ = refresh_king(chat_id)
+    king_is_target = bool(kingdom and kingdom[0] == target_user_id)
+
+    remaining = None if king_is_target else db.get_consensus_protection_remaining(chat_id, target_user_id)
     if remaining is not None:
         hours = max(1, int(remaining.total_seconds() // 3600))
         await update.message.reply_text(
@@ -770,358 +896,6 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
         )
     except:
         pass
-
-FOOTBALL_POLL_INTERVAL_SECONDS = int(os.environ.get('FOOTBALL_POLL_INTERVAL_SECONDS', '120'))
-BETTING_OPENS_HOURS_BEFORE = 2
-
-async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id):
-    try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in ('creator', 'administrator')
-    except Exception:
-        return False
-
-def encode_odds(odds):
-    return int(round(odds * 100))
-
-def decode_odds(odds_cents):
-    return odds_cents / 100
-
-def football_status_label(short):
-    return {
-        '1H': 'نیمهٔ اول', 'HT': 'نیمه‌وقت', '2H': 'نیمهٔ دوم',
-        'ET': 'وقت اضافه', 'BT': 'استراحت وقت اضافه', 'P': 'پنالتی',
-    }.get(short, 'زنده')
-
-def build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away):
-    rows = [
-        [
-            InlineKeyboardButton(f"⚽️ {home_team} {amt} (×{odds_home:.2f})", callback_data=f"fbet_{market_id}_h_{amt}_{encode_odds(odds_home)}"),
-            InlineKeyboardButton(f"⚽️ {away_team} {amt} (×{odds_away:.2f})", callback_data=f"fbet_{market_id}_a_{amt}_{encode_odds(odds_away)}"),
-        ]
-        for amt in BET_AMOUNTS
-    ]
-    return InlineKeyboardMarkup(rows)
-
-def group_football_bets(bets):
-    """Merges bets placed by the same person, on the same side, at the exact same
-    locked-in odds into a single combined line (summed amount) - bets at different
-    odds (even by the same person) stay separate, since they're priced differently.
-    Returns (user_id, first_name, side, total_amount, odds), in first-seen order."""
-    groups = {}
-    order = []
-    for user_id, first_name, side, amount, odds in bets:
-        key = (user_id, side, odds)
-        if key not in groups:
-            groups[key] = [user_id, first_name, side, 0.0, odds]
-            order.append(key)
-        groups[key][3] += amount
-    return [tuple(groups[key]) for key in order]
-
-def render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets):
-    lines = [
-        f"⚽️ {home_team} {home_score} - {away_score} {away_team}",
-        f"🕐 {status_label}" + (f" (دقیقه {elapsed}')" if elapsed else ""),
-        f"📊 ضریب زنده: {home_team} ×{odds_home:.2f}  |  {away_team} ×{odds_away:.2f}",
-    ]
-    if bets:
-        lines.append("\n📋 شرط‌های ثبت‌شده:")
-        for bettor_id, first_name, side, amount, odds in bets:
-            side_name = home_team if side == 'home' else away_team
-            lines.append(f"- {first_name}: {int(amount)} سانت روی {side_name} (ضریب {odds:.2f})")
-    return "\n".join(lines)
-
-async def football_bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
-        return
-    db.track_chat(chat_id)
-
-    if not await is_group_admin(context, chat_id, user.id):
-        await update.message.reply_text("فقط ادمین‌های گروه می‌تونن بت فوتبالی راه بندازن!")
-        return
-
-    text = update.message.text
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2 or '-' not in parts[1]:
-        await update.message.reply_text(
-            "استفاده صحیح:\n/fbet تیم۱ - تیم۲\nمثال: /fbet اسپانیا - فرانسه"
-        )
-        return
-
-    team1_text, team2_text = parts[1].split('-', 1)
-    team1_text, team2_text = team1_text.strip(), team2_text.strip()
-    if not team1_text or not team2_text:
-        await update.message.reply_text("لطفا هر دو اسم تیم رو وارد کنید.")
-        return
-
-    await update.message.reply_text("🔎 در حال جستجوی بازی...")
-
-    today = datetime.datetime.now(datetime.timezone.utc).date()
-    fixture = None
-    try:
-        for offset in (0, 1):
-            date_str = (today + datetime.timedelta(days=offset)).isoformat()
-            fixture = await football.find_fixture(team1_text, team2_text, date_str)
-            if fixture:
-                break
-    except football.FootballApiError as e:
-        await update.message.reply_text(str(e))
-        return
-    except Exception as e:
-        logging.error(f"Football API error: {e}")
-        await update.message.reply_text("⚠️ خطا در ارتباط با سرویس اطلاعات فوتبال. بعدا دوباره امتحان کنید.")
-        return
-
-    if not fixture:
-        await update.message.reply_text(
-            f"❌ بازی‌ای بین «{team1_text}» و «{team2_text}» برای امروز یا فردا پیدا نشد."
-        )
-        return
-
-    prior_home_prob = None
-    try:
-        prior_home_prob = await football.get_prematch_home_probability(fixture['fixture_id'])
-    except Exception as e:
-        logging.error(f"Football prematch odds error: {e}")
-
-    kickoff_dt = None
-    try:
-        kickoff_dt = datetime.datetime.fromisoformat(fixture['kickoff_iso'])
-    except Exception:
-        pass
-
-    db.create_football_market(
-        chat_id, fixture['fixture_id'], fixture['home_team'], fixture['away_team'], user.id,
-        prior_home_prob=prior_home_prob if prior_home_prob is not None else 0.5,
-        kickoff_at=kickoff_dt
-    )
-
-    kickoff_str = ""
-    if kickoff_dt:
-        kickoff_local = kickoff_dt.astimezone(IRAN_TZ)
-        kickoff_str = (
-            f"\n🕐 ساعت شروع: {kickoff_local.strftime('%H:%M')} (به وقت ایران)"
-            f"\n🎰 از {BETTING_OPENS_HOURS_BEFORE} ساعت قبل از شروع بازی می‌شه شرط بست."
-        )
-
-    if prior_home_prob is not None:
-        opening_home, opening_away = football.compute_odds(0, 0, 0, prior_home_prob)
-        odds_str = f"\n📊 ضریب اولیه (بر اساس قدرت تیم‌ها): {fixture['home_team']} ×{opening_home:.2f}  |  {fixture['away_team']} ×{opening_away:.2f}"
-    else:
-        odds_str = "\n📊 ضریب اولیه بازار در دسترس نبود؛ با شانس برابر (۲.۰۰ / ۲.۰۰) شروع می‌شه."
-
-    await update.message.reply_text(
-        f"✅ بازی {fixture['home_team']} - {fixture['away_team']} پیدا شد و بت‌گیری براش فعال شد!"
-        f"{kickoff_str}"
-        f"{odds_str}\n"
-        f"⏰ به محض شروع بازی، پیام شرط‌بندی همینجا فرستاده می‌شه."
-    )
-
-async def poll_football_markets(context: ContextTypes.DEFAULT_TYPE):
-    markets = db.get_active_football_markets()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    for market_id, chat_id, fixture_id, home_team, away_team, status, halftime_announced, message_id, prior_home_prob, kickoff_at, match_started_announced in markets:
-        try:
-            fstatus = await football.get_fixture_status(fixture_id)
-        except Exception as e:
-            logging.error(f"Football poll error for fixture {fixture_id}: {e}")
-            continue
-        if not fstatus:
-            continue
-
-        short = fstatus['status']
-        elapsed = fstatus['elapsed']
-        home_score = fstatus['home_score']
-        away_score = fstatus['away_score']
-
-        # Record what we just saw: bets are priced from this stored state, not from
-        # the odds baked into whatever button the user tapped.
-        db.set_football_market_state(market_id, elapsed, home_score, away_score)
-
-        if short in football.FINISHED_STATUSES:
-            if home_score > away_score:
-                result = 'home'
-            elif away_score > home_score:
-                result = 'away'
-            else:
-                result = 'draw'
-
-            # Pay first, mark the market finished afterwards. Claiming the bets flips
-            # them to settled atomically, so a crash mid-payout leaves the market
-            # unfinished and the *unpaid* remainder is retried on the next poll,
-            # instead of the old order which lost every unpaid bet forever.
-            claimed = db.claim_unsettled_football_bets(market_id)
-            bets = group_football_bets([(uid, name, side, amount, odds)
-                                        for _bid, uid, name, side, amount, odds in claimed])
-            win_lines, lose_lines = [], []
-            for bettor_id, first_name, side, amount, odds in bets:
-                if result == 'draw':
-                    db.update_size(bettor_id, chat_id, amount)  # full refund, nobody wins a 2-way market on a draw
-                elif side == result:
-                    payout = amount * odds
-                    db.update_size(bettor_id, chat_id, payout)
-                    win_lines.append(f"✅ {first_name}: {int(amount)} سانت با ضریب {odds:.2f} بست و {int(payout)} سانت گرفت (سود {int(payout - amount)})")
-                else:
-                    lose_lines.append(f"❌ {first_name}: {int(amount)} سانت از دست داد")
-            db.finish_football_market(market_id, result)
-
-            winner_name = home_team if result == 'home' else (away_team if result == 'away' else None)
-            msg = f"🏁 بازی {home_team} {home_score} - {away_score} {away_team} تموم شد!\n"
-            msg += f"🎉 به نفع {winner_name}!" if winner_name else "🤝 مساوی شد!"
-            if bets:
-                msg += "\n\n📋 شرط‌های ثبت‌شده:"
-                for bettor_id, first_name, side, amount, odds in bets:
-                    side_name = home_team if side == 'home' else away_team
-                    msg += f"\n- {first_name}: {int(amount)} سانت روی {side_name} (ضریب {odds:.2f})"
-                if result == 'draw':
-                    msg += "\n\n🎰 چون مساوی شد، همهٔ شرط‌ها باطل شد و سانتی که گذاشته بودن بهشون برگشت."
-                else:
-                    if win_lines:
-                        msg += "\n\n" + "\n".join(win_lines)
-                    if lose_lines:
-                        msg += "\n\n" + "\n".join(lose_lines)
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=msg)
-            except Exception as e:
-                logging.error(f"Failed to send football result to {chat_id}: {e}")
-            continue
-
-        # Open the betting window either BETTING_OPENS_HOURS_BEFORE kickoff, or right
-        # away if the match is already underway (e.g. the market was created late).
-        if status == 'scheduled':
-            should_open = short in football.LIVE_STATUSES
-            if not should_open and kickoff_at:
-                should_open = now >= kickoff_at - datetime.timedelta(hours=BETTING_OPENS_HOURS_BEFORE)
-            if should_open:
-                odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
-                bets = group_football_bets(db.get_football_bets(market_id))
-                status_label = football_status_label(short) if short in football.LIVE_STATUSES else "قبل از شروع بازی"
-                text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
-                keyboard = build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away)
-                try:
-                    sent = await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🎰 بت‌گیری برای بازی {home_team} - {away_team} باز شد!\n\n" + text,
-                        reply_markup=keyboard
-                    )
-                except Exception as e:
-                    # Only flip to 'live' once the buttons actually reached the group -
-                    # flipping first left the market permanently live with no message
-                    # (and so unbettable) whenever this send failed.
-                    logging.error(f"Failed to send football betting-open message to {chat_id}; will retry next poll: {e}")
-                    continue
-                db.set_football_market_message(market_id, sent.message_id)
-                message_id = sent.message_id
-                db.set_football_market_status(market_id, 'live')
-                status = 'live'
-
-        if short in football.LIVE_STATUSES and not match_started_announced:
-            db.mark_football_match_started(market_id)
-            match_started_announced = True
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚽️ بازی {home_team} - {away_team} شروع شد!")
-            except Exception as e:
-                logging.error(f"Failed to send football kickoff message to {chat_id}: {e}")
-
-        if short in football.HALFTIME_STATUSES and not halftime_announced:
-            db.mark_football_halftime_announced(market_id)
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⏸️ نیمهٔ اول {home_team} - {away_team} تموم شد!\nنتیجه: {home_score} - {away_score}"
-                )
-            except Exception as e:
-                logging.error(f"Failed to send halftime message to {chat_id}: {e}")
-
-        if status == 'live' and message_id:
-            odds_home, odds_away = football.compute_odds(elapsed, home_score, away_score, prior_home_prob)
-            bets = group_football_bets(db.get_football_bets(market_id))
-            status_label = football_status_label(short) if short in football.LIVE_STATUSES else "قبل از شروع بازی"
-            text = render_football_message(home_team, away_team, status_label, elapsed, home_score, away_score, odds_home, odds_away, bets)
-            keyboard = build_football_keyboard(market_id, home_team, away_team, odds_home, odds_away)
-            try:
-                await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
-            except Exception:
-                pass  # unchanged content or message too old to edit - not fatal
-
-async def place_football_bet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-
-    chat_id = resolve_chat_id(query)
-    if not chat_id:
-        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
-        return
-
-    data = query.data.split('_')
-    if len(data) != 5 or data[0] != 'fbet':
-        return
-    try:
-        market_id = int(data[1])
-        amount = int(data[3])
-    except ValueError:
-        return
-    if data[2] not in ('h', 'a'):
-        return
-    side = 'home' if data[2] == 'h' else 'away'
-    # callback_data is client-supplied: honour only the stakes the bot actually offers.
-    if amount not in BET_AMOUNTS:
-        await query.answer("مبلغ شرط نامعتبره!", show_alert=True)
-        return
-
-    market = db.get_football_market(market_id)
-    if not market:
-        await query.answer("این بازار وجود نداره!", show_alert=True)
-        return
-    (m_chat_id, fixture_id, home_team, away_team, status, halftime_announced, result, message_id,
-     created_by, prior_home_prob, kickoff_at, match_started_announced,
-     last_elapsed, last_home_score, last_away_score) = market
-    if status != 'live':
-        await query.answer("این بازی الان قابل شرط‌بندی نیست!", show_alert=True)
-        return
-    # A market belongs to the group it was opened in; don't let a button forwarded (or
-    # a callback forged) elsewhere settle against a different group's balances.
-    if m_chat_id != chat_id:
-        await query.answer("این بازار مال این گروه نیست!", show_alert=True)
-        return
-
-    # Price the bet from the server's own latest view of the match, never from the odds
-    # encoded in the tapped button: those go stale between polls (a goal at 89' left a
-    # ×2.00 button live for up to two minutes) and, being client-supplied, could simply
-    # be edited to ×50.
-    odds_home, odds_away = football.compute_odds(last_elapsed, last_home_score, last_away_score, prior_home_prob)
-    odds = odds_home if side == 'home' else odds_away
-    shown_odds = decode_odds(int(data[4])) if data[4].isdigit() else odds
-    if abs(shown_odds - odds) > 0.005:
-        await query.answer(
-            f"ضریب همین الان تغییر کرد ({shown_odds:.2f} ← {odds:.2f})! دوباره بزن تا با ضریب جدید ثبت بشه.",
-            show_alert=True
-        )
-        return
-
-    user_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-
-    # Escrow first with an atomic check-and-take (no double-spend window), then
-    # record the bet; if recording fails the stake is handed straight back.
-    if not db.try_deduct_size(user.id, chat_id, amount):
-        await query.answer(f"شما به اندازه کافی سایز ندارید! سایز فعلی: {int(user_size)}", show_alert=True)
-        return
-    try:
-        db.place_football_bet(market_id, user.id, user.first_name, side, amount, odds)
-    except Exception:
-        db.update_size(user.id, chat_id, amount)
-        raise
-    side_name = home_team if side == 'home' else away_team
-
-    prior_bets = [b for b in db.get_football_bets(market_id) if b[0] == user.id]
-    total_staked = sum(b[3] for b in prior_bets)
-    msg = f"{amount} سانت روی {side_name} با ضریب {odds:.2f} بستید! در صورت برد {int(amount * odds)} سانت می‌گیرید."
-    if len(prior_bets) > 1:
-        msg += f"\nمجموع شرط‌های شما روی این بازی تا الان: {int(total_staked)} سانت."
-    await query.answer(msg, show_alert=True)
 
 async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1409,6 +1183,16 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         if loser_perk == "لاشی":
             loser_loss = int(bet * 0.5)
 
+        # The crown is a target: whoever wears it bleeds double, which is what makes
+        # taking a swing at the leader worth it and stops the top spot from ossifying.
+        # The winner's take doubles with it - otherwise the extra would simply vanish
+        # and dethroning the king would pay no better than any other win.
+        kingdom = db.get_kingdom(chat_id)
+        if kingdom and kingdom[0] == loser_id:
+            loser_loss *= 2
+            winner_gain *= 2
+            msg_item_log += f"- 👑 {loser_name} پادشاهه و دو برابر ضرر کرد (و برنده دو برابر برد)!\n"
+
         if winner_milk:
             extra = random.randint(5, 15)
             winner_gain += extra
@@ -1435,6 +1219,14 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         db.update_size(winner_id, chat_id, winner_gain + bet)
         db.update_size(loser_id, chat_id, bet - loser_loss)
         db.record_match_result(winner_id, loser_id, chat_id)
+
+        wins, _ = db.get_win_loss(winner_id, chat_id)
+        badges = award(winner_id, chat_id, 'win_10') if wins >= 10 else []
+        w_size_now, _, _ = db.get_user(winner_id, chat_id, None, None)
+        if w_size_now >= 1000:
+            badges += award(winner_id, chat_id, 'first_1000')
+        l_size_now, _, _ = db.get_user(loser_id, chat_id, None, None)
+        loser_badges = award(loser_id, chat_id, 'rock_bottom') if l_size_now < 0 else []
 
         msg += f"\n💰 شرط اصلی: {bet} سانت"
         msg += msg_item_log
@@ -1468,6 +1260,14 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
                     msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"
 
         await deliver_pvp_message(context, chat_id, message_id, msg, inline_message_id=inline_message_id)
+        await announce_achievements(context, chat_id, winner_name, badges)
+        await announce_achievements(context, chat_id, loser_name, loser_badges)
+
+        # A decided match moves size, so the crown may well have changed hands.
+        old_king_name = kingdom[1] if kingdom else None
+        _, new_king = refresh_king(chat_id)
+        if new_king:
+            await announce_coronation(context, chat_id, new_king, old_king_name)
     except Exception:
         if settled:
             # Money already moved (payout or tie-refund done); refunding again here
@@ -1500,6 +1300,17 @@ async def recover_stuck_pvp_matches(context: ContextTypes.DEFAULT_TYPE):
             await resolve_pvp_match(context, match_id)
         except Exception as e:
             logging.error(f"Failed to recover stuck PvP match {match_id}: {e}")
+
+async def recover_pending_lotteries(context: ContextTypes.DEFAULT_TYPE):
+    """Startup sweep for lottery draws whose midnight job never ran (a restart, an
+    outage). The tickets were already paid for, so without this the pot would stay
+    escrowed and the money would simply be gone."""
+    for chat_id, draw_date in db.get_pending_lottery_draws(tehran_today_str()):
+        try:
+            await draw_lottery(context, draw_date)
+        except Exception as e:
+            logging.error(f"Failed to recover lottery {chat_id}/{draw_date}: {e}")
+
 
 async def recover_expired_consensus(context: ContextTypes.DEFAULT_TYPE):
     """Startup sweep for consensus votes whose one-hour timeout job died with the
@@ -1731,8 +1542,11 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Atomically stamp today's date first: a rapid double-tap (or the same button in
-    # two clients) would otherwise pass the check above twice and grow twice.
-    if not db.claim_daily_growth(user.id, chat_id, today_str):
+    # two clients) would otherwise pass the check above twice and grow twice. The same
+    # statement rolls the daily streak forward (or resets it if yesterday was missed).
+    yesterday_str = (datetime.datetime.now(IRAN_TZ).date() - datetime.timedelta(days=1)).isoformat()
+    streak = db.claim_daily_growth_with_streak(user.id, chat_id, today_str, yesterday_str)
+    if streak is None:
         await query.answer("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.", show_alert=True)
         return
 
@@ -1742,6 +1556,13 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delta = roll_nonzero(-3, 20)
     else:
         delta = roll_nonzero(-6, 10)
+
+    # Showing up every day compounds: each consecutive day adds a centimetre on top of
+    # the roll, capped so a long streak stays an edge rather than a runaway lead.
+    streak_bonus = min(max(streak - 1, 0), STREAK_MAX_BONUS)
+    delta += streak_bonus
+    if delta == 0:
+        delta = 1  # growth must always move the number - see roll_nonzero
 
     db.update_size(user.id, chat_id, delta)
 
@@ -1784,15 +1605,32 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dropped_item = drop_item(user.id, chat_id, drop_chance)
     item_msg = f"\n🎁 شما یک آیتم پیدا کردید: **{dropped_item}**\n📝 توضیحات: {ITEM_DESCRIPTIONS.get(dropped_item, '')}" if dropped_item else ""
 
+    streak_msg = ""
+    if streak >= 2:
+        streak_msg = f"\n🔥 استریک: {streak} روز پیاپی"
+        if streak_bonus:
+            streak_msg += f" (+{streak_bonus} سانت پاداش)"
+        if streak == STREAK_MAX_BONUS + 1:
+            streak_msg += "\n(به سقف پاداش استریک رسیدی!)"
+
     verb = "بزرگ شد" if delta >= 0 else "کوچک شد"
     d_name = get_dick_name(current_size)
-    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
-    
+    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.{streak_msg}\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
+
     await query.answer(f"{d_name} شما تغییر کرد!")
     try:
         await query.edit_message_text(msg)
     except:
         pass
+
+    earned = []
+    if streak >= 7:
+        earned += award(user.id, chat_id, 'streak_7')
+    if current_size >= 1000:
+        earned += award(user.id, chat_id, 'first_1000')
+    if current_size < 0:
+        earned += award(user.id, chat_id, 'rock_bottom')
+    await announce_achievements(context, chat_id, user.first_name, earned)
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.inline_query.from_user
@@ -1947,9 +1785,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             id=str(uuid4()),
             title="❓ راهنمای بازی",
             description="لیست تمام دستورات و نحوه بازی",
-            input_message_content=InputTextMessageContent(
-                "📖 **راهنمای بازی دودول**\n\n🌱 `/d` - رشد دادن دودول\n⚔️ `/c 10` - ایجاد چالش\n🏆 `/t` - برترین‌های گروه\n🎒 `/i` - آیتم‌های من\n💉 `/u آیتم` - استفاده از آیتم\n🎁 `/dd @user 10` - اهدای سایز\n\nیا از منوی اینلاین `@dickchallengerbot` استفاده کنید!"
-            )
+            input_message_content=InputTextMessageContent(HELP_TEXT)
         )
     ]
     if is_number:
@@ -2024,16 +1860,805 @@ async def show_inv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(msg, reply_markup=reply_markup)
 
+# ==========================================================================
+# Crown, consort, theft, shop, boss, lottery, random events, achievements
+# ==========================================================================
+
+STREAK_MAX_BONUS = 10
+
+# The crown taxes the group daily, which is what makes being #1 worth chasing - but it
+# also makes its wearer the only player consensus protection doesn't cover and doubles
+# what they lose in a challenge. The point is that the top spot should be contested,
+# not a seat someone parks in forever.
+KING_TAX_RATIO = 0.01
+KING_TAX_MIN_SIZE = 20
+CONSORT_TAX_SHARE = 0.30
+KHIANAT_STEAL_RATIO = 0.15
+TRAITOR_DAYS = 3
+
+THEFT_COOLDOWN_SECONDS = 6 * 3600
+THEFT_MIN_TARGET_SIZE = 25
+THEFT_MIN_RATIO, THEFT_MAX_RATIO = 0.05, 0.15
+THEFT_LUCKY_PERK_BONUS = 0.10
+
+BOSS_SPAWN_HOUR = 20  # Tehran
+BOSS_HP_PER_PLAYER = 40
+BOSS_MIN_HP = 80
+BOSS_REWARD_BASE = 25
+BOSS_TOP_DAMAGE_BONUS = 25
+BOSS_NAMES = [
+    "کیرِ غول‌پیکر سیاه", "اژدهای دودولی", "شومبول‌خوارِ اعظم",
+    "هیولای خایه‌دار", "کصِ کهکشانی", "دیوِ سه‌متری",
+]
+
+LOTTERY_TICKET_PRICE = 10
+LOTTERY_BURN_RATIO = 0.10  # burned, so the lottery is a sink and not just a shuffle
+
+RANDOM_EVENT_INTERVAL_SECONDS = 3 * 3600
+RANDOM_EVENT_CHANCE = 0.18
+
+ACHIEVEMENTS = {
+    'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
+    'streak_7': ('🔥', 'هفتهٔ کامل', '۷ روز پشت سر هم دودولش رو مالید'),
+    'king': ('👑', 'پادشاه', 'تاج گروه رو گرفت'),
+    'consort': ('💍', 'همسر پادشاه', 'به عقد پادشاه دراومد'),
+    'traitor': ('🗡️', 'خائن', 'به پادشاه خیانت کرد'),
+    'thief': ('🥷', 'دزد', 'یه دزدی موفق انجام داد'),
+    'robbed': ('😭', 'مالباخته', 'ازش دزدی شد'),
+    'boss_slayer': ('🐉', 'اژدهاکش', 'تو کشتن باس شرکت کرد'),
+    'lottery_winner': ('🎟️', 'خوش‌شانس', 'لاتاری رو برد'),
+    'rock_bottom': ('💀', 'ته جدول', 'سایزش منفی شد'),
+    'win_10': ('⚔️', 'ده‌برده', '۱۰ تا چالش برد'),
+}
+
+
+def award(user_id, chat_id, code):
+    """Grants a badge and returns [(emoji, title)] the first time only, [] afterwards.
+    Callers collect these and hand them to announce_achievements."""
+    if code not in ACHIEVEMENTS:
+        return []
+    if not db.grant_achievement(user_id, chat_id, code):
+        return []
+    emoji, title, _ = ACHIEVEMENTS[code]
+    return [(emoji, title)]
+
+
+async def announce_achievements(context, chat_id, who, earned):
+    if not earned:
+        return
+    lines = "\n".join(f"{emoji} {title}" for emoji, title in earned)
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=f"🏅 {who} نشان جدید گرفت:\n{lines}")
+    except Exception as e:
+        logging.error(f"Failed to announce achievements in {chat_id}: {e}")
+
+
+def refresh_king(chat_id):
+    """Recomputes who holds the crown from the current leaderboard.
+
+    Returns (kingdom_row, new_king) where new_king is (id, name) only when the crown
+    actually changed hands, so the caller can announce a coronation exactly once. The
+    consort seat is emptied by db.crown_king on a change of ruler - the consort belongs
+    to the throne, not to the person who was sitting on it."""
+    rows = db.get_top_users_full(chat_id)
+    rows = [r for r in rows if (r[2] or 0) > 0]
+    if not rows:
+        return db.get_kingdom(chat_id), None
+    top_id, top_name = rows[0][0], rows[0][1]
+    current = db.get_kingdom(chat_id)
+    if current and current[0] == top_id:
+        return current, None
+    db.crown_king(chat_id, top_id, top_name)
+    return db.get_kingdom(chat_id), (top_id, top_name)
+
+
+async def announce_coronation(context, chat_id, new_king, old_king_name):
+    king_id, king_name = new_king
+    msg = f"👑 تاج جابه‌جا شد!\n{king_name} پادشاه جدید گروهه."
+    if old_king_name:
+        msg += f"\n{old_king_name} از تخت افتاد و همسرش هم از قصر انداخته شد بیرون."
+    msg += (f"\n\nپادشاه روزانه {int(KING_TAX_RATIO * 100)}٪ از سایز بقیه مالیات می‌گیره،"
+            f"\nولی تو چالش دو برابر ضرر می‌کنه و سپر اجماع براش کار نمی‌کنه."
+            f"\nبا /hamsar می‌تونه برای خودش همسر انتخاب کنه.")
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception as e:
+        logging.error(f"Failed to announce coronation in {chat_id}: {e}")
+    await announce_achievements(context, chat_id, king_name, award(king_id, chat_id, 'king'))
+
+
+async def king_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    before = db.get_kingdom(chat_id)
+    kingdom, new_king = refresh_king(chat_id)
+    if new_king:
+        await announce_coronation(context, chat_id, new_king, before[1] if before else None)
+    if not kingdom or not kingdom[0]:
+        await update.message.reply_text("هنوز هیچکس تو این گروه تاج نگرفته! اول یه کم رشد کنید.")
+        return
+
+    king_id, king_name, consort_id, consort_name, _, _ = kingdom
+    info = db.get_user_info(king_id, chat_id)
+    king_size = int(info[1]) if info else 0
+    msg = f"👑 پادشاه گروه: {king_name} ({king_size} سانتی‌متر)\n"
+    if consort_id:
+        c_info = db.get_user_info(consort_id, chat_id)
+        c_size = int(c_info[1]) if c_info else 0
+        msg += f"💍 همسر پادشاه: {consort_name} ({c_size} سانتی‌متر)\n"
+        msg += f"   └ روزانه {int(CONSORT_TAX_SHARE * 100)}٪ از مالیات پادشاه بهش می‌رسه و کسی نمی‌تونه ازش دزدی کنه.\n"
+        msg += f"   └ ولی هر لحظه می‌تونه با /khianat به پادشاه خیانت کنه!\n"
+    else:
+        msg += "💍 همسر پادشاه: ندارد\n   └ پادشاه با `/hamsar @username` می‌تونه انتخاب کنه.\n"
+    msg += (f"\n📜 قوانین تاج:\n"
+            f"• روزانه {int(KING_TAX_RATIO * 100)}٪ از سایز هر بازیکن به پادشاه می‌رسه\n"
+            f"• پادشاه تو چالش دو برابر ضرر می‌کنه\n"
+            f"• سپر ۳ روزهٔ اجماع برای پادشاه کار نمی‌کنه")
+    await update.message.reply_text(msg)
+
+
+async def consort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/hamsar @username` - the king seats a consort. Once per Tehran day, so the
+    throne can't cycle partners to farm anything."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    kingdom, new_king = refresh_king(chat_id)
+    if new_king:
+        await announce_coronation(context, chat_id, new_king, None)
+    if not kingdom or kingdom[0] != user.id:
+        king_name = kingdom[1] if kingdom and kingdom[1] else "کسی"
+        await update.message.reply_text(f"فقط پادشاه می‌تونه همسر انتخاب کنه! الان {king_name} پادشاهه 👑")
+        return
+
+    target_id, target_name = get_target_user(update, update.message.text, chat_id)
+    if not target_id:
+        await update.message.reply_text("استفاده صحیح:\n/hamsar @username\nیا ریپلای روی پیام شخص و تایپ /hamsar")
+        return
+    if target_id == user.id:
+        await update.message.reply_text("نمی‌تونی با خودت ازدواج کنی! 😐")
+        return
+    if db.is_traitor(target_id, chat_id):
+        await update.message.reply_text(f"{target_name} خائنه! تا چند روز هیچ پادشاهی قبولش نمی‌کنه 🗡️")
+        return
+
+    today_str = tehran_today_str()
+    if not db.set_consort(chat_id, user.id, target_id, target_name, today_str):
+        await update.message.reply_text("امروز یه بار همسر انتخاب کردی! فردا دوباره می‌تونی.")
+        return
+
+    await update.message.reply_text(
+        f"💍 پادشاه {user.first_name} رسماً {target_name} رو به همسری انتخاب کرد!\n\n"
+        f"از این به بعد {int(CONSORT_TAX_SHARE * 100)}٪ از مالیات روزانهٔ پادشاه به {target_name} می‌رسه "
+        f"و گارد سلطنتی جلوی دزدی ازش رو می‌گیره.\n"
+        f"⚠️ ولی حواست باشه — همسرِ پادشاه هر وقت بخواد می‌تونه خیانت کنه..."
+    )
+    await announce_achievements(context, chat_id, target_name, award(target_id, chat_id, 'consort'))
+
+
+async def divorce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/talagh` - the king dismisses the consort before they get the chance to betray."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    kingdom = db.get_kingdom(chat_id)
+    if not kingdom or kingdom[0] != user.id:
+        await update.message.reply_text("فقط پادشاه می‌تونه طلاق بده!")
+        return
+    if not kingdom[2]:
+        await update.message.reply_text("تو که همسری نداری 😐")
+        return
+    consort_name = kingdom[3]
+    if not db.clear_consort(chat_id):
+        await update.message.reply_text("تو که همسری نداری 😐")
+        return
+    await update.message.reply_text(
+        f"💔 پادشاه {user.first_name} همسرش {consort_name} رو طلاق داد و از قصر انداخت بیرون!"
+    )
+
+
+async def betray_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/khianat @username` - the consort defects, walking off with a slice of the
+    king's size and splitting it with whoever they left him for."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    kingdom = db.get_kingdom(chat_id)
+    if not kingdom or kingdom[2] != user.id:
+        await update.message.reply_text("تو همسر پادشاه نیستی که بخوای خیانت کنی! 😏")
+        return
+    king_id, king_name = kingdom[0], kingdom[1]
+
+    lover_id, lover_name = get_target_user(update, update.message.text, chat_id)
+    if not lover_id:
+        await update.message.reply_text("با کی می‌خوای بری؟\n/khianat @username")
+        return
+    if lover_id == king_id:
+        await update.message.reply_text("با خودِ پادشاه که نمی‌شه بهش خیانت کرد 😐")
+        return
+    if lover_id == user.id:
+        await update.message.reply_text("با خودت؟ 😐")
+        return
+
+    king_info = db.get_user_info(king_id, chat_id)
+    king_size = king_info[1] if king_info else 0
+    loot = max(1, int(king_size * KHIANAT_STEAL_RATIO))
+    # Only take what the crown actually has, so betrayal can never mint size.
+    if not db.try_deduct_size(king_id, chat_id, loot):
+        loot = max(0, int(king_size))
+        if loot <= 0 or not db.try_deduct_size(king_id, chat_id, loot):
+            await update.message.reply_text("خزانهٔ پادشاه خالیه! چیزی برای بردن نیست 😂")
+            return
+
+    traitor_cut = loot // 2
+    lover_cut = loot - traitor_cut
+    db.update_size(user.id, chat_id, traitor_cut)
+    db.update_size(lover_id, chat_id, lover_cut)
+    db.clear_consort(chat_id)
+    db.mark_traitor(user.id, chat_id, TRAITOR_DAYS)
+
+    await update.message.reply_text(
+        f"🗡️💔 خیانت!\n\n"
+        f"{user.first_name} رفت به {lover_name} داد و خیانت کرد!\n\n"
+        f"👑 {king_name} تنها موند و {int(loot)} سانت از خزانه‌اش رفت.\n"
+        f"🥷 {user.first_name}: +{int(traitor_cut)} سانت\n"
+        f"😏 {lover_name}: +{int(lover_cut)} سانت\n\n"
+        f"🗡️ {user.first_name} تا {TRAITOR_DAYS} روز داغ «خائن» رو داره: "
+        f"هیچ پادشاهی همسرش نمی‌کنه و دزدی ازش راحت‌تره."
+    )
+    await announce_achievements(context, chat_id, user.first_name, award(user.id, chat_id, 'traitor'))
+
+
+async def collect_king_tax(context: ContextTypes.DEFAULT_TYPE, chat_id, today_str):
+    """The crown's daily income. Taxes every player who can afford it, hands the
+    consort their cut, and reports the take. Claimed once per day per group."""
+    kingdom, new_king = refresh_king(chat_id)
+    if not kingdom or not kingdom[0]:
+        return
+    if not db.mark_tax_collected(chat_id, today_str):
+        return
+    king_id, king_name, consort_id, consort_name = kingdom[0], kingdom[1], kingdom[2], kingdom[3]
+
+    total = 0
+    payers = 0
+    try:
+        for uid, _name, size in db.get_taxable_players(chat_id, king_id, KING_TAX_MIN_SIZE):
+            amount = max(1, int((size or 0) * KING_TAX_RATIO))
+            if db.try_deduct_size(uid, chat_id, amount):
+                total += amount
+                payers += 1
+    finally:
+        # Pay out whatever was actually collected even if the loop blew up part way:
+        # otherwise the players already debited would have their size destroyed rather
+        # than transferred, and the day is already stamped as collected.
+        if total > 0:
+            consort_cut = int(total * CONSORT_TAX_SHARE) if consort_id else 0
+            db.update_size(king_id, chat_id, total - consort_cut)
+            if consort_cut:
+                db.update_size(consort_id, chat_id, consort_cut)
+    if total <= 0:
+        return
+    consort_cut = int(total * CONSORT_TAX_SHARE) if consort_id else 0
+
+    msg = (f"👑 مالیات روزانهٔ سلطنتی\n\n"
+           f"{king_name} از {payers} نفر مجموعاً {int(total)} سانت مالیات گرفت.")
+    if consort_cut:
+        msg += f"\n💍 سهم همسرش {consort_name}: {int(consort_cut)} سانت"
+    msg += "\n\n(دوست نداری مالیات بدی؟ تاج رو ازش بگیر 😈)"
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception as e:
+        logging.error(f"Failed to announce king tax in {chat_id}: {e}")
+
+
+async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/dozdi @username` - attempt to rob someone. Robbing a bigger player is harder,
+    a failed attempt pays a fine to the victim, and the whole thing is zero-sum."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+    # Same gate /ejma uses: only people actually playing today can move other people's
+    # size around, so a throwaway account can't be spun up purely to rob someone.
+    if thief_last_grown != tehran_today_str():
+        await update.message.reply_text("اول باید امروز دودولت رو بمالی (/d) بعد بری دزدی! 🥷")
+        return
+
+    target_id, target_name = get_target_user(update, update.message.text, chat_id)
+    if not target_id:
+        await update.message.reply_text("از کی می‌خوای بدزدی؟\n/dozdi @username\nیا ریپلای روی پیامش و تایپ /dozdi")
+        return
+    if target_id == user.id:
+        await update.message.reply_text("از جیب خودت؟ 😐")
+        return
+
+    target_info = db.get_user_info(target_id, chat_id)
+    target_size = (target_info[1] if target_info else 0) or 0
+    if target_size < THEFT_MIN_TARGET_SIZE:
+        await update.message.reply_text(
+            f"{target_name} فقیرتر از اونیه که ازش بدزدی! (حداقل {THEFT_MIN_TARGET_SIZE} سانت لازمه)"
+        )
+        return
+
+    kingdom, _ = refresh_king(chat_id)
+    if kingdom and kingdom[2] == target_id:
+        await update.message.reply_text(
+            f"🛡️ {target_name} همسر پادشاهه و گارد سلطنتی نمی‌ذاره بهش دست بزنی!"
+        )
+        return
+
+    ok, remaining = db.try_start_theft(user.id, chat_id, THEFT_COOLDOWN_SECONDS)
+    if not ok:
+        hours, minutes = remaining // 3600, (remaining % 3600) // 60
+        await update.message.reply_text(
+            f"تازه دزدی کردی! تا {hours} ساعت و {minutes} دقیقهٔ دیگه دستت بستس 🥷"
+        )
+        return
+
+    # Robbing up is meant to be a long shot and robbing down easy money, so the odds
+    # follow the size gap rather than being a flat coin flip.
+    ratio = target_size / max(1.0, thief_size + target_size)
+    chance = 0.65 - 0.4 * ratio
+    if thief_perk == "کص‌شانس":
+        chance += THEFT_LUCKY_PERK_BONUS
+    if db.is_traitor(target_id, chat_id):
+        chance += 0.20  # nobody guards a traitor
+    chance = min(max(chance, 0.15), 0.75)
+
+    loot = max(1, int(target_size * random.uniform(THEFT_MIN_RATIO, THEFT_MAX_RATIO)))
+
+    # قفل is bought precisely for this moment: it eats one theft attempt and is spent.
+    # Checked before the roll, so a lock is never wasted on an attempt that would have
+    # failed anyway - the thief still burns their cooldown either way.
+    if db.use_inventory(target_id, chat_id, "قفل"):
+        await update.message.reply_text(
+            f"🔒 {target_name} قفل داشت!\n{user.first_name} به در بسته خورد و دست خالی برگشت.\n"
+            f"(قفل {target_name} مصرف شد)"
+        )
+        return
+
+    if random.random() < chance:
+        if not db.try_deduct_size(target_id, chat_id, loot):
+            await update.message.reply_text(f"{target_name} همین الان سایزش کم شد؛ دزدی بی‌نتیجه موند!")
+            return
+        db.update_size(user.id, chat_id, loot)
+        await update.message.reply_text(
+            f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!\n"
+            f"(شانس موفقیت: {int(chance * 100)}٪)"
+        )
+        earned = award(user.id, chat_id, 'thief')
+        await announce_achievements(context, chat_id, user.first_name, earned)
+        await announce_achievements(context, chat_id, target_name, award(target_id, chat_id, 'robbed'))
+    else:
+        fine = max(1, loot // 2)
+        if db.try_deduct_size(user.id, chat_id, fine):
+            db.update_size(target_id, chat_id, fine)
+            await update.message.reply_text(
+                f"🚨 مچ‌گیری!\n\n{user.first_name} می‌خواست از {target_name} بدزده ولی گیر افتاد "
+                f"و {int(fine)} سانت غرامت داد!\n(شانس موفقیت: {int(chance * 100)}٪)"
+            )
+        else:
+            await update.message.reply_text(
+                f"🚨 {user.first_name} گیر افتاد ولی اونقدر فقیره که غرامتی هم نداشت بده 😂"
+            )
+
+
+def build_shop_keyboard(user_id):
+    rows = []
+    items = list(SHOP_PRICES.items())
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(f"{name} — {price}", callback_data=f"buy_{user_id}_{name}")
+               for name, price in items[i:i + 2]]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    db.track_chat(chat_id)
+    size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    lines = ["🏪 **فروشگاه دودول**\n", f"💰 موجودی شما: {int(size)} سانتی‌متر\n"]
+    for name, price in SHOP_PRICES.items():
+        lines.append(f"• {name} — {price} سانت\n  └ {ITEM_DESCRIPTIONS.get(name, '')}")
+    lines.append("\nروی دکمه بزن تا بخری 👇")
+    await update.message.reply_text("\n".join(lines), reply_markup=build_shop_keyboard(user.id))
+
+
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
+        return
+
+    data = query.data.split('_', 2)
+    if len(data) != 3 or data[0] != 'buy':
+        return
+    try:
+        owner_id = int(data[1])
+    except ValueError:
+        return
+    item_name = data[2]
+    if user.id != owner_id:
+        await query.answer("این فروشگاه مال شما نیست! خودت /shop بزن.", show_alert=True)
+        return
+    price = SHOP_PRICES.get(item_name)
+    if price is None:
+        await query.answer("این آیتم تو فروشگاه نیست!", show_alert=True)
+        return
+
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    # Pay first, then hand over the goods; if the insert somehow fails the size goes back.
+    if not db.try_deduct_size(user.id, chat_id, price):
+        size, _, _ = db.get_user(user.id, chat_id, None, None)
+        await query.answer(f"پول کافی نداری! قیمت {price} سانته، تو {int(size)} داری.", show_alert=True)
+        return
+    try:
+        db.add_inventory(user.id, chat_id, item_name)
+    except Exception:
+        db.update_size(user.id, chat_id, price)
+        raise
+
+    size, _, _ = db.get_user(user.id, chat_id, None, None)
+    await query.answer(f"{item_name} خریدی! 🛍️\nموجودی جدید: {int(size)} سانت", show_alert=True)
+
+
+async def spawn_daily_bosses(context: ContextTypes.DEFAULT_TYPE):
+    """Drops one boss per active group each evening. Co-op, unlike everything else in
+    this game: the whole group chips damage in and shares the reward if it dies."""
+    today_str = tehran_today_str()
+    for chat_id in db.get_all_chats():
+        try:
+            players = db.get_active_today_count(chat_id, today_str)
+            if players < 2:
+                continue
+            hp = max(BOSS_MIN_HP, BOSS_HP_PER_PLAYER * players)
+            name = random.choice(BOSS_NAMES)
+            boss_id = db.spawn_boss(chat_id, name, hp, today_str)
+            if not boss_id:
+                continue
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=render_boss_message(name, hp, hp, []),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚔️ حمله!", callback_data=f"bosshit_{boss_id}")]])
+            )
+            db.set_boss_message(boss_id, sent.message_id)
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception as e:
+            logging.error(f"Failed to spawn boss in {chat_id}: {e}")
+
+
+def render_boss_message(name, hp, max_hp, hits):
+    filled = int(10 * hp / max_hp) if max_hp else 0
+    bar = "🟩" * filled + "⬛️" * (10 - filled)
+    lines = [
+        f"🐉 **{name}** به گروه حمله کرد!",
+        f"❤️ جون: {hp}/{max_hp}",
+        bar,
+        "",
+        "هر نفر فقط یه بار می‌تونه بزنه. تا نیمه‌شب وقت دارید بکشیدش!",
+    ]
+    if hits:
+        lines.append("\n⚔️ ضربه‌ها:")
+        for _uid, fname, dmg in hits[:10]:
+            lines.append(f"- {fname}: {dmg} دمیج")
+    return "\n".join(lines)
+
+
+async def boss_hit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
+        return
+
+    data = query.data.split('_')
+    if len(data) != 2 or data[0] != 'bosshit':
+        return
+    try:
+        boss_id = int(data[1])
+    except ValueError:
+        return
+
+    boss = db.get_boss(boss_id)
+    if not boss:
+        await query.answer("این باس دیگه وجود نداره!", show_alert=True)
+        return
+    b_chat_id, name, max_hp, hp, status, message_id = boss
+    if b_chat_id != chat_id:
+        await query.answer("این باس مال این گروه نیست!", show_alert=True)
+        return
+    if status != 'alive':
+        await query.answer("این باس دیگه زنده نیست!", show_alert=True)
+        return
+
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    streak, _ = db.get_streak(user.id, chat_id)
+    damage = _dice_rng.randint(8, 30) + min(streak, 10)
+
+    accepted, remaining_hp = db.hit_boss(boss_id, user.id, user.first_name, damage)
+    if not accepted:
+        await query.answer("تو قبلاً به این باس زدی! نوبت بقیه‌ست.", show_alert=True)
+        return
+
+    await query.answer(f"⚔️ {damage} دمیج زدی!")
+    hits = db.get_boss_hits(boss_id)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            text=render_boss_message(name, max(0, remaining_hp or 0), max_hp, hits),
+            reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton("⚔️ حمله!", callback_data=f"bosshit_{boss_id}")]])
+                          if (remaining_hp or 0) > 0 else None)
+        )
+    except Exception:
+        pass
+
+    if (remaining_hp or 0) > 0:
+        return
+    # Only the hit that actually brought it down pays the group out.
+    if not db.claim_boss_kill(boss_id):
+        return
+
+    # Re-read the hits AFTER claiming the kill: the edit above is an await, so another
+    # player's hit can land in between, and paying from the older snapshot would leave
+    # them out of the split entirely.
+    hits = db.get_boss_hits(boss_id)
+    lines = [f"🎉 گروه **{name}** رو کشت!", "", "💰 جایزه‌ها:"]
+    top_damage = max((h[2] for h in hits), default=0)
+    for uid, fname, dmg in hits:
+        reward = BOSS_REWARD_BASE + dmg // 2
+        if dmg == top_damage:
+            reward += BOSS_TOP_DAMAGE_BONUS
+        db.update_size(uid, chat_id, reward)
+        star = " 🏆" if dmg == top_damage else ""
+        lines.append(f"• {fname}{star}: {dmg} دمیج → +{reward} سانت")
+        await announce_achievements(context, chat_id, fname, award(uid, chat_id, 'boss_slayer'))
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception as e:
+        logging.error(f"Failed to announce boss kill in {chat_id}: {e}")
+
+
+async def expire_bosses_job(context: ContextTypes.DEFAULT_TYPE):
+    for boss_id, chat_id, name, message_id, max_hp, hp in db.expire_bosses():
+        try:
+            if message_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id,
+                        text=f"🐉 {name} فرار کرد!\nگروه نتونست بکشتش ({hp}/{max_hp} جون براش مونده بود)."
+                    )
+                except Exception:
+                    pass
+            await context.bot.send_message(chat_id=chat_id, text=f"🐉 {name} تا صبح فرار کرد! امشب دوباره یکی میاد.")
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception as e:
+            logging.error(f"Failed to expire boss {boss_id}: {e}")
+
+
+async def lottery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    text, keyboard = build_lottery_view(chat_id, user.id)
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+def build_lottery_view(chat_id, user_id):
+    entries = db.get_lottery_entries(chat_id, tehran_today_str())
+    pot = sum(t for _, _, t in entries) * LOTTERY_TICKET_PRICE
+    mine = next((t for uid, _, t in entries if uid == user_id), 0)
+    lines = [
+        "🎟️ **لاتاری امشب**",
+        f"💰 جایزه: {int(pot * (1 - LOTTERY_BURN_RATIO))} سانتی‌متر",
+        f"🎫 قیمت هر بلیت: {LOTTERY_TICKET_PRICE} سانت",
+        f"🎫 بلیت‌های تو: {mine}",
+        "",
+        "قرعه‌کشی نیمه‌شب به وقت تهران. هرچی بلیت بیشتر، شانس بیشتر.",
+    ]
+    if entries:
+        lines.append("\n👥 شرکت‌کننده‌ها:")
+        for _uid, fname, t in entries:
+            lines.append(f"- {fname}: {t} بلیت")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎫 ۱ بلیت", callback_data=f"lot_{user_id}_1"),
+        InlineKeyboardButton("🎫 ۵ بلیت", callback_data=f"lot_{user_id}_5"),
+        InlineKeyboardButton("🎫 ۱۰ بلیت", callback_data=f"lot_{user_id}_10"),
+    ]])
+    return "\n".join(lines), keyboard
+
+
+async def lottery_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
+        return
+
+    data = query.data.split('_')
+    if len(data) != 3 or data[0] != 'lot':
+        return
+    try:
+        owner_id, count = int(data[1]), int(data[2])
+    except ValueError:
+        return
+    if user.id != owner_id:
+        await query.answer("این دکمه مال شما نیست! خودت /lottery بزن.", show_alert=True)
+        return
+    if count not in (1, 5, 10):
+        return
+
+    cost = count * LOTTERY_TICKET_PRICE
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    if not db.try_deduct_size(user.id, chat_id, cost):
+        size, _, _ = db.get_user(user.id, chat_id, None, None)
+        await query.answer(f"پول کافی نداری! {count} بلیت {cost} سانته، تو {int(size)} داری.", show_alert=True)
+        return
+    try:
+        db.buy_lottery_tickets(chat_id, tehran_today_str(), user.id, user.first_name, count)
+    except Exception:
+        db.update_size(user.id, chat_id, cost)
+        raise
+
+    await query.answer(f"{count} بلیت خریدی! 🎟️")
+    text, keyboard = build_lottery_view(chat_id, user.id)
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        pass
+
+
+async def draw_lottery(context: ContextTypes.DEFAULT_TYPE, draw_date):
+    """Midnight draw. claim_lottery_draw removes the day's tickets as it reads them, so
+    a re-run of the midnight job can never pay a second winner from the same pot."""
+    for chat_id in db.get_lottery_chats(draw_date):
+        try:
+            entries = db.claim_lottery_draw(chat_id, draw_date)
+            if not entries:
+                continue
+            pot = sum(t for _, _, t in entries) * LOTTERY_TICKET_PRICE
+            prize = int(pot * (1 - LOTTERY_BURN_RATIO))
+            pool = []
+            for uid, fname, tickets in entries:
+                pool.extend([(uid, fname)] * tickets)
+            if not pool or prize <= 0:
+                continue
+            winner_id, winner_name = _dice_rng.choice(pool)
+            db.update_size(winner_id, chat_id, prize)
+            odds = sum(t for uid, _, t in entries if uid == winner_id) / len(pool) * 100
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(f"🎟️ قرعه‌کشی لاتاری!\n\n"
+                      f"🎉 برنده: {winner_name}\n"
+                      f"💰 جایزه: {prize} سانتی‌متر\n"
+                      f"🎲 شانسش: {odds:.0f}٪ از {len(pool)} بلیت")
+            )
+            await announce_achievements(context, chat_id, winner_name, award(winner_id, chat_id, 'lottery_winner'))
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception as e:
+            logging.error(f"Lottery draw failed for {chat_id}: {e}")
+
+
+async def random_event_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every few hours each group has a small chance of something happening to it.
+    Besides the chaos, this is a deliberate lever on the size supply: roughly half the
+    events remove size and half add it."""
+    for chat_id in db.get_all_chats():
+        try:
+            if random.random() > RANDOM_EVENT_CHANCE:
+                continue
+            players = db.get_all_players(chat_id)
+            players = [p for p in players if (p[2] or 0) != 0]
+            if len(players) < 2:
+                continue
+            event = random.choice(['earthquake', 'viagra_rain', 'storm', 'treasure', 'blessing'])
+
+            if event == 'earthquake':
+                for uid, _n, size in players:
+                    cut = max(1, int((size or 0) * 0.08))
+                    if (size or 0) > 0:
+                        db.try_deduct_size(uid, chat_id, cut)
+                text = "🌍 زلزله!\nزمین لرزید و ۸٪ از سایز همه ریخت پایین."
+            elif event == 'viagra_rain':
+                for uid, _n, _s in players:
+                    db.update_size(uid, chat_id, 15)
+                text = "💊 بارون ویاگرا!\nاز آسمون ویاگرا بارید و همه ۱۵ سانت گرفتن."
+            elif event == 'storm':
+                kingdom = db.get_kingdom(chat_id)
+                if not kingdom or not kingdom[0]:
+                    continue
+                info = db.get_user_info(kingdom[0], chat_id)
+                k_size = (info[1] if info else 0) or 0
+                cut = max(1, int(k_size * 0.12))
+                if not db.try_deduct_size(kingdom[0], chat_id, cut):
+                    continue
+                text = f"⛈️ طوفان به قصر زد!\n👑 {kingdom[1]} ‌{int(cut)} سانت از دست داد. تاج سنگینه..."
+            elif event == 'treasure':
+                uid, fname, _s = random.choice(players)
+                db.update_size(uid, chat_id, 60)
+                text = f"💎 گنج!\n{fname} یه صندوق گنج پیدا کرد و ۶۰ سانت گرفت!"
+            else:
+                lucky = []
+                for uid, fname, _s in players:
+                    streak, _ = db.get_streak(uid, chat_id)
+                    if streak >= 3:
+                        db.update_size(uid, chat_id, 20)
+                        lucky.append(fname)
+                if not lucky:
+                    continue
+                text = "🔥 برکت استریک!\nهر کی ۳ روز پیاپی اومده بود ۲۰ سانت گرفت:\n" + "، ".join(lucky)
+
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception as e:
+            logging.error(f"Random event failed for {chat_id}: {e}")
+
+
+async def achievements_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    db.track_chat(chat_id)
+    target_id, target_name = get_target_user(update, update.message.text, chat_id)
+    if not target_id:
+        target_id, target_name = user.id, user.first_name
+        db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    earned = set(db.get_achievements(target_id, chat_id))
+    streak, best = db.get_streak(target_id, chat_id)
+    lines = [f"🏅 نشان‌های {target_name} ({len(earned)} از {len(ACHIEVEMENTS)})", ""]
+    for code, (emoji, title, desc) in ACHIEVEMENTS.items():
+        mark = "✅" if code in earned else "🔒"
+        lines.append(f"{mark} {emoji} {title} — {desc}")
+    lines.append(f"\n🔥 استریک فعلی: {streak} روز (رکورد: {best})")
+    await update.message.reply_text("\n".join(lines))
+
+
 if __name__ == '__main__':
     db.init_db()
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     
-    app.job_queue.run_daily(midnight_reminder, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
-    app.job_queue.run_repeating(poll_football_markets, interval=FOOTBALL_POLL_INTERVAL_SECONDS, first=10)
+    app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
+    app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
+    app.job_queue.run_repeating(random_event_job, interval=RANDOM_EVENT_INTERVAL_SECONDS, first=300)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
     app.job_queue.run_once(recover_expired_consensus, when=7)
+    app.job_queue.run_once(recover_pending_lotteries, when=9)
 
     app.add_error_handler(on_error)
+
+    # Group -1 runs ahead of every real handler and never blocks them.
+    app.add_handler(TypeHandler(Update, log_incoming), group=-1)
 
     app.add_handler(CommandHandler('start', start, filters=filters.UpdateType.MESSAGE))
     app.add_handler(CommandHandler('help', start, filters=filters.UpdateType.MESSAGE))
@@ -2046,7 +2671,14 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(use|u)\b'), use_item_cmd))
     app.add_handler(MessageHandler(cmd(r'^/ejma\b'), consensus_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(wr|winrate)\b'), winrate_cmd))
-    app.add_handler(MessageHandler(cmd(r'^/fbet\b'), football_bet_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(king|shah)\b'), king_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(hamsar|malake)\b'), consort_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(khianat|khiyanat)\b'), betray_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/talagh\b'), divorce_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(dozdi|steal)\b'), steal_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(shop|forushgah)\b'), shop_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(lottery|lotari)\b'), lottery_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     app.add_handler(CallbackQueryHandler(accept_challenge_callback, pattern=r'^chal_'))
     app.add_handler(CallbackQueryHandler(rematch_callback, pattern=r'^rematch_'))
@@ -2058,7 +2690,9 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(show_top_callback, pattern=r'^showtop_'))
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))
     app.add_handler(CallbackQueryHandler(show_inv_callback, pattern=r'^showinv_'))
-    app.add_handler(CallbackQueryHandler(place_football_bet_callback, pattern=r'^fbet_'))
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy_'))
+    app.add_handler(CallbackQueryHandler(boss_hit_callback, pattern=r'^bosshit_'))
+    app.add_handler(CallbackQueryHandler(lottery_buy_callback, pattern=r'^lot_'))
     
     app.add_handler(InlineQueryHandler(inline_query))
     

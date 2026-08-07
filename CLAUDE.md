@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-DickDickBot is a Persian-language Telegram group game bot ("grow your size" comedy game) written in Python using `python-telegram-bot` v20+, with PostgreSQL (Supabase) as the only datastore. There is no build step, no bundler, and no test framework configured in the repo — it's three flat modules under `python_bot/`.
+DickDickBot is a Persian-language Telegram group game bot ("grow your size" comedy game) written in Python using `python-telegram-bot` v20+, with PostgreSQL (Supabase) as the only datastore. There is no build step, no bundler, and no test framework configured in the repo — it's two flat modules under `python_bot/`.
 
-Read `README.md` for the full user-facing feature list (in Persian) — it documents exact game rules (consensus vote thresholds, betting payout formulas, perk effects, football odds mechanics) that are easy to get subtly wrong if you only read the code.
+Read `README.md` for the full user-facing feature list (in Persian) — it documents exact game rules (consensus vote thresholds, betting payout formulas, perk effects, crown/consort rules) that are easy to get subtly wrong if you only read the code.
 
 ## Running the bot
 
@@ -14,7 +14,6 @@ Read `README.md` for the full user-facing feature list (in Persian) — it docum
 cd python_bot
 pip install -r requirements.txt
 export SUPABASE_DB_URL="postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres"
-export API_FOOTBALL_KEY="..."   # optional - only /fbet needs it
 python bot.py
 ```
 
@@ -24,7 +23,7 @@ python bot.py
 
 ## Testing
 
-There is no test suite committed to the repo. The established pattern for this codebase (see recent git history) is to spin up a throwaway local Postgres instance and write a standalone script that imports `db`/`bot`/`football` directly and drives handlers with hand-rolled fake `Update`/`CallbackQuery`/`Context` objects — there is no pytest config or fixtures.
+There is no test suite committed to the repo. The established pattern for this codebase (see recent git history) is to spin up a throwaway local Postgres instance and write a standalone script that imports `db`/`bot` directly and drives handlers with hand-rolled fake `Update`/`CallbackQuery`/`Context` objects — there is no pytest config or fixtures.
 
 ```bash
 # one-time: init a local scratch Postgres cluster on a free port
@@ -34,35 +33,33 @@ createdb -p 55432 -h /tmp dicktest
 
 # in the test script, before importing db/bot:
 os.environ["SUPABASE_DB_URL"] = "postgresql://postgres@/dicktest?host=/tmp&port=55432"
-os.environ["API_FOOTBALL_KEY"] = "test-key"  # football.py reads this at import time
 sys.path.insert(0, "/path/to/python_bot")
 import db; db.init_db()
 ```
 
 Key gotchas when writing this style of test:
-- `football.API_FOOTBALL_KEY` is captured as a module-level constant at import time — to change it in a test, monkeypatch `football.API_FOOTBALL_KEY` directly, not `os.environ`.
 - Mock `bot._dice_rng.randint` to rig match outcomes deterministically (it's `random.SystemRandom()`, not the global `random` module).
 - Fake `CallbackQuery` objects need both a message-based path (`query.message.chat.id` / `query.message.message_id`) and an inline path (`query.message is None`, only `query.inline_message_id` and `query.chat_instance` available) — see "Inline vs. in-chat callback queries" below. Getting this wrong silently breaks tests that never exercise the inline path, which is the app's most common usage pattern.
 - Fake `Context` objects need `.bot` (with async `edit_message_text`/`send_message`) and, for anything PvP-challenge-related, `.job_queue` (with a `run_once(callback, when, data, name)` method) — `accept_challenge_callback` schedules a resolution job through it.
-- Run the full existing regression scripts before shipping any change to `bot.py`/`db.py`/`football.py`; there's no single entrypoint, run each script individually.
+- Run the full existing regression scripts before shipping any change to `bot.py`/`db.py`; there's no single entrypoint, run each script individually.
 
 ## Architecture
 
-Three modules, no package structure:
+Two modules, no package structure:
 
 - **`db.py`** — the only place SQL is written. Every table's schema lives inside `init_db()`. Every other function opens a connection via the `get_connection()` context manager (commits on success, rolls back and re-raises on exception, always closes) and returns plain tuples — there is no ORM. `bot.py` never touches `psycopg2` directly.
-- **`football.py`** — isolated API-Football HTTP client (`httpx.AsyncClient`) plus the live-odds pricing model (`compute_odds`). No Telegram or DB imports; testable standalone with `httpx.MockTransport`.
-- **`bot.py`** — everything else: all command/callback handlers, all game logic (perks, items, escrow math, odds rendering), and the `if __name__ == '__main__':` block that wires up `ApplicationBuilder`, registers job-queue jobs, and registers every handler (regex-based `MessageHandler`s for commands like `/d`, `/c`, `/fbet`; `CallbackQueryHandler`s keyed on `callback_data` prefixes like `chal_`, `bet_`, `rematch_`, `fbet_`).
+- **`bot.py`** — everything else: all command/callback handlers, all game logic (perks, items, escrow math, crown/consort, theft, shop, boss, lottery), and the `if __name__ == '__main__':` block that wires up `ApplicationBuilder`, registers job-queue jobs, and registers every handler (regex-based `MessageHandler`s for commands like `/d`, `/c`, `/dozdi`; `CallbackQueryHandler`s keyed on `callback_data` prefixes like `chal_`, `bet_`, `rematch_`, `buy_`, `bosshit_`, `lot_`).
 
 ### Data model (all tables live in `db.py`'s `init_db()`)
 
 - `users` (composite PK `user_id, chat_id`) — **every group is a fully independent league**: the same Telegram user has a separate `size`/`perk`/`wins`/`losses` row per `chat_id`. Never assume a user has one global size.
 - `chats`, `chat_instances` — the latter maps a Telegram inline "chat_instance" token to a real `chat_id`, since inline queries never reveal which chat they were typed in (see below).
-- `inventory`, `consensus_votes` / `consensus_vote_casts` / `consensus_protection` (the `/ejma` group-vote-to-shrink-someone feature), `football_markets` / `football_bets` (`/fbet`), `pvp_matches` / `pvp_match_bets` (1v1 challenges + spectator betting).
+- `kingdom` (one row per group: who wears the crown and who their consort is), `bosses` / `boss_hits`, `lottery_tickets`, `achievements`, `claimed_challenges`
+- `inventory`, `consensus_votes` / `consensus_vote_casts` / `consensus_protection` (the `/ejma` group-vote-to-shrink-someone feature), `pvp_matches` / `pvp_match_bets` (1v1 challenges + spectator betting).
 
 ### Money/size flow is escrow-based everywhere
 
-Any stake (a PvP challenge bet, a spectator bet, a football bet) is deducted from `size` **the instant it's placed/accepted**, not at settlement time. Settlement then either pays out `stake × multiplier` to the winner or simply never returns the stake to the loser. This convention exists specifically to prevent double-spend/over-commit exploits (a user accepting two challenges at once using the same not-yet-deducted balance was a real, fixed bug). When adding any new betting/wagering feature, follow this same pattern rather than deducting at settlement.
+Any stake (a PvP challenge bet, a spectator bet, a shop purchase, a lottery ticket) is deducted from `size` **the instant it's placed/accepted**, not at settlement time. Settlement then either pays out `stake × multiplier` to the winner or simply never returns the stake to the loser. This convention exists specifically to prevent double-spend/over-commit exploits (a user accepting two challenges at once using the same not-yet-deducted balance was a real, fixed bug). When adding any new betting/wagering feature, follow this same pattern rather than deducting at settlement.
 
 Payouts must stay zero-sum: a winner can never receive more than what was actually removed from the loser (see the `winner_gain = min(winner_gain, loser_loss)` guard in `resolve_pvp_match` in `bot.py`) — perks/items that shield a loser from losing their stake must shrink the winner's take to match, not mint size out of nothing.
 
@@ -88,14 +85,36 @@ A daily perk is granted alongside a growth roll, so `last_grown` (the growth dat
 
 ### Background jobs (all registered in `bot.py`'s `__main__` block)
 
-- `midnight_reminder` — daily at Tehran midnight.
-- `poll_football_markets` — every `FOOTBALL_POLL_INTERVAL_SECONDS` (default 120s, env-configurable); the single driver for all `/fbet` market lifecycle transitions (opening the betting window 2h before kickoff, live odds updates, halftime/full-time announcements, settlement).
+- `midnight_tasks` — daily at Tehran midnight: draws the lottery for the day that just ended, expires unkilled bosses, collects the crown's daily tax, then sends the growth reminder.
+- `spawn_daily_bosses` — daily at 20:00 Tehran; one co-op boss per active group.
+- `random_event_job` — every 3h, small per-group chance of an earthquake/viagra-rain/treasure event.
 - `recover_stuck_pvp_matches` — one-shot, 5s after startup; sweeps `pvp_matches` for anything stale.
-
-### Football odds model (`football.py`)
-
-`compute_odds()` blends a pre-match prior probability (fetched once from API-Football's own bookmaker odds at market creation, via `get_prematch_home_probability`; falls back to neutral 0.5 if unavailable) with a live goal-difference signal through a logistic function. The prior's influence fades linearly to zero as elapsed time approaches full time, while the goal-difference weight grows — deliberately mimicking a live prediction market (e.g. Polymarket) rather than fixed bookmaker odds.
 
 ## Deployment
 
 `.github/workflows/deploy.yml` runs on every push to `main` (and via manual `workflow_dispatch`): SSHes into the production server, `git reset --hard origin/main`, `pip install -r requirements.txt`, `systemctl restart dickbot`, then dumps the last 200 lines of `journalctl -u dickbot` into the workflow log — this is the primary way to check for a clean startup or a crash after shipping a change (grep for `Traceback`/`ERROR`). There is no staging environment; every merge to `main` is live in production immediately.
+
+### The crown is the game's balancing mechanism
+
+The player with the largest size in a group is its king (`refresh_king` recomputes this
+from the leaderboard; `db.crown_king` empties the consort seat whenever the crown
+changes hands, because the consort belongs to the throne rather than to the person).
+The crown deliberately cuts both ways: it collects `KING_TAX_RATIO` of every player's
+size each Tehran midnight, but its wearer loses double in a challenge and is the one
+player consensus protection never covers. This exists because a runaway leader had made
+the top of the leaderboard uncontestable — treat "being #1 must stay dangerous" as the
+invariant when touching any of it.
+
+The consort (`/hamsar`, king-only, once per Tehran day) takes `CONSORT_TAX_SHARE` of the
+tax and can't be robbed — but can defect at any moment with `/khianat @user`, taking
+`KHIANAT_STEAL_RATIO` of the king's size and splitting it with whoever they left for.
+Betrayal is deducted from the king with `try_deduct_size` first and only then paid out,
+so it can never mint size when the treasury is short.
+
+### Size sources and sinks
+
+Growth, boss rewards and the viagra-rain/treasure events *create* size; the shop, the
+lottery burn (`LOTTERY_BURN_RATIO`) and the earthquake event *destroy* it. Everything
+else (tax, theft, betrayal, challenges, donations) only moves it between players and
+must stay exactly zero-sum. When adding a feature, be explicit about which of the three
+it is — the economy inflated badly once because every mechanic was a source.

@@ -8,8 +8,6 @@ WorkingDirectory=/opt/DickDickBot
 # Supabase connection string (Settings -> Database -> Connection string -> Transaction pooler).
 # Either set it inline here, or point EnvironmentFile to a file that defines SUPABASE_DB_URL.
 Environment=SUPABASE_DB_URL=postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres
-# Optional: enables /fbet (live football betting). Get a free key from api-football.com.
-# Environment=API_FOOTBALL_KEY=your-api-football-key
 # EnvironmentFile=/opt/DickDickBot/.env
 ExecStart=/opt/DickDickBot/venv/bin/python bot.py
 Restart=always
