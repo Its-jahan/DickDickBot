@@ -151,6 +151,10 @@ def build_top_text(chat_id):
     consort_id = kingdom[2] if kingdom else None
     badge_counts = db.get_achievement_counts(chat_id)
 
+    rows = [r for r in rows if r[0] != BOT_USER_ID]
+    if not rows:
+        return None
+
     msg = "🏆 برترین‌های این گروه:\n\n"
     for i, (user_id, first_name, size, streak) in enumerate(rows, 1):
         size = size or 0
@@ -205,6 +209,13 @@ logging.basicConfig(
 )
 
 TOKEN = '8802494355:AAFYiGyKph3R8wLiZoeDsELOPx07Q9ZvuVw'
+
+# The numeric prefix of the token is the bot's own Telegram user id. The bot ends up
+# with a users row of its own (anything that resolves a target registers one), which
+# made it targetable like a player: it was appointed consort in a real group, and
+# since it can never grow, betray or be dethroned, that parked the seat forever and
+# quietly funnelled 30% of the daily tax into an account nobody controls.
+BOT_USER_ID = int(TOKEN.split(':')[0])
 
 BET_AMOUNTS = [5, 10, 50, 100]
 
@@ -344,6 +355,9 @@ def get_target_user(update: Update, text: str, chat_id: int):
             row = db.find_user_by_username(candidates[0], chat_id)
             if row:
                 target_user_id, target_first_name, _ = row
+
+    if target_user_id == BOT_USER_ID:
+        return None, None  # the bot is not a player - see BOT_USER_ID
 
     return target_user_id, target_first_name
 
@@ -1946,7 +1960,7 @@ def refresh_king(chat_id):
     consort seat is emptied by db.crown_king on a change of ruler - the consort belongs
     to the throne, not to the person who was sitting on it."""
     rows = db.get_top_users_full(chat_id)
-    rows = [r for r in rows if (r[2] or 0) > 0]
+    rows = [r for r in rows if (r[2] or 0) > 0 and r[0] != BOT_USER_ID]
     if not rows:
         return db.get_kingdom(chat_id), None
     top_id, top_name = rows[0][0], rows[0][1]
