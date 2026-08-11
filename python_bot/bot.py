@@ -106,6 +106,50 @@ def cmd(pattern):
     return filters.UpdateType.MESSAGE & filters.Regex(pattern)
 
 
+# The `/` autocomplete menu Telegram shows. This is registered with setMyCommands, NOT
+# derived from the handlers - so it drifts: the live menu still listed a dead `/stats`
+# (no handler at all) and none of the crown/theft/shop/lottery commands, which is what
+# users hit as "the / menu is full of commands that don't work". setup_commands re-pushes
+# this on every startup, so a deploy always heals it. Only the canonical alias of each
+# command goes here (Telegram shows one per row); the handlers still accept every alias.
+BOT_COMMANDS = [
+    ("d", "🌱 رشد روزانهٔ دودول"),
+    ("t", "🏆 لیدربرد گروه"),
+    ("c", "⚔️ چالش با شرط دلخواه — /c 50"),
+    ("dd", "🎁 اهدای سایز — /dd @user 20"),
+    ("i", "🎒 آیتم‌های من"),
+    ("u", "💉 استفاده از آیتم — /u ویاگرا @user"),
+    ("shop", "🏪 خرید آیتم با سانت"),
+    ("ejma", "⚖️ رای‌گیری برای کم‌کردن سایز — /ejma @user"),
+    ("dozdi", "🥷 دزدی از یکی — /dozdi @user"),
+    ("king", "👑 پادشاه گروه و قوانین تاج"),
+    ("hamsar", "💍 (پادشاه) انتخاب همسر — /hamsar @user"),
+    ("khianat", "🗡️ (همسر پادشاه) خیانت — /khianat @user"),
+    ("talagh", "💔 (پادشاه) طلاق همسر"),
+    ("lottery", "🎟️ لاتاری روزانه"),
+    ("ach", "🏅 نشان‌ها و استریک من"),
+    ("wr", "📊 آمار برد و باخت"),
+    ("help", "❓ راهنمای کامل بازی"),
+]
+
+
+async def setup_commands(application):
+    """Push the / menu to Telegram at startup for both private chats and groups, so it
+    always matches the handlers this build actually has. Runs in post_init so it fires
+    once per process without blocking polling."""
+    from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+    cmds = [BotCommand(c, d) for c, d in BOT_COMMANDS]
+    try:
+        await application.bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
+        await application.bot.set_my_commands(cmds, scope=BotCommandScopeAllPrivateChats())
+        # Clear the default scope so a stale global list (the old /stats etc.) can't show
+        # through in any chat type the two scopes above don't cover.
+        await application.bot.set_my_commands(cmds)
+        logging.info("Bot command menu registered (%d commands)", len(cmds))
+    except Exception as e:
+        logging.error("Failed to register command menu: %s", e)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Global error handler: without one, an exception in any handler is swallowed
     with just a log line and the user gets dead silence - the single biggest source
@@ -2665,8 +2709,8 @@ async def achievements_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     db.init_db()
-    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
-    
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(setup_commands).build()
+
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(random_event_job, interval=RANDOM_EVENT_INTERVAL_SECONDS, first=300)
