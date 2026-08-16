@@ -1610,22 +1610,32 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if current_size < 50:
-        delta = roll_nonzero(-5, 20)
+        low, high = -5, 20
     elif current_size < 150:
-        delta = roll_nonzero(-3, 20)
+        low, high = -3, 20
     else:
-        delta = roll_nonzero(-6, 10)
+        low, high = -6, 10
+
+    # Per-player growth dial (1.0 for everyone by default). It narrows the top of the
+    # roll *before* the dice are thrown rather than shrinking the result afterwards:
+    # post-scaling kept collapsing onto the minimum, so a throttled player saw a
+    # suspicious run of identical numbers. Narrowing the range instead produces an
+    # ordinary-looking spread that just happens to be lower - and whatever comes out is
+    # exactly what gets credited and exactly what the player is shown. The downside
+    # bound is left alone, so this only ever takes away good days.
+    _, growth_mult = db.get_modifiers(user.id, chat_id)
+    if growth_mult != 1.0:
+        high = max(1, int(round(high * growth_mult)))
+
+    delta = roll_nonzero(low, high)
 
     # Showing up every day compounds: each consecutive day adds a centimetre on top of
     # the roll, capped so a long streak stays an edge rather than a runaway lead.
     streak_bonus = min(max(streak - 1, 0), STREAK_MAX_BONUS)
+    if growth_mult != 1.0:
+        # Scale the bonus too, or a long streak would swamp the narrowed roll.
+        streak_bonus = int(round(streak_bonus * growth_mult))
     delta += streak_bonus
-    # Per-player growth dial (1.0 for everyone by default). Applied to gains only, so a
-    # throttled player simply keeps rolling low rather than being handed free ground on
-    # their bad days. Never shown or announced - see the admin commands.
-    _, growth_mult = db.get_modifiers(user.id, chat_id)
-    if delta > 0 and growth_mult != 1.0:
-        delta = max(1, int(round(delta * growth_mult)))
     if delta == 0:
         delta = 1  # growth must always move the number - see roll_nonzero
 
@@ -2295,11 +2305,11 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chance = min(max(chance, 0.15), 0.75)
 
     # Per-player luck dial (1.0 for everyone by default), applied after the normal floor
-    # so a throttled player can be taken below the usual 15% minimum. Every "شانس
-    # موفقیت" the bot prints below is this final number, so a throttled player is told
-    # the odds it actually rolls against - the bot is quiet about the dial, never wrong
-    # about the odds. That also makes the throttle harder to detect, not easier: a
-    # printed number that didn't match reality would show up in anyone's win/loss count.
+    # so a throttled player can be taken below the usual 15% minimum. The bot no longer
+    # publishes the success chance anywhere: with no number quoted there is nothing that
+    # can disagree with reality, which is both honest and a better throttle than a
+    # quoted number would be - a published percentage is exactly the thing a player can
+    # check their own win/loss record against.
     theft_luck, _ = db.get_modifiers(user.id, chat_id)
     if theft_luck != 1.0:
         chance = min(max(chance * theft_luck, 0.0), 0.95)
@@ -2322,8 +2332,7 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db.update_size(user.id, chat_id, loot)
         await update.message.reply_text(
-            f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!\n"
-            f"(شانس موفقیت: {int(chance * 100)}٪)"
+            f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!"
         )
         earned = award(user.id, chat_id, 'thief')
         await announce_achievements(context, chat_id, user.first_name, earned)
@@ -2334,7 +2343,7 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.update_size(target_id, chat_id, fine)
             await update.message.reply_text(
                 f"🚨 مچ‌گیری!\n\n{user.first_name} می‌خواست از {target_name} بدزده ولی گیر افتاد "
-                f"و {int(fine)} سانت غرامت داد!\n(شانس موفقیت: {int(chance * 100)}٪)"
+                f"و {int(fine)} سانت غرامت داد!"
             )
         else:
             await update.message.reply_text(

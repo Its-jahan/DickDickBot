@@ -90,11 +90,12 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_theft_at TIMESTAMPTZ")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS traitor_until TIMESTAMPTZ")
         # Per-player moderation dials, both 1.0 = untouched. theft_luck multiplies the
-        # final /dozdi success chance; growth_mult multiplies a positive daily growth
-        # roll. They exist so a suspected cheater can be quietly throttled instead of
-        # banned outright - see the admin commands in bot.py. The numbers the bot shows
-        # a player always reflect these, so the bot never states a chance it isn't
-        # actually rolling against.
+        # final /dozdi success chance; growth_mult narrows the top of the daily growth
+        # roll before the dice are thrown. They exist so a suspected cheater can be
+        # quietly throttled instead of banned outright - see the admin commands in
+        # bot.py. Neither one ever makes the bot report a number that isn't real: the
+        # theft chance is no longer published at all, and a throttled growth roll is
+        # credited and displayed as exactly the number that was rolled.
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theft_luck DOUBLE PRECISION DEFAULT 1.0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS growth_mult DOUBLE PRECISION DEFAULT 1.0")
         c.execute("UPDATE users SET theft_luck = 1.0 WHERE theft_luck IS NULL")
