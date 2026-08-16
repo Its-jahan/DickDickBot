@@ -89,6 +89,16 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_theft_at TIMESTAMPTZ")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS traitor_until TIMESTAMPTZ")
+        # Per-player moderation dials, both 1.0 = untouched. theft_luck multiplies the
+        # final /dozdi success chance; growth_mult multiplies a positive daily growth
+        # roll. They exist so a suspected cheater can be quietly throttled instead of
+        # banned outright - see the admin commands in bot.py. The numbers the bot shows
+        # a player always reflect these, so the bot never states a chance it isn't
+        # actually rolling against.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theft_luck DOUBLE PRECISION DEFAULT 1.0")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS growth_mult DOUBLE PRECISION DEFAULT 1.0")
+        c.execute("UPDATE users SET theft_luck = 1.0 WHERE theft_luck IS NULL")
+        c.execute("UPDATE users SET growth_mult = 1.0 WHERE growth_mult IS NULL")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS chats (
@@ -1171,6 +1181,49 @@ def get_all_players(chat_id):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute('SELECT user_id, first_name, size FROM users WHERE chat_id = %s', (chat_id,))
+        return c.fetchall()
+
+
+# ---------------------------------------------------------------- moderation dials
+
+def get_modifiers(user_id, chat_id):
+    """(theft_luck, growth_mult) for a player, defaulting to 1.0/1.0 for anyone who has
+    never been touched (including a user_id with no row in this chat yet)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT COALESCE(theft_luck, 1.0), COALESCE(growth_mult, 1.0) '
+            'FROM users WHERE user_id = %s AND chat_id = %s',
+            (user_id, chat_id)
+        )
+        return c.fetchone() or (1.0, 1.0)
+
+
+def set_modifier(user_id, chat_id, column, value):
+    """Sets one dial. column must be 'theft_luck' or 'growth_mult' - it is interpolated
+    into the SQL, so it is checked against a literal allow-list rather than trusted."""
+    if column not in ('theft_luck', 'growth_mult'):
+        raise ValueError(f"unknown modifier column: {column}")
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            f'UPDATE users SET {column} = %s WHERE user_id = %s AND chat_id = %s',
+            (value, user_id, chat_id)
+        )
+        return c.rowcount > 0
+
+
+def get_group_modifiers(chat_id):
+    """(user_id, first_name, username, size, theft_luck, growth_mult) for every player
+    in a group, biggest first - the admin overview behind /luck."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, first_name, username, size, '
+            'COALESCE(theft_luck, 1.0), COALESCE(growth_mult, 1.0) '
+            'FROM users WHERE chat_id = %s ORDER BY size DESC NULLS LAST, user_id ASC',
+            (chat_id,)
+        )
         return c.fetchall()
 
 

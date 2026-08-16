@@ -1619,6 +1619,12 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # the roll, capped so a long streak stays an edge rather than a runaway lead.
     streak_bonus = min(max(streak - 1, 0), STREAK_MAX_BONUS)
     delta += streak_bonus
+    # Per-player growth dial (1.0 for everyone by default). Applied to gains only, so a
+    # throttled player simply keeps rolling low rather than being handed free ground on
+    # their bad days. Never shown or announced - see the admin commands.
+    _, growth_mult = db.get_modifiers(user.id, chat_id)
+    if delta > 0 and growth_mult != 1.0:
+        delta = max(1, int(round(delta * growth_mult)))
     if delta == 0:
         delta = 1  # growth must always move the number - see roll_nonzero
 
@@ -2287,6 +2293,16 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chance += 0.20  # nobody guards a traitor
     chance = min(max(chance, 0.15), 0.75)
 
+    # Per-player luck dial (1.0 for everyone by default), applied after the normal floor
+    # so a throttled player can be taken below the usual 15% minimum. Every "شانس
+    # موفقیت" the bot prints below is this final number, so a throttled player is told
+    # the odds it actually rolls against - the bot is quiet about the dial, never wrong
+    # about the odds. That also makes the throttle harder to detect, not easier: a
+    # printed number that didn't match reality would show up in anyone's win/loss count.
+    theft_luck, _ = db.get_modifiers(user.id, chat_id)
+    if theft_luck != 1.0:
+        chance = min(max(chance * theft_luck, 0.0), 0.95)
+
     loot = max(1, int(target_size * random.uniform(THEFT_MIN_RATIO, THEFT_MAX_RATIO)))
 
     # قفل is bought precisely for this moment: it eats one theft attempt and is spent.
@@ -2688,6 +2704,120 @@ async def random_event_job(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Random event failed for {chat_id}: {e}")
 
 
+# ==========================================================================
+# Owner-only moderation. Deliberately absent from BOT_COMMANDS: putting these in
+# the / menu would advertise their existence to every player in every group.
+# They also only answer in the bot's private chat, and to anyone else they are
+# silent no-ops rather than "you are not allowed" - a refusal is itself a tell.
+# ==========================================================================
+
+OWNER_ID = 812712003
+
+MOD_LIMITS = (0.0, 5.0)
+
+
+def _owner_only(update):
+    """True only for the owner in the bot's own DM. Anything else returns False and the
+    caller returns without replying at all."""
+    user = update.effective_user
+    chat = update.effective_chat
+    return bool(user and chat and user.id == OWNER_ID and chat.id > 0)
+
+
+async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/groups` - list the chat_ids the other admin commands take."""
+    if not _owner_only(update):
+        return
+    lines = ["👥 گروه‌های ثبت‌شده:\n"]
+    for chat_id in db.get_all_chats():
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            title = chat.title or str(chat_id)
+        except Exception:
+            title = "(دسترسی ندارم)"
+        players = len(db.get_group_modifiers(chat_id))
+        lines.append(f"`{chat_id}`\n  {title} — {players} بازیکن")
+    lines.append("\nبرای دیدن ضریب‌ها: `/luck <chat_id>`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def luck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/luck <chat_id>` - the whole group's dials in one table."""
+    if not _owner_only(update):
+        return
+    parts = update.message.text.split()
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "استفاده: `/luck <chat_id>`\nبرای دیدن لیست گروه‌ها: /groups", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("chat_id باید عدد باشه. /groups رو بزن.")
+        return
+
+    rows = db.get_group_modifiers(chat_id)
+    if not rows:
+        await update.message.reply_text("این گروه بازیکنی نداره یا chat_id اشتباهه.")
+        return
+
+    lines = [f"🎛 ضریب‌های گروه `{chat_id}`", "(۱.۰ = دست‌نخورده)\n"]
+    for uid, name, username, size, luck, growth in rows:
+        flag = "" if (luck == 1.0 and growth == 1.0) else "  ⚠️"
+        handle = f"@{username}" if username else str(uid)
+        lines.append(
+            f"`{uid}` {name} ({handle}){flag}\n"
+            f"    سایز {int(size or 0)} | دزدی ×{luck:g} | رشد ×{growth:g}"
+        )
+    lines.append(
+        "\n`/setluck <chat_id> <user_id> <عدد>`\n"
+        "`/setgrowth <chat_id> <user_id> <عدد>`\n"
+        f"محدوده: {MOD_LIMITS[0]} تا {MOD_LIMITS[1]} — ۱ یعنی عادی، ۰.۳ یعنی شدیداً کم"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def _set_modifier_cmd(update, context, column, label):
+    if not _owner_only(update):
+        return
+    parts = update.message.text.split()
+    if len(parts) < 4:
+        await update.message.reply_text(
+            f"استفاده: `/{ 'setluck' if column == 'theft_luck' else 'setgrowth' } <chat_id> <user_id> <عدد>`",
+            parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(parts[1])
+        target_id = int(parts[2])
+        value = float(parts[3])
+    except ValueError:
+        await update.message.reply_text("chat_id و user_id باید عدد باشن و ضریب هم یه عدد اعشاری.")
+        return
+    if not (MOD_LIMITS[0] <= value <= MOD_LIMITS[1]) or value != value:
+        await update.message.reply_text(f"ضریب باید بین {MOD_LIMITS[0]} و {MOD_LIMITS[1]} باشه.")
+        return
+
+    if not db.set_modifier(target_id, chat_id, column, value):
+        await update.message.reply_text("این کاربر تو این گروه پیدا نشد. /luck رو چک کن.")
+        return
+
+    info = db.get_user_info(target_id, chat_id)
+    name = info[0] if info else str(target_id)
+    note = "عادی" if value == 1.0 else ("کمتر از عادی 🔻" if value < 1.0 else "بیشتر از عادی 🔺")
+    await update.message.reply_text(
+        f"✅ {label} برای {name} روی ×{value:g} تنظیم شد ({note}).\n"
+        f"هیچ اعلانی تو گروه نمی‌ره و خودش خبردار نمی‌شه."
+    )
+
+
+async def setluck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_modifier_cmd(update, context, 'theft_luck', "شانس دزدی")
+
+
+async def setgrowth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_modifier_cmd(update, context, 'growth_mult', "ضریب رشد روزانه")
+
+
 async def achievements_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -2742,6 +2872,12 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(shop|forushgah)\b'), shop_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(lottery|lotari)\b'), lottery_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
+
+    # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).
+    app.add_handler(MessageHandler(cmd(r'^/groups\b'), groups_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/luck\b'), luck_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/setluck\b'), setluck_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/setgrowth\b'), setgrowth_cmd))
 
     app.add_handler(CallbackQueryHandler(accept_challenge_callback, pattern=r'^chal_'))
     app.add_handler(CallbackQueryHandler(rematch_callback, pattern=r'^rematch_'))
