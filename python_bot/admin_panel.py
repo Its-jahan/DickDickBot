@@ -12,6 +12,7 @@ ledger as the gameplay around it and stays visible in a player's history.
 Auth is a single owner password. It is read from ADMIN_PANEL_PASSWORD_HASH (a
 werkzeug hash) so the plaintext is never stored on disk or in the repo.
 """
+import datetime
 import functools
 import math
 import os
@@ -23,6 +24,8 @@ from flask import (Flask, abort, flash, redirect, render_template_string, reques
 from markupsafe import Markup
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
+
+from zoneinfo import ZoneInfo
 
 import db
 
@@ -46,6 +49,19 @@ app.config.update(
 )
 
 PASSWORD_HASH = os.environ["ADMIN_PANEL_PASSWORD_HASH"]
+
+# The whole game runs on Tehran time - the daily reset, the 20:00 boss, midnight tasks -
+# so the panel has to read in Tehran time too. created_at is TIMESTAMPTZ and the DB
+# session is UTC, so timestamps arrive correct but three and a half hours behind what
+# an event "happened at" as far as the game is concerned. Nothing is stored differently;
+# this is purely how it is rendered.
+TEHRAN = ZoneInfo("Asia/Tehran")
+
+
+def tehran(ts, fmt="%m-%d %H:%M:%S"):
+    if ts is None:
+        return ""
+    return ts.astimezone(TEHRAN).strftime(fmt)
 
 ITEMS = ["ویاگرا", "قرص اورژانسی", "زعفرون", "کاندوم", "شیر موز", "سوزن", "طلسم", "اسپری", "قفل"]
 PERKS = ["عادی", "جاکش", "کص‌کش", "حرومزاده", "لاشی", "خایه‌مال", "کون‌گشاد", "زن جنده",
@@ -183,6 +199,7 @@ def _render(template_source, ctx):
     "got multiple values for argument 'source'". Passing a dict makes the helper
     immune to whatever the callers happen to name their variables."""
     ctx = dict(ctx)
+    ctx.setdefault('tehran', tehran)
     app.update_template_context(ctx)
     return app.jinja_env.from_string(template_source).render(ctx)
 
@@ -309,7 +326,7 @@ def group(chat_id):
 {% if protections %}
 <div class="tablewrap"><table><tr><th>بازیکن</th><th>تا</th><th>دلیل</th><th></th></tr>
 {% for t in protections %}
-<tr><td>{{ t[1] }}</td><td class="dim">{{ t[2].strftime('%Y-%m-%d %H:%M') }}</td>
+<tr><td>{{ t[1] }}</td><td class="dim">{{ tehran(t[2], '%Y-%m-%d %H:%M') }}</td>
     <td class="dim">{{ t[3] or '' }}</td>
     <td><form class="inline" method="post" action="{{ url_for('clear_protection', chat_id=chat_id, user_id=t[0]) }}">
         <button class="ghost">لغو</button></form></td></tr>
@@ -333,7 +350,7 @@ def player(chat_id, user_id):
 <h1>{{ d[3] }} <span class="badge">{{ d[0] }}</span></h1>
 <p class="dim">گروه {{ chat_id }} ·
   {% if d[2] %}@{{ d[2] }}{% endif %} ·
-  عضویت از {{ d[8].strftime('%Y-%m-%d') if d[8] else '?' }}</p>
+  عضویت از {{ tehran(d[8], '%Y-%m-%d') or '?' }}</p>
 
 <h2>تنظیم سریع سایز</h2>
 <div class="card">
@@ -516,7 +533,7 @@ def ledger():
 <tr><th>زمان</th><th>بازیکن</th><th>تغییر</th><th>موجودی بعد</th><th>منبع</th><th>یادداشت</th></tr>
 {% for r in rows %}
 <tr>
-  <td class="dim">{{ r[1].strftime('%m-%d %H:%M:%S') }}</td>
+  <td class="dim">{{ tehran(r[1]) }}</td>
   <td><a class="link" href="{{ url_for('player', chat_id=r[2], user_id=r[3]) }}">{{ r[4] }}</a></td>
   <td class="{{ 'pos' if r[5] > 0 else 'neg' }}"><b>{{ '%+d'|format(r[5]|int) }}</b></td>
   <td class="dim">{{ r[6]|int }}</td>
