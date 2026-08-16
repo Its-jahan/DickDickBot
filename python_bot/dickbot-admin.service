@@ -1,0 +1,17 @@
+[Unit]
+Description=DickDickBot admin panel
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/DickDickBot/python_bot
+# Secrets live here, outside the repo, mode 600. ADMIN_PANEL_PASSWORD_HASH is a
+# werkzeug hash, so the plaintext password exists nowhere on the server.
+EnvironmentFile=/etc/dickbot-admin.env
+ExecStart=/opt/DickDickBot/venv/bin/gunicorn --bind 127.0.0.1:8011 --workers 2 \
+          --timeout 60 --access-logfile - --error-logfile - admin_panel:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

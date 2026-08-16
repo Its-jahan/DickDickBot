@@ -1,6 +1,7 @@
 import datetime
 import functools
 import os
+import sys
 import time
 import types
 from contextlib import contextmanager
@@ -230,6 +231,25 @@ def init_db():
                 PRIMARY KEY (chat_id, draw_date, user_id)
             )
         ''')
+
+        # Every movement of size, ever. Written from inside update_size/try_deduct_size
+        # so coverage is complete by construction rather than depending on 50-odd call
+        # sites remembering to log. `source` is the calling function's name, which is
+        # what makes "where did this player's size come from" answerable at all.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS size_log (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                user_id BIGINT,
+                delta DOUBLE PRECISION,
+                balance_after DOUBLE PRECISION,
+                source TEXT,
+                note TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+        c.execute("CREATE INDEX IF NOT EXISTS size_log_chat_user_idx ON size_log (chat_id, user_id, created_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS size_log_created_idx ON size_log (created_at DESC)")
 
         # Permanent badges. The PK is what makes each one award-once.
         c.execute('''
@@ -528,32 +548,74 @@ def get_user_rank(user_id, chat_id):
         return higher + 1
 
 
-def update_size(user_id, chat_id, size_delta, current_date_str=None):
+_THIS_FILE = os.path.abspath(__file__)
+
+
+def _caller_name():
+    """Name of the first function *outside this module* on the stack, used as the audit
+    `source` on every ledger row.
+
+    Walking until the frame leaves db.py matters: every public function here is wrapped
+    by _retry_transient, so a fixed depth lands on that wrapper and records the same
+    meaningless name for every single row. sys._getframe is used rather than
+    inspect.stack() because the latter reads source files off disk on each call, which
+    is far too heavy for something on the path of every payout."""
+    try:
+        frame = sys._getframe(1)
+        for _ in range(12):
+            if frame is None:
+                break
+            if os.path.abspath(frame.f_code.co_filename) != _THIS_FILE:
+                return frame.f_code.co_name
+            frame = frame.f_back
+    except Exception:
+        pass
+    return "unknown"
+
+
+def update_size(user_id, chat_id, size_delta, current_date_str=None, note=None):
     # A single relative UPDATE, not read-then-write: with concurrent_updates(True)
     # two handlers settling money for the same user at once (e.g. a bet payout and
     # a donation) must both land instead of one silently overwriting the other.
+    source = _caller_name()
     with get_connection() as conn:
         c = conn.cursor()
         if current_date_str:
-            c.execute('UPDATE users SET size = COALESCE(size, 0) + %s, last_grown = %s WHERE user_id = %s AND chat_id = %s',
+            c.execute('UPDATE users SET size = COALESCE(size, 0) + %s, last_grown = %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
                       (size_delta, current_date_str, user_id, chat_id))
         else:
-            c.execute('UPDATE users SET size = COALESCE(size, 0) + %s WHERE user_id = %s AND chat_id = %s',
+            c.execute('UPDATE users SET size = COALESCE(size, 0) + %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
                       (size_delta, user_id, chat_id))
+        row = c.fetchone()
+        if row is not None:
+            # Same transaction as the balance change, so the ledger can never disagree
+            # with the balance it is describing.
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s, %s, %s, %s, %s, %s)',
+                      (chat_id, user_id, size_delta, row[0], source, note))
 
 
-def try_deduct_size(user_id, chat_id, amount):
+def try_deduct_size(user_id, chat_id, amount, note=None):
     """Atomically escrows `amount` out of a user's size, refusing (returns False) if
     their balance is short or they have no row. The balance check and the deduction
     are one UPDATE, so two concurrent stakes can never both spend the same centimeters."""
+    source = _caller_name()
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
             'UPDATE users SET size = COALESCE(size, 0) - %s '
-            'WHERE user_id = %s AND chat_id = %s AND COALESCE(size, 0) >= %s',
+            'WHERE user_id = %s AND chat_id = %s AND COALESCE(size, 0) >= %s RETURNING size',
             (amount, user_id, chat_id, amount)
         )
-        return c.rowcount > 0
+        row = c.fetchone()
+        if row is None:
+            return False
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (chat_id, user_id, -amount, row[0], source, note))
+        return True
 
 
 def claim_challenge(nonce):
@@ -1266,6 +1328,158 @@ def get_group_modifiers(chat_id):
             (chat_id,)
         )
         return c.fetchall()
+
+
+# ---------------------------------------------------------------- audit ledger
+
+def get_size_log(chat_id=None, user_id=None, source=None, limit=200, offset=0):
+    """Ledger rows newest-first, with the player's name joined on for display."""
+    where, params = [], []
+    if chat_id is not None:
+        where.append('l.chat_id = %s'); params.append(chat_id)
+    if user_id is not None:
+        where.append('l.user_id = %s'); params.append(user_id)
+    if source:
+        where.append('l.source = %s'); params.append(source)
+    clause = ('WHERE ' + ' AND '.join(where)) if where else ''
+    params.extend([limit, offset])
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT l.id, l.created_at, l.chat_id, l.user_id, COALESCE(u.first_name, %s), '
+            'l.delta, l.balance_after, l.source, l.note '
+            'FROM size_log l LEFT JOIN users u ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
+            f'{clause} ORDER BY l.id DESC LIMIT %s OFFSET %s',
+            ['?'] + params
+        )
+        return c.fetchall()
+
+
+def get_size_log_sources(chat_id=None):
+    """Distinct sources, for the panel's filter dropdown."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        if chat_id is None:
+            c.execute('SELECT source, count(*) FROM size_log GROUP BY source ORDER BY count(*) DESC')
+        else:
+            c.execute('SELECT source, count(*) FROM size_log WHERE chat_id = %s GROUP BY source ORDER BY count(*) DESC',
+                      (chat_id,))
+        return c.fetchall()
+
+
+def get_player_totals(chat_id, user_id):
+    """Where one player's size came from: net movement grouped by source."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT source, count(*), sum(delta) FROM size_log '
+            'WHERE chat_id = %s AND user_id = %s GROUP BY source ORDER BY sum(delta) DESC',
+            (chat_id, user_id)
+        )
+        return c.fetchall()
+
+
+# ---------------------------------------------------------------- admin editing
+
+# Only these columns can be written through the panel, each with a validator. The
+# panel interpolates the column name into SQL, so this dict is also the allow-list
+# that stops anything else being addressed at all.
+EDITABLE_USER_FIELDS = {
+    'size':        ('number', 'سایز'),
+    'streak':      ('int',    'استریک'),
+    'best_streak': ('int',    'رکورد استریک'),
+    'wins':        ('int',    'برد'),
+    'losses':      ('int',    'باخت'),
+    'perk':        ('text',   'پرک امروز'),
+    'active_item': ('text',   'آیتم فعال'),
+    'theft_luck':  ('mult',   'ضریب دزدی'),
+    'growth_mult': ('mult',   'ضریب رشد'),
+    'last_grown':  ('text',   'آخرین رشد (YYYY-MM-DD)'),
+}
+
+
+def admin_set_user_field(user_id, chat_id, column, value):
+    if column not in EDITABLE_USER_FIELDS:
+        raise ValueError(f"field not editable: {column}")
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(f'UPDATE users SET {column} = %s WHERE user_id = %s AND chat_id = %s',
+                  (value, user_id, chat_id))
+        return c.rowcount > 0
+
+
+def admin_adjust_size(user_id, chat_id, delta, note):
+    """Size changes from the panel go through the ledger like everything else, so an
+    admin edit is visible in the same history as the gameplay that surrounds it."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET size = COALESCE(size, 0) + %s WHERE user_id = %s AND chat_id = %s RETURNING size',
+                  (delta, user_id, chat_id))
+        row = c.fetchone()
+        if row is None:
+            return None
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (chat_id, user_id, delta, row[0], 'admin_panel', note))
+        return row[0]
+
+
+def admin_set_inventory(user_id, chat_id, item_name, quantity):
+    """Sets an exact quantity; 0 or less removes the row entirely."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        if quantity <= 0:
+            c.execute('DELETE FROM inventory WHERE user_id = %s AND chat_id = %s AND item_name = %s',
+                      (user_id, chat_id, item_name))
+        else:
+            c.execute(
+                'INSERT INTO inventory (user_id, chat_id, item_name, quantity) VALUES (%s, %s, %s, %s) '
+                'ON CONFLICT (user_id, chat_id, item_name) DO UPDATE SET quantity = EXCLUDED.quantity',
+                (user_id, chat_id, item_name, quantity)
+            )
+
+
+def get_player_detail(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT user_id, chat_id, username, first_name, size, last_grown, perk, active_item, '
+            'joined_at, wins, losses, COALESCE(streak,0), COALESCE(best_streak,0), last_theft_at, '
+            'traitor_until, last_dosed_at, COALESCE(theft_luck,1.0), COALESCE(growth_mult,1.0) '
+            'FROM users WHERE user_id = %s AND chat_id = %s',
+            (user_id, chat_id)
+        )
+        return c.fetchone()
+
+
+def get_consensus_protections(chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT target_id, target_name, protected_until, reason FROM consensus_protection '
+                  'WHERE chat_id = %s AND protected_until > now() ORDER BY protected_until DESC', (chat_id,))
+        return c.fetchall()
+
+
+def clear_consensus_protection(chat_id, target_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM consensus_protection WHERE chat_id = %s AND target_id = %s', (chat_id, target_id))
+        return c.rowcount > 0
+
+
+def get_group_stats(chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT count(*), COALESCE(sum(size),0), COALESCE(max(size),0) FROM users WHERE chat_id = %s',
+                  (chat_id,))
+        players, total, biggest = c.fetchone()
+        c.execute('SELECT count(*) FROM users WHERE chat_id = %s AND last_grown = %s',
+                  (chat_id, _tehran_today_str()))
+        active = c.fetchone()[0]
+        c.execute('SELECT count(*) FROM size_log WHERE chat_id = %s', (chat_id,))
+        events = c.fetchone()[0]
+        return {'players': players, 'total_size': total, 'biggest': biggest,
+                'active_today': active, 'log_events': events}
 
 
 def _retry_transient(fn):
