@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import html
 import logging
 import random
 import datetime
@@ -2716,6 +2717,31 @@ OWNER_ID = 812712003
 MOD_LIMITS = (0.0, 5.0)
 
 
+def _esc(value):
+    """Escape a user-controlled string for parse_mode=HTML.
+
+    These messages embed names and usernames verbatim. Markdown was unusable here: a
+    single '_' in a username (@Reza_Jr) opens an italic entity that never closes and
+    Telegram rejects the whole message with "Can't parse entities" - which is exactly
+    how /luck was failing. HTML escaping is total (only &, <, >) so no name can break it."""
+    return html.escape(str(value), quote=False)
+
+
+async def _reply_chunks(update, lines, sep="\n"):
+    """Send lines as HTML, split across messages so a big group can't blow past
+    Telegram's 4096-character limit."""
+    chunks, current = [], ""
+    for line in lines:
+        if len(current) + len(line) + len(sep) > 3500:
+            chunks.append(current)
+            current = ""
+        current += line + sep
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await update.message.reply_text(chunk, parse_mode="HTML")
+
+
 def _owner_only(update):
     """True only for the owner in the bot's own DM. Anything else returns False and the
     caller returns without replying at all."""
@@ -2736,9 +2762,9 @@ async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             title = "(دسترسی ندارم)"
         players = len(db.get_group_modifiers(chat_id))
-        lines.append(f"`{chat_id}`\n  {title} — {players} بازیکن")
-    lines.append("\nبرای دیدن ضریب‌ها: `/luck <chat_id>`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"<code>{chat_id}</code>\n  {_esc(title)} — {players} بازیکن")
+    lines.append("\nبرای دیدن ضریب‌ها: <code>/luck &lt;chat_id&gt;</code>")
+    await _reply_chunks(update, lines)
 
 
 async def luck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2748,7 +2774,8 @@ async def luck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split()
     if len(parts) < 2:
         await update.message.reply_text(
-            "استفاده: `/luck <chat_id>`\nبرای دیدن لیست گروه‌ها: /groups", parse_mode="Markdown")
+            "استفاده: <code>/luck &lt;chat_id&gt;</code>\nبرای دیدن لیست گروه‌ها: /groups",
+            parse_mode="HTML")
         return
     try:
         chat_id = int(parts[1])
@@ -2761,20 +2788,20 @@ async def luck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("این گروه بازیکنی نداره یا chat_id اشتباهه.")
         return
 
-    lines = [f"🎛 ضریب‌های گروه `{chat_id}`", "(۱.۰ = دست‌نخورده)\n"]
+    lines = [f"🎛 ضریب‌های گروه <code>{chat_id}</code>", "(۱.۰ = دست‌نخورده)\n"]
     for uid, name, username, size, luck, growth in rows:
         flag = "" if (luck == 1.0 and growth == 1.0) else "  ⚠️"
-        handle = f"@{username}" if username else str(uid)
+        handle = f"@{_esc(username)}" if username else str(uid)
         lines.append(
-            f"`{uid}` {name} ({handle}){flag}\n"
+            f"<code>{uid}</code> {_esc(name)} ({handle}){flag}\n"
             f"    سایز {int(size or 0)} | دزدی ×{luck:g} | رشد ×{growth:g}"
         )
     lines.append(
-        "\n`/setluck <chat_id> <user_id> <عدد>`\n"
-        "`/setgrowth <chat_id> <user_id> <عدد>`\n"
+        "\n<code>/setluck &lt;chat_id&gt; &lt;user_id&gt; &lt;عدد&gt;</code>\n"
+        "<code>/setgrowth &lt;chat_id&gt; &lt;user_id&gt; &lt;عدد&gt;</code>\n"
         f"محدوده: {MOD_LIMITS[0]} تا {MOD_LIMITS[1]} — ۱ یعنی عادی، ۰.۳ یعنی شدیداً کم"
     )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await _reply_chunks(update, lines)
 
 
 async def _set_modifier_cmd(update, context, column, label):
@@ -2782,9 +2809,10 @@ async def _set_modifier_cmd(update, context, column, label):
         return
     parts = update.message.text.split()
     if len(parts) < 4:
+        name = 'setluck' if column == 'theft_luck' else 'setgrowth'
         await update.message.reply_text(
-            f"استفاده: `/{ 'setluck' if column == 'theft_luck' else 'setgrowth' } <chat_id> <user_id> <عدد>`",
-            parse_mode="Markdown")
+            f"استفاده: <code>/{name} &lt;chat_id&gt; &lt;user_id&gt; &lt;عدد&gt;</code>",
+            parse_mode="HTML")
         return
     try:
         chat_id = int(parts[1])
@@ -2805,7 +2833,7 @@ async def _set_modifier_cmd(update, context, column, label):
     name = info[0] if info else str(target_id)
     note = "عادی" if value == 1.0 else ("کمتر از عادی 🔻" if value < 1.0 else "بیشتر از عادی 🔺")
     await update.message.reply_text(
-        f"✅ {label} برای {name} روی ×{value:g} تنظیم شد ({note}).\n"
+        f"✅ {label} برای {_esc(name)} روی ×{value:g} تنظیم شد ({note}).\n"
         f"هیچ اعلانی تو گروه نمی‌ره و خودش خبردار نمی‌شه."
     )
 
@@ -2863,7 +2891,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(inv|inventory|i)\b'), inventory_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(use|u)\b'), use_item_cmd))
     app.add_handler(MessageHandler(cmd(r'^/ejma\b'), consensus_cmd))
-    app.add_handler(MessageHandler(cmd(r'^/(wr|winrate)\b'), winrate_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(wr|winrate|stats)\b'), winrate_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(king|shah)\b'), king_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(hamsar|malake)\b'), consort_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(khianat|khiyanat)\b'), betray_cmd))
