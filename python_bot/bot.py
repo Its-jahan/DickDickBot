@@ -390,6 +390,32 @@ SHOP_PRICES = {
     "قفل": 40,
 }
 
+# A player can only be dosed with one of these per 24h, counted on the receiving end.
+# زعفرون is deliberately not included - it's the rare, expensive one, and it isn't
+# what people were stacking.
+DOSE_LIMITED_ITEMS = ["ویاگرا", "قرص اورژانسی"]
+
+
+def claim_dose_slot(item_name, target_id, target_name, chat_id):
+    """Reserves the target's daily dose slot for a limited item.
+
+    Returns (True, None) when the item may be used, or (False, message) explaining how
+    long is left. Call this BEFORE consuming the item from the giver's inventory, and
+    db.release_dose() if that consume then fails - otherwise a blocked dose would still
+    cost someone their item."""
+    if item_name not in DOSE_LIMITED_ITEMS:
+        return True, None
+    ok, remaining = db.try_claim_dose(target_id, chat_id)
+    if ok:
+        return True, None
+    hours = remaining // 3600
+    minutes = (remaining % 3600) // 60
+    return False, (
+        f"💊 {target_name} امروز قبلاً ویاگرا یا قرص اورژانسی خورده!\n"
+        f"تا {hours} ساعت و {minutes} دقیقهٔ دیگه نمی‌شه دوباره بهش داد."
+    )
+
+
 def apply_direct_item(item_name, target_user_id, target_name, chat_id):
     """Applies a direct item's effect to a target and returns the result message."""
     if item_name == "ویاگرا":
@@ -593,13 +619,22 @@ async def use_direct_item_inline_callback(update: Update, context: ContextTypes.
         await query.answer("شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!", show_alert=True)
         return
 
-    success = db.use_inventory(user.id, chat_id, item_name)
-    if not success:
-        await query.answer("این آیتم رو دیگه ندارید!", show_alert=True)
-        return
-
     target_info = db.get_user_info(target_id, chat_id)
     target_name = target_info[0] if target_info else "ناشناس"
+
+    # Claim the target's daily dose slot before spending the item, so a blocked dose
+    # never costs the giver anything.
+    allowed, reason = claim_dose_slot(item_name, target_id, target_name, chat_id)
+    if not allowed:
+        await query.answer(reason, show_alert=True)
+        return
+
+    success = db.use_inventory(user.id, chat_id, item_name)
+    if not success:
+        if item_name in DOSE_LIMITED_ITEMS:
+            db.release_dose(target_id, chat_id)
+        await query.answer("این آیتم رو دیگه ندارید!", show_alert=True)
+        return
 
     msg = apply_direct_item(item_name, target_id, target_name, chat_id)
     await query.answer("انجام شد!")
@@ -659,9 +694,16 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("باید روی یک نفر ریپلای کنید یا یوزرنیمش رو منشن کنید!")
             return
 
+        allowed, reason = claim_dose_slot(item_name, target_user_id, target_first_name, chat_id)
+        if not allowed:
+            await update.message.reply_text(reason)
+            return
+
         # Consume the item BEFORE applying its effect - the other order let a race
         # (or a failed decrement) apply the effect for free.
         if not db.use_inventory(user.id, chat_id, item_name):
+            if item_name in DOSE_LIMITED_ITEMS:
+                db.release_dose(target_user_id, chat_id)
             await update.message.reply_text(f"شما آیتم '{item_name}' را در این گروه ندارید!")
             return
         msg = apply_direct_item(item_name, target_user_id, target_first_name, chat_id)
@@ -726,7 +768,17 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_user_id == user.id:
         await update.message.reply_text("نمی‌توانید به خودتان اهدا کنید!")
         return
-        
+
+    # The waiting period applies to receiving as well as giving. Gating only the giver
+    # left the obvious hole open: make a fresh account, have an established one feed it.
+    target_wait = db.get_donation_wait_remaining(target_user_id, chat_id)
+    if target_wait is not None:
+        days = max(1, int(target_wait.total_seconds() // 86400) + 1)
+        await update.message.reply_text(
+            f"{target_first_name} تازه به این گروه پیوسته! تا {days} روز دیگر نمی‌شود به او سایز اهدا کرد."
+        )
+        return
+
     parts = text.split()
     amount_str = parts[-1] if len(parts) > 1 else ""
     try:
@@ -822,13 +874,11 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{target_first_name} سایز کافی برای اجماع ندارد!")
         return
 
-    # The crown buys no shelter: the king is the one player the group can always
-    # gang up on, no matter how recently they were last targeted. Recompute it first,
-    # so a player who was dethroned an hour ago isn't still treated as the king.
-    kingdom, _ = refresh_king(chat_id)
-    king_is_target = bool(kingdom and kingdom[0] == target_user_id)
-
-    remaining = None if king_is_target else db.get_consensus_protection_remaining(chat_id, target_user_id)
+    # Consensus protection applies to everyone alike, the king included: back-to-back
+    # consensus on one person is the thing the cooldown exists to stop, and being #1
+    # isn't a reason to lose that. The crown still pays for itself through the daily
+    # tax and the doubled challenge loss.
+    remaining = db.get_consensus_protection_remaining(chat_id, target_user_id)
     if remaining is not None:
         hours = max(1, int(remaining.total_seconds() // 3600))
         await update.message.reply_text(

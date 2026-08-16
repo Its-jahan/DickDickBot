@@ -96,6 +96,10 @@ def init_db():
         # bot.py. Neither one ever makes the bot report a number that isn't real: the
         # theft chance is no longer published at all, and a throttled growth roll is
         # credited and displayed as exactly the number that was rolled.
+        # When this player last had a ویاگرا/قرص اورژانسی applied *to* them. The limit
+        # is on the receiving end, not the giver: otherwise four people could each
+        # spend one item on the same target in a row and swing them 160cm in a minute.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_dosed_at TIMESTAMPTZ")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS theft_luck DOUBLE PRECISION DEFAULT 1.0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS growth_mult DOUBLE PRECISION DEFAULT 1.0")
         c.execute("UPDATE users SET theft_luck = 1.0 WHERE theft_luck IS NULL")
@@ -369,6 +373,42 @@ def get_user(user_id, chat_id, username, first_name):
         if row[2] != 'عادی' and row[1] != _tehran_today_str():
             row = row[:2] + ('عادی',)
         return row
+
+
+DOSE_COOLDOWN_HOURS = 24
+
+
+def try_claim_dose(target_id, chat_id):
+    """Atomically claims the target's once-per-24h slot for a ویاگرا / قرص اورژانسی.
+
+    Returns (True, None) if the item may be applied, or (False, seconds_remaining) if
+    they've already been dosed inside the window. The claim and the check are one
+    statement so two givers hitting the same target at once can't both get through."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET last_dosed_at = now() '
+            'WHERE user_id = %s AND chat_id = %s '
+            'AND (last_dosed_at IS NULL OR last_dosed_at < now() - make_interval(hours => %s))',
+            (target_id, chat_id, DOSE_COOLDOWN_HOURS)
+        )
+        if c.rowcount > 0:
+            return True, None
+        c.execute(
+            'SELECT EXTRACT(EPOCH FROM (last_dosed_at + make_interval(hours => %s) - now())) '
+            'FROM users WHERE user_id = %s AND chat_id = %s',
+            (DOSE_COOLDOWN_HOURS, target_id, chat_id)
+        )
+        row = c.fetchone()
+        return False, int(row[0]) if row and row[0] else 0
+
+
+def release_dose(target_id, chat_id):
+    """Hands the slot back when an item couldn't actually be applied after claiming."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET last_dosed_at = NULL WHERE user_id = %s AND chat_id = %s',
+                  (target_id, chat_id))
 
 
 DONATION_MIN_DAYS = 7

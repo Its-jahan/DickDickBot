@@ -100,16 +100,33 @@ The player with the largest size in a group is its king (`refresh_king` recomput
 from the leaderboard; `db.crown_king` empties the consort seat whenever the crown
 changes hands, because the consort belongs to the throne rather than to the person).
 The crown deliberately cuts both ways: it collects `KING_TAX_RATIO` of every player's
-size each Tehran midnight, but its wearer loses double in a challenge and is the one
-player consensus protection never covers. This exists because a runaway leader had made
-the top of the leaderboard uncontestable — treat "being #1 must stay dangerous" as the
-invariant when touching any of it.
+size each Tehran midnight, and in exchange its wearer loses double in a challenge. This
+exists because a runaway leader had made the top of the leaderboard uncontestable —
+treat "being #1 must stay dangerous" as the invariant when touching any of it.
+
+Consensus protection is *not* part of that trade: it applies to the king exactly as it
+does to everyone else. An earlier version exempted the king, which meant the group
+could run back-to-back consensus votes on one person — the precise thing the cooldown
+exists to prevent.
 
 The consort (`/hamsar`, king-only, once per Tehran day) takes `CONSORT_TAX_SHARE` of the
 tax and can't be robbed — but can defect at any moment with `/khianat @user`, taking
 `KHIANAT_STEAL_RATIO` of the king's size and splitting it with whoever they left for.
 Betrayal is deducted from the king with `try_deduct_size` first and only then paid out,
 so it can never mint size when the treasury is short.
+
+### Per-target rate limits
+
+Two limits are enforced on the *receiving* end rather than the acting end, because
+gating the actor leaves the obvious hole open (four people each spending one item on
+the same target, or a fresh account being fed by an established one):
+
+- `db.try_claim_dose` — a player can only have a ویاگرا / قرص اورژانسی applied to them
+  once per `DOSE_COOLDOWN_HOURS`. Claim the slot *before* consuming the giver's item
+  and `db.release_dose` if that consume then fails, or a blocked dose costs someone
+  their item. زعفرون is deliberately exempt.
+- `db.get_donation_wait_remaining` is checked for both the donor and the recipient, so
+  `DONATION_MIN_DAYS` gates receiving a donation as well as making one.
 
 ### Size sources and sinks
 
