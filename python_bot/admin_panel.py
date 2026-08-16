@@ -21,11 +21,19 @@ import time
 from flask import (Flask, abort, flash, redirect, render_template_string, request,
                    session, url_for)
 from markupsafe import Markup
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
 import db
 
 app = Flask(__name__)
+# nginx serves this under /dickadmin/ and strips the prefix before proxying, so without
+# this Flask builds every url_for()/redirect as "/login" instead of "/dickadmin/login" -
+# which lands on the main site's SPA fallback and shows the portfolio page instead of
+# the panel. ProxyFix makes Flask honour the X-Forwarded-Prefix/-Proto/-For that the
+# nginx block sets. Trusting those headers is safe here precisely because the app only
+# listens on 127.0.0.1, so nginx is the only thing that can reach it.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 # A missing secret would silently reset every session on restart, so fail loudly.
 app.secret_key = os.environ["ADMIN_PANEL_SECRET"]
 app.config.update(
