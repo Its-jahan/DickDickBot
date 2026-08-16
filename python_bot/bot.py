@@ -134,19 +134,43 @@ BOT_COMMANDS = [
 ]
 
 
+# Telegram resolves the / menu through a precedence chain, and a list registered
+# under a narrower scope (or under the viewer's exact language) wins over a broader
+# one. Setting only all_group_chats/all_private_chats/default therefore fixed nothing
+# for most people here: the old three-command menu was still registered under
+# all_chat_administrators (which outranks all_group_chats, so every group admin kept
+# seeing it) and under the en/fa/ru language variants (which outrank the
+# language-agnostic list, so every Persian-language client kept seeing it too).
+# So: write the canonical list to every broad scope, and explicitly delete the
+# per-language overrides underneath them rather than trying to keep translations of
+# them in sync.
+COMMAND_SCOPE_LANGUAGES = ["en", "fa", "ru", "ar", "tr", "de", "fr", "es"]
+
+
 async def setup_commands(application):
-    """Push the / menu to Telegram at startup for both private chats and groups, so it
-    always matches the handlers this build actually has. Runs in post_init so it fires
-    once per process without blocking polling."""
-    from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+    """Push the / menu at startup so it always matches this build's handlers. Runs in
+    post_init, once per process, without blocking polling."""
+    from telegram import (BotCommand, BotCommandScopeAllGroupChats,
+                          BotCommandScopeAllPrivateChats, BotCommandScopeAllChatAdministrators)
     cmds = [BotCommand(c, d) for c, d in BOT_COMMANDS]
+    scopes = [
+        None,  # default
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+        BotCommandScopeAllChatAdministrators(),
+    ]
+    cleared = 0
     try:
-        await application.bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
-        await application.bot.set_my_commands(cmds, scope=BotCommandScopeAllPrivateChats())
-        # Clear the default scope so a stale global list (the old /stats etc.) can't show
-        # through in any chat type the two scopes above don't cover.
-        await application.bot.set_my_commands(cmds)
-        logging.info("Bot command menu registered (%d commands)", len(cmds))
+        for scope in scopes:
+            for lang in COMMAND_SCOPE_LANGUAGES:
+                try:
+                    await application.bot.delete_my_commands(scope=scope, language_code=lang)
+                    cleared += 1
+                except Exception:
+                    pass  # nothing registered for that combination - fine
+            await application.bot.set_my_commands(cmds, scope=scope)
+        logging.info("Bot command menu registered (%d commands, %d scopes, %d language overrides cleared)",
+                     len(cmds), len(scopes), cleared)
     except Exception as e:
         logging.error("Failed to register command menu: %s", e)
 
