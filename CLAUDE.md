@@ -90,6 +90,41 @@ A daily perk is granted alongside a growth roll, so `last_grown` (the growth dat
 - `random_event_job` — every 3h, small per-group chance of an earthquake/viagra-rain/treasure event.
 - `recover_stuck_pvp_matches` — one-shot, 5s after startup; sweeps `pvp_matches` for anything stale.
 
+## Admin panel
+
+`python_bot/admin_panel.py` is a separate Flask/gunicorn service (`dickbot-admin`,
+127.0.0.1:8011) served at **https://admin.inddex.app**. It imports `db.py` but never
+`bot.py`, and runs as its own systemd unit, so panel and game fail independently.
+
+- Secrets live in `/etc/dickbot-admin.env` (mode 600, outside the repo): the session
+  secret, a werkzeug password *hash*, and the DB URL. The plaintext password is not
+  stored anywhere in the repo or in git history.
+- nginx config is mirrored at `deploy/nginx-admin.inddex.app.conf`. Cloudflare proxies
+  the hostname in Full (strict) mode, so the origin needs a real cert for the
+  subdomain — a self-signed one gives a 526. The port-80 block must keep serving
+  `/.well-known/acme-challenge/` for renewals: Cloudflare only talks HTTPS to the
+  origin for HTTPS requests, so plain HTTP on 80 is what carries the ACME challenge
+  for a proxied hostname.
+- `X-Real-IP` is set from `$http_cf_connecting_ip`, not `$remote_addr` — behind
+  Cloudflare the socket peer is always a CF edge IP.
+- The panel is also reachable at `https://inddex.app/dickadmin/`, where nginx strips
+  the prefix. `ProxyFix(x_prefix=1, ...)` is what makes Flask build URLs under that
+  prefix; without it every redirect goes to `/login` and the main site's SPA fallback
+  answers with the portfolio page.
+- Editing is curated: only `db.EDITABLE_USER_FIELDS` is writable and every value goes
+  through `admin_panel.validate` (which rejects nan/inf — the value that once poisoned
+  a balance permanently). Size edits route through `db.admin_adjust_size` so they land
+  in the ledger like gameplay does.
+
+### The size ledger
+
+Every change to `size` is written to `size_log` from *inside* `db.update_size` and
+`db.try_deduct_size`, not at the ~50 call sites, so coverage can't drift. The `source`
+column is resolved by `db._caller_name()`, which walks the stack to the first frame
+outside `db.py` — a fixed depth lands on `_retry_transient`'s wrapper and stamps the
+same useless name on every row. This is the thing that makes "where did this player's
+size come from" answerable; check it before adding any new size-moving path.
+
 ## Deployment
 
 `.github/workflows/deploy.yml` runs on every push to `main` (and via manual `workflow_dispatch`): SSHes into the production server, `git reset --hard origin/main`, `pip install -r requirements.txt`, `systemctl restart dickbot`, then dumps the last 200 lines of `journalctl -u dickbot` into the workflow log — this is the primary way to check for a clean startup or a crash after shipping a change (grep for `Traceback`/`ERROR`). There is no staging environment; every merge to `main` is live in production immediately.
