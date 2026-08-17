@@ -23,6 +23,7 @@ def tehran_today_str():
     return datetime.datetime.now(IRAN_TZ).date().isoformat()
 
 import db
+import lottery
 
 async def midnight_tasks(context: ContextTypes.DEFAULT_TYPE):
     """Everything that closes out a Tehran day, in the order that keeps the books
@@ -2045,8 +2046,9 @@ BOSS_NAMES = [
     "هیولای خایه‌دار", "کصِ کهکشانی", "دیوِ سه‌متری",
 ]
 
-LOTTERY_TICKET_PRICE = 10
-LOTTERY_BURN_RATIO = 0.10  # burned, so the lottery is a sink and not just a shuffle
+# Single source of truth lives in lottery.py, which the admin panel shares.
+LOTTERY_TICKET_PRICE = lottery.TICKET_PRICE
+LOTTERY_BURN_RATIO = lottery.BURN_RATIO
 
 RANDOM_EVENT_INTERVAL_SECONDS = 3 * 3600
 RANDOM_EVENT_CHANCE = 0.18
@@ -2701,31 +2703,16 @@ async def lottery_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def draw_lottery(context: ContextTypes.DEFAULT_TYPE, draw_date):
-    """Midnight draw. claim_lottery_draw removes the day's tickets as it reads them, so
-    a re-run of the midnight job can never pay a second winner from the same pot."""
+    """Midnight draw. The draw itself lives in lottery.draw so the admin panel runs the
+    exact same code rather than a second copy of it; this only announces the outcome."""
     for chat_id in db.get_lottery_chats(draw_date):
         try:
-            entries = db.claim_lottery_draw(chat_id, draw_date)
-            if not entries:
+            result = lottery.draw(chat_id, draw_date)
+            if not result:
                 continue
-            pot = sum(t for _, _, t in entries) * LOTTERY_TICKET_PRICE
-            prize = int(pot * (1 - LOTTERY_BURN_RATIO))
-            pool = []
-            for uid, fname, tickets in entries:
-                pool.extend([(uid, fname)] * tickets)
-            if not pool or prize <= 0:
-                continue
-            winner_id, winner_name = _dice_rng.choice(pool)
-            db.update_size(winner_id, chat_id, prize)
-            odds = sum(t for uid, _, t in entries if uid == winner_id) / len(pool) * 100
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(f"🎟️ قرعه‌کشی لاتاری!\n\n"
-                      f"🎉 برنده: {winner_name}\n"
-                      f"💰 جایزه: {prize} سانتی‌متر\n"
-                      f"🎲 شانسش: {odds:.0f}٪ از {len(pool)} بلیت")
-            )
-            await announce_achievements(context, chat_id, winner_name, award(winner_id, chat_id, 'lottery_winner'))
+            await context.bot.send_message(chat_id=chat_id, text=lottery.render_result(result))
+            await announce_achievements(context, chat_id, result["winner_name"],
+                                        award(result["winner_id"], chat_id, 'lottery_winner'))
         except Forbidden:
             db.remove_chat(chat_id)
         except Exception as e:

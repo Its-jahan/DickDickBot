@@ -116,6 +116,18 @@ A daily perk is granted alongside a growth roll, so `last_grown` (the growth dat
   a balance permanently). Size edits route through `db.admin_adjust_size` so they land
   in the ledger like gameplay does.
 
+### The lottery draw is shared code
+
+`python_bot/lottery.py` holds the draw itself (`draw`, `render_result`, `pending_pot`)
+and imports only `db` — no telegram, no flask. Both `bot.draw_lottery` (midnight job +
+startup recovery sweep) and the panel's draw button call it, so there is exactly one
+implementation of "pick the winner and pay the pot". Do not inline a second copy: two
+versions of a payout drift, and the drifted one pays real players the wrong amount.
+
+`db.claim_lottery_draw` deletes the day's tickets as it reads them in a single
+statement, which is what makes all three callers safe to race — the pot can only ever
+be paid once.
+
 ### The size ledger
 
 Every change to `size` is written to `size_log` from *inside* `db.update_size` and

@@ -25,9 +25,13 @@ from markupsafe import Markup
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
+import json
+import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 
 import db
+import lottery
 
 app = Flask(__name__)
 # nginx serves this under /dickadmin/ and strips the prefix before proxying, so without
@@ -56,6 +60,31 @@ PASSWORD_HASH = os.environ["ADMIN_PANEL_PASSWORD_HASH"]
 # an event "happened at" as far as the game is concerned. Nothing is stored differently;
 # this is purely how it is rendered.
 TEHRAN = ZoneInfo("Asia/Tehran")
+
+# Set so the panel can post a draw result into the group. Optional: without it the
+# panel still runs, and the draw button simply reports that it can't announce rather
+# than drawing and swallowing the result.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+
+
+def telegram_send(chat_id, text):
+    """Post a message as the bot. Used only for admin-triggered announcements; the bot
+    process does its own sending. Returns (ok, error)."""
+    if not TELEGRAM_TOKEN:
+        return False, "TELEGRAM_TOKEN تنظیم نشده"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=20) as resp:
+            body = json.load(resp)
+        return bool(body.get("ok")), body.get("description", "")
+    except Exception as e:
+        return False, str(e)
+
+
+def _today():
+    """Today's Tehran date, the key lottery tickets are filed under."""
+    return datetime.datetime.now(TEHRAN).date().isoformat()
 
 
 def tehran(ts, fmt="%m-%d %H:%M:%S"):
@@ -299,6 +328,7 @@ def group(chat_id):
             "is_king": bool(kingdom and kingdom[0] == uid),
             "is_consort": bool(kingdom and kingdom[2] == uid),
         })
+    lot_tickets, lot_prize, lot_entries = lottery.pending_pot(chat_id, _today())
     return page(f"گروه {chat_id}", """
 <h1>گروه {{ chat_id }}</h1>
 <div class="card"><div class="tablewrap"><table>
@@ -321,6 +351,33 @@ def group(chat_id):
 {% endfor %}
 </table></div></div>
 
+<h2>🎟️ لاتاری امروز</h2>
+<div class="card">
+  <div class="grid" style="margin-bottom:12px">
+    <div class="stat"><b>{{ lot_tickets }}</b><span>بلیت فروخته‌شده</span></div>
+    <div class="stat"><b>{{ lot_prize }}</b><span>جایزه در صورت قرعه‌کشی</span></div>
+    <div class="stat"><b>{{ lot_entries|length }}</b><span>شرکت‌کننده</span></div>
+  </div>
+  {% if lot_entries %}
+  <div class="tablewrap"><table style="min-width:0">
+    <tr><th>بازیکن</th><th>بلیت</th><th>شانس</th></tr>
+    {% for uid, fname, t in lot_entries %}
+    <tr><td>{{ fname }}</td><td>{{ t }}</td>
+        <td class="dim">{{ '%.0f'|format(t / lot_tickets * 100) }}٪</td></tr>
+    {% endfor %}
+  </table></div>
+  <form method="post" action="{{ url_for('draw_lottery_now', chat_id=chat_id) }}"
+        style="margin-top:14px"
+        onsubmit="return confirm('قرعه‌کشی همین الان انجام و نتیجه در گروه اعلام شود؟ این کار برگشت‌ناپذیر است.')">
+    <button>🎲 قرعه‌کشی کن و در گروه اعلام کن</button>
+    <span class="dim" style="margin-inline-start:10px">
+      برنده به‌صورت تصادفی و به نسبت بلیت‌ها انتخاب می‌شود — همان کاری که نیمه‌شب انجام می‌شد.</span>
+  </form>
+  {% else %}
+  <span class="dim">هنوز کسی برای امروز بلیت نخریده.</span>
+  {% endif %}
+</div>
+
 <h2>سپر اجماع فعال</h2>
 <div class="card">
 {% if protections %}
@@ -336,7 +393,8 @@ def group(chat_id):
 </div>
 
 <p><a class="link" href="{{ url_for('ledger', chat_id=chat_id) }}">📜 لاگ تراکنش این گروه</a></p>
-""", chat_id=chat_id, players=players, protections=db.get_consensus_protections(chat_id))
+""", chat_id=chat_id, players=players, protections=db.get_consensus_protections(chat_id),
+        lot_tickets=lot_tickets, lot_prize=lot_prize, lot_entries=lot_entries)
 
 
 @app.route("/group/<int(signed=True):chat_id>/player/<int:user_id>")
@@ -499,6 +557,32 @@ def save_items(chat_id, user_id):
 def clear_protection(chat_id, user_id):
     flash("سپر اجماع لغو شد." if db.clear_consensus_protection(chat_id, user_id)
           else "سپری برای این بازیکن نبود.")
+    return redirect(url_for("group", chat_id=chat_id))
+
+
+@app.route("/group/<int(signed=True):chat_id>/lottery/draw", methods=["POST"])
+@login_required
+def draw_lottery_now(chat_id):
+    """Run today's draw immediately instead of waiting for midnight.
+
+    This is the same lottery.draw the midnight job calls, so the winner is picked at
+    random weighted by tickets exactly as it would be at midnight - the button changes
+    *when* the draw happens, not who wins. db.claim_lottery_draw consumes the tickets
+    in one statement, so this racing the midnight job can't pay two winners."""
+    result = lottery.draw(chat_id, _today())
+    if not result:
+        flash("بلیتی برای امروز فروخته نشده؛ چیزی برای قرعه‌کشی نبود.", "error")
+        return redirect(url_for("group", chat_id=chat_id))
+
+    ok, err = telegram_send(chat_id, lottery.render_result(result, manual=True))
+    msg = (f"قرعه‌کشی انجام شد — برنده: {result['winner_name']} "
+           f"({result['prize']} سانت، شانس {result['odds']:.0f}٪).")
+    if ok:
+        flash(msg + " در گروه اعلام شد.")
+    else:
+        # The payout already happened and the tickets are already consumed, so say so
+        # rather than implying nothing occurred.
+        flash(msg + f" ولی اعلام در گروه نشد: {err} — جایزه پرداخت شده است.", "error")
     return redirect(url_for("group", chat_id=chat_id))
 
 
