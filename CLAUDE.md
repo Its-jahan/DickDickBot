@@ -116,6 +116,72 @@ A daily perk is granted alongside a growth roll, so `last_grown` (the growth dat
   a balance permanently). Size edits route through `db.admin_adjust_size` so they land
   in the ledger like gameplay does.
 
+### The nightly auto-handicap (`auto_handicap_job`)
+
+Runs daily at 00:20 Tehran, after `midnight_tasks` has closed the day out. For each
+group with at least `HANDICAP_MIN_PLAYERS` active players it reads
+`db.get_recent_net_by_user(chat_id, HANDICAP_WINDOW_DAYS)` — **net gained recently from
+the ledger, not current balance** — and nudges each player's `growth_mult` and
+`theft_luck` toward a target derived from their distance above/below the group's
+*median* net (mean absolute deviation is the spread measure; a single whale can't
+inflate it the way a standard deviation would). Dials move only `HANDICAP_SMOOTHING` of
+the way each night and are clamped to `HANDICAP_GROWTH_RANGE` / `HANDICAP_LUCK_RANGE`.
+
+Two things to know before touching it:
+
+- **`users.dials_locked` is the contract between this job and the owner commands.**
+  `/setgrowth` and `/setluck` pin a player (setting a dial to exactly `1.0` unpins
+  them); the job skips pinned players entirely. Without that flag the two systems
+  write the same two columns and silently fight over them.
+- **The lock backfill in `init_db()` must stay one-shot.** It is guarded by the
+  `bot_meta` key `dials_lock_migrated`. `init_db()` runs on *every* startup, so an
+  unguarded "lock everything that isn't 1.0" would re-fire on each restart and freeze
+  every dial the job had legitimately moved.
+
+Every decision is written to `rebalance_log`; `/balance [chat_id]` (owner-only) prints
+the recent ones with before/after values.
+
+### Size must be conserved — the invariants that keep it that way
+
+Three separate leaks were fixed here, and all three are easy to reintroduce:
+
+- **The spectator book is parimutuel, not a fixed 2×.** Winners split exactly what the
+  losers staked, pro rata (remainder to the largest stake). A flat double payout mints
+  size whenever the book is one-sided, which is the normal case — everyone backs the
+  favourite. If *nobody* picks the winner the book is voided and every stake refunded,
+  the same rule the tie branch follows.
+- **Perks that shield a loser must shrink the winner's take to match** (`لاشی`,
+  `کاندوم`) *and* perks that shrink the winner's take must shrink the loser's loss to
+  match (`جاکش`) — otherwise the difference is silently destroyed, which is just as
+  wrong as minting it.
+- **`lottery_tickets.tickets` is entries (odds); `lottery_tickets.paid` is the size
+  actually spent.** The pot is `SUM(paid)`. Bonus entries (the `خرشانس` perk, the
+  `بلیت طلایی` item) pass `paid=0` — they buy odds, never prize money nobody funded.
+  Before these were split, any bonus entry inflated the prize as well as the odds.
+
+### Perks and items span three subsystems, not just challenges
+
+Most groups spend their day on `/dozdi` and `/lottery` (theft outnumbered challenges
+roughly 3:1 in the ledger), so perks reach into all three:
+
+- Challenge dice/payout: `جاکش`, `کص‌کش`, `لاشی`, `کون‌گشاد`, `حروم‌دست`, `زن جنده`, `جقی`.
+- Theft: `THEFT_CHANCE_PERKS`, `THEFT_LOOT_PERKS` (the thief's own perk) and
+  `VICTIM_SOFT_PERKS` (the *victim's* perk — `سوراخ‌جیب` makes them easier to rob).
+  `شب‌رو` halves the theft cooldown.
+- Lottery: `خرشانس` doubles entries bought, `بدبیار` blocks buying entirely.
+
+Items live in four buckets — `CHALLENGE_ITEMS`, `DIRECT_ITEMS`, `PASSIVE_ITEMS`,
+`THEFT_ITEMS`, plus `INSTANT_ITEMS` applied immediately. **Theft items arm their own
+slot** (`users.active_theft_item`), separate from the challenge slot: one shared slot
+meant arming a glove silently disarmed the condom someone was holding. `activate_special_item`
+is the single shared implementation behind both the inventory button and `/use`.
+
+A perk's numbers and the text players are shown must not drift — that is a real bug
+class here, not a hypothetical. `جقی` promised a wild dice swing in its description
+while the code was actually randomising the *stake* at challenge-creation time (and
+skewing it 25% upward); `زن جنده` had an undocumented +1 dice bonus. Both are fixed,
+and there is a test asserting every perk in the roll pool has a description.
+
 ### The lottery draw is shared code
 
 `python_bot/lottery.py` holds the draw itself (`draw`, `render_result`, `pending_pot`)

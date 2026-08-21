@@ -253,7 +253,8 @@ def build_inventory_view(user_id, chat_id):
     """Builds (message_text, keyboard) for a user's inventory in a group. Returns (None, None) if empty."""
     items = db.get_inventory(user_id, chat_id)
     active_item = db.get_user_active_item(user_id, chat_id)
-    if not items and not active_item:
+    active_theft = db.get_user_active_theft_item(user_id, chat_id)
+    if not items and not active_item and not active_theft:
         return None, None
 
     msg = "🎒 **آیتم‌های شما در این گروه:**\n\n"
@@ -268,6 +269,8 @@ def build_inventory_view(user_id, chat_id):
         keyboard.append([InlineKeyboardButton(f"استفاده از {item_name}", callback_data=f"useitem_{user_id}_{item_name}")])
     if active_item:
         msg += f"\n🔥 آیتم فعال برای چالش بعدی: **{active_item}**"
+    if active_theft:
+        msg += f"\n🥷 آیتم فعال برای دزدی بعدی: **{active_theft}**"
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     return msg, reply_markup
@@ -348,14 +351,30 @@ PERK_DESCRIPTIONS = {
     "لاشی": "شما پرک **لاشی 🦅** گرفتید! (اگه تو چالش ببازید ۵۰٪ کمتر سایز از دست میدید).",
     "خایه‌مال": "شما پرک **خایه‌مال 🤲** گرفتید! (+۵ سانت هدیه بلافاصله اضافه شد).",
     "کون‌گشاد": "شما پرک **کون‌گشاد 🦥** گرفتید! (تاس‌های شما همیشه ۱ دونه کمتر محاسبه میشه).",
-    "زن جنده": "به صورت رندوم یکی از اعضای گروه رو انتخاب می‌کنه و اگه سایزش بیشتر از ۱۰ باشه ۵ سانت از اون کم می‌کنه و به تو اضافه می‌کنه.",
+    "زن جنده": "به صورت رندوم یکی از اعضای گروه رو انتخاب می‌کنه و اگه سایزش بیشتر از ۱۰ باشه ۵ سانت از اون کم می‌کنه و به تو اضافه می‌کنه (تاست هم تو چالش ۱ عدد بیشتر حساب می‌شه).",
     "جقی": "موقع چالش ممکنه عدد تاس رو رندوم به شدت بالا یا پایین ببره!",
     "کیرکلفت": "شما پرک **کیرکلفت 💪** گرفتید! (یه رشد اضافه هم بلافاصله گیرت اومد).",
     "کص‌شانس": "شما پرک **کص‌شانس 🍀** گرفتید! (امروز شانس پیدا کردن آیتم دو برابره).",
     "کیرشکسته": "شما پرک **کیرشکسته 💔** گرفتید! (یه مقدار سانت هم بلافاصله از دست دادید).",
     "کون‌سوخته": "شما پرک **کون‌سوخته 🔥** گرفتید! (امروز نمی‌تونید از هیچ آیتمی استفاده کنید).",
-    "حروم‌دست": "شما پرک **حروم‌دست 🎲** گرفتید! (تاس‌های امروزتون تو چالش ۲ عدد کمتر محاسبه میشه)."
+    "حروم‌دست": "شما پرک **حروم‌دست 🎲** گرفتید! (تاس‌های امروزتون تو چالش ۲ عدد کمتر محاسبه میشه).",
+    # Theft- and lottery-facing perks. The daily perk used to matter almost only inside
+    # a challenge, while most groups actually spend their day on /dozdi and /lottery -
+    # so a perk roll was irrelevant to what people were really doing. These give the
+    # roll teeth in the parts of the game that are actually being played.
+    "جیب‌بر": "شما پرک **جیب‌بر 🧤** گرفتید! (امروز شانس دزدیتون بیشتره و غنیمت بیشتری می‌برید).",
+    "شب‌رو": "شما پرک **شب‌رو 🌙** گرفتید! (امروز کول‌داون دزدی براتون نصفه).",
+    "دست‌کج": "شما پرک **دست‌کج 🪤** گرفتید! (امروز شانس دزدیتون کمتره و اگه گیر بیفتید غرامت دوبرابر می‌دید).",
+    "سوراخ‌جیب": "شما پرک **سوراخ‌جیب 🕳️** گرفتید! (امروز بقیه راحت‌تر و بیشتر از شما می‌دزدند).",
+    "خرشانس": "شما پرک **خرشانس 🎰** گرفتید! (امروز هر بلیت لاتاری شما دوبار تو قرعه‌کشی حساب می‌شه).",
+    "بدبیار": "شما پرک **بدبیار 🚫** گرفتید! (امروز نمی‌تونید بلیت لاتاری بخرید)."
 }
+
+# Perk effect tables, kept next to the descriptions so a perk's numbers and the text
+# players are shown can't drift apart.
+THEFT_CHANCE_PERKS = {"جیب‌بر": 0.15, "دست‌کج": -0.20}   # added to the thief's chance
+THEFT_LOOT_PERKS = {"جیب‌بر": 1.25}                        # multiplies the thief's loot
+VICTIM_SOFT_PERKS = {"سوراخ‌جیب": (0.20, 1.5)}             # (chance bonus, loot mult) vs this victim
 
 ITEM_DESCRIPTIONS = {
     "ویاگرا": "بده به یکی تا ۴۰ سانت بره رو کیرش! (/use ویاگرا @username)",
@@ -366,7 +385,11 @@ ITEM_DESCRIPTIONS = {
     "سوزن": "فعالش کن تا کاندوم حریفت رو تو چالش پاره کنی.",
     "طلسم": "فعالش کن تا اثر شیر موز حریفت رو باطل کنی.",
     "اسپری": "فعالش کن تا تاس حریفت رو تو چالش یکی کم کنی.",
-    "قفل": "خودکار عمل می‌کنه: جلوی یه دزدی رو می‌گیره و بعدش مصرف می‌شه."
+    "قفل": "خودکار عمل می‌کنه: جلوی یه دزدی رو می‌گیره و بعدش مصرف می‌شه.",
+    "دستکش": "فعالش کن تا شانس دزدی بعدیت خیلی بیشتر بشه. (/use دستکش)",
+    "کیسه": "فعالش کن تا غنیمت دزدی بعدیت دوبرابر بشه. (/use کیسه)",
+    "آژیر": "خودکار عمل می‌کنه: جلوی یه دزدی رو می‌گیره و دزد رو هم جریمه می‌کنه.",
+    "بلیت طلایی": "فعالش کن تا ۱۰ بلیت لاتاری رایگان برای امروز بگیری. (/use بلیت طلایی)"
 }
 
 # Challenge items are "activated" for your next challenge; direct items are applied
@@ -374,7 +397,17 @@ ITEM_DESCRIPTIONS = {
 # button); passive items just sit in the bag and fire on their own when relevant.
 CHALLENGE_ITEMS = ["کاندوم", "شیر موز", "سوزن", "طلسم", "اسپری"]
 DIRECT_ITEMS = ["ویاگرا", "قرص اورژانسی", "زعفرون"]
-PASSIVE_ITEMS = ["قفل"]
+PASSIVE_ITEMS = ["قفل", "آژیر"]
+# Theft items arm their own slot (users.active_theft_item), so arming one never
+# disarms the condom someone is holding for a challenge.
+THEFT_ITEMS = ["دستکش", "کیسه"]
+# Applied the moment they're used rather than armed for later - there is nothing to
+# wait for, the tickets land in today's pot immediately.
+INSTANT_ITEMS = ["بلیت طلایی"]
+THEFT_ITEM_CHANCE_BONUS = 0.25   # دستکش
+THEFT_ITEM_LOOT_MULT = 2.0       # کیسه
+GOLDEN_TICKET_TICKETS = 10       # بلیت طلایی
+ALARM_FINE_RATIO = 0.20          # آژیر fines the thief this much of the loot they missed
 
 # Buying is the game's only real size *sink* - everything else (daily growth, boss
 # rewards, one-sided spectator books) only ever creates size. Prices are deliberately
@@ -389,6 +422,10 @@ SHOP_PRICES = {
     "طلسم": 35,
     "اسپری": 30,
     "قفل": 40,
+    "دستکش": 50,
+    "کیسه": 55,
+    "آژیر": 70,
+    "بلیت طلایی": 90,
 }
 
 # A player can only be dosed with one of these per 24h, counted on the receiving end.
@@ -431,6 +468,34 @@ def apply_direct_item(item_name, target_user_id, target_name, chat_id):
         return f"شما با زعفرون {loss} سانت از {target_name} کم کردید!"
     return "آیتم نامشخص."
 
+def activate_special_item(user_id, chat_id, item_name, first_name=""):
+    """Arms a theft item, or applies an instant one. Returns (ok, message).
+
+    Shared by the inventory button and the /use command so the two entry points can't
+    drift - the older challenge-item path already had two near-copies of its logic and
+    they were not identical."""
+    if item_name in THEFT_ITEMS:
+        if db.get_user_active_theft_item(user_id, chat_id):
+            return False, "شما از قبل یه آیتم دزدی فعال دارید! اول یه بار /dozdi بزنید."
+        if not db.use_inventory(user_id, chat_id, item_name):
+            return False, "شما این آیتم را ندارید!"
+        db.set_user_active_theft_item(user_id, chat_id, item_name)
+        return True, f"آیتم {item_name} فعال شد! تو دزدی بعدیت اعمال می‌شه. 🥷"
+
+    if item_name == "بلیت طلایی":
+        _, _, perk = db.get_user(user_id, chat_id, None, None)
+        if perk == "بدبیار":
+            return False, "امروز پرک بدبیار 🚫 داری و نمی‌تونی وارد لاتاری بشی!"
+        if not db.use_inventory(user_id, chat_id, item_name):
+            return False, "شما این آیتم را ندارید!"
+        # paid=0: a golden ticket is odds, not prize money. See buy_lottery_tickets.
+        db.buy_lottery_tickets(chat_id, tehran_today_str(), user_id, first_name,
+                               GOLDEN_TICKET_TICKETS, paid=0)
+        return True, f"🎫 بلیت طلایی خرج شد و {GOLDEN_TICKET_TICKETS} بلیت لاتاری برای امروز گرفتی!"
+
+    return False, "این آیتم رو نمی‌شه اینطوری استفاده کرد."
+
+
 def get_target_user(update: Update, text: str, chat_id: int):
     """Helper to find the target user of a command (either by reply or username)"""
     target_user_id = None
@@ -461,8 +526,12 @@ def drop_item(user_id, chat_id, chance=0.3):
     if random.random() > chance:
         return None
     
-    # Pool weights: viagra 24, pill 10, saffron 1, condom 15, milk 15, needle 10, spell 15, spray 10
-    pool = ["ویاگرا"]*24 + ["قرص اورژانسی"]*10 + ["زعفرون"]*1 + ["کاندوم"]*15 + ["شیر موز"]*15 + ["سوزن"]*10 + ["طلسم"]*15 + ["اسپری"]*10
+    # Pool weights. The theft/lottery items are in the drop table too, not shop-only:
+    # /dozdi is by far the most-used verb in these groups, so the items that interact
+    # with it have to be reachable by simply showing up daily, not only by saving up.
+    pool = (["ویاگرا"]*24 + ["قرص اورژانسی"]*10 + ["زعفرون"]*1 + ["کاندوم"]*15
+            + ["شیر موز"]*15 + ["سوزن"]*10 + ["طلسم"]*15 + ["اسپری"]*10
+            + ["دستکش"]*12 + ["کیسه"]*10 + ["آژیر"]*8 + ["بلیت طلایی"]*4)
     item = random.choice(pool)
     db.add_inventory(user_id, chat_id, item)
     return item
@@ -506,6 +575,8 @@ HELP_TEXT = (
     "**اقتصاد و سرگرمی**\n"
     "🏪 /shop — خرید آیتم با سانت\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
+    "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
+    "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
     "🏅 /ach — نشان‌های من\n"
     "🐉 هر شب ساعت ۲۰ یه باس میاد؛ همه با هم بزنیدش!\n\n"
     "می‌تونید با @dickchallengerbot به صورت اینلاین هم بازی کنید."
@@ -578,6 +649,14 @@ async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"برای استفاده از {item_name} باید تو گروه بنویسی:\n/use {item_name} @username", show_alert=True)
         return
         
+    if item_name in THEFT_ITEMS or item_name in INSTANT_ITEMS:
+        ok, note = activate_special_item(user.id, chat_id, item_name, user.first_name)
+        await query.answer(note, show_alert=True)
+        if ok:
+            msg, reply_markup = build_inventory_view(user.id, chat_id)
+            await query.edit_message_text(msg, reply_markup=reply_markup)
+        return
+
     if item_name in CHALLENGE_ITEMS:
         current_active = db.get_user_active_item(user.id, chat_id)
         if current_active:
@@ -659,7 +738,8 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # item name might be multiple words
     item_name = " ".join([p for p in parts[1:] if not p.startswith('@')])
 
-    if item_name not in CHALLENGE_ITEMS and item_name not in DIRECT_ITEMS:
+    if (item_name not in CHALLENGE_ITEMS and item_name not in DIRECT_ITEMS
+            and item_name not in THEFT_ITEMS and item_name not in INSTANT_ITEMS):
         return  # not a real item name at all - stay silent instead of replying
 
     # check if user has item
@@ -675,6 +755,11 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     
+    if item_name in THEFT_ITEMS or item_name in INSTANT_ITEMS:
+        _ok, note = activate_special_item(user.id, chat_id, item_name, user.first_name)
+        await update.message.reply_text(note)
+        return
+
     if item_name in CHALLENGE_ITEMS:
         current_active = db.get_user_active_item(user.id, chat_id)
         if current_active:
@@ -1054,14 +1139,13 @@ async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش ایجاد کنید.")
         return
         
-    if user_perk == "جقی":
-        bet = random.randint(max(1, bet - int(bet/2)), bet + int(bet))
-        
+    # جقی deliberately does NOT touch the stake here. Its description promises a wild
+    # swing on the *dice* during the challenge, and that is where it is now applied
+    # (see resolve_pvp_match). Rewriting the bet instead meant the one perk players
+    # were warned about did something else entirely - and, because the old roll was
+    # randint(bet/2, 2*bet), it quietly inflated the average stake by 25%.
     if user_size < bet:
-        if user_perk == "جقی":
-            await update.message.reply_text(f"پرک جقی باعث شد شرط شما بشه {bet} سانت، ولی شما اینقدر سانت در این گروه ندارید!")
-        else:
-            await update.message.reply_text(f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه ندارید! سایز فعلی شما: {int(user_size)}")
+        await update.message.reply_text(f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه ندارید! سایز فعلی شما: {int(user_size)}")
         return
         
     keyboard = [[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=build_challenge_data(user.id, bet))]]
@@ -1234,10 +1318,12 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         if c_perk == "کون‌گشاد": val1 = max(1, val1 - 1)
         elif c_perk == "زن جنده": val1 = min(6, val1 + 1)
         elif c_perk == "حروم‌دست": val1 = max(1, val1 - 2)
+        elif c_perk == "جقی": val1 = _jaghi_swing(val1)
 
         if user_perk == "کون‌گشاد": val2 = max(1, val2 - 1)
         elif user_perk == "زن جنده": val2 = min(6, val2 + 1)
         elif user_perk == "حروم‌دست": val2 = max(1, val2 - 2)
+        elif user_perk == "جقی": val2 = _jaghi_swing(val2)
 
         msg_item_log = ""
         if c_item or u_item:
@@ -1312,7 +1398,12 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
             winner_gain = int(bet * 1.2)
             loser_loss = winner_gain
         elif winner_perk == "جاکش":
+            # The loser's loss comes down with the winner's take. Previously only the
+            # gain was halved while the loser still paid the full bet, so half the
+            # stake was quietly destroyed on every جاکش win - the mirror image of the
+            # mint the zero-sum guard below exists to prevent, and just as wrong.
             winner_gain = int(bet * 0.5)
+            loser_loss = winner_gain
 
         if loser_perk == "لاشی":
             loser_loss = int(bet * 0.5)
@@ -1384,13 +1475,45 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
             # Bettors already had their stake deducted the moment they placed the bet (see
             # place_bet_callback), so a correct guess pays back double the stake (stake + winnings)
             # and a wrong guess pays back nothing - the staked amount is simply gone.
+            # Parimutuel, not a fixed 2x. The old flat double paid every correct
+            # guess out of nothing: with all the spectators on the same side - the
+            # normal case, since people back the obvious favourite - the book had no
+            # losing stakes to pay from and simply minted the difference. Winners now
+            # split exactly what the losers staked, pro rata, so the book always
+            # settles to zero no matter how one-sided it is.
             correct_side = "win" if winner_id == challenger_id else "lose"
+            winning_bets = {uid: v for uid, v in bets.items() if v[0] == correct_side}
+            losing_pool = sum(a for s, a, _ in bets.values() if s != correct_side)
+            winning_stake = sum(a for _, a, _ in winning_bets.values())
+
             msg += "\n\n🎰 نتیجهٔ شرط‌بندی‌ها:"
-            for bettor_id, (side, amount, bettor_name) in bets.items():
-                if side == correct_side:
-                    db.update_size(bettor_id, chat_id, amount * 2)
-                    msg += f"\n✅ {bettor_name}: {int(amount)} گذاشت و {int(amount * 2)} گرفت (سود {int(amount)})"
-                else:
+            if not winning_bets:
+                # Nobody backed the winner, so there is no one to pay the pool to.
+                # Void the book and hand every stake back rather than quietly
+                # destroying it - the same rule the tie branch above already follows,
+                # and what a real parimutuel does when no ticket picks the winner.
+                for uid, (_side, amount, bettor_name) in bets.items():
+                    db.update_size(uid, chat_id, amount)
+                msg += "\n↩️ هیچ‌کس برنده رو درست حدس نزده بود، پس شرط‌ها باطل شد و سانت همه برگشت."
+            if winning_bets:
+                # Integer split with the rounding remainder handed to the largest
+                # stake, so the pool is distributed exactly and never over-paid.
+                shares = {}
+                for uid, (_side, amount, _n) in winning_bets.items():
+                    shares[uid] = int(losing_pool * amount / winning_stake) if winning_stake else 0
+                remainder = losing_pool - sum(shares.values())
+                if remainder > 0 and shares:
+                    top = max(shares, key=lambda u: winning_bets[u][1])
+                    shares[top] += remainder
+                for uid, (_side, amount, bettor_name) in winning_bets.items():
+                    profit = shares.get(uid, 0)
+                    db.update_size(uid, chat_id, amount + profit)
+                    if profit > 0:
+                        msg += f"\n✅ {bettor_name}: {int(amount)} گذاشت و {int(amount + profit)} گرفت (سود {int(profit)})"
+                    else:
+                        msg += f"\n➖ {bettor_name}: درست حدس زد ولی کسی مقابلش شرط نبسته بود؛ {int(amount)} سانتش برگشت"
+            for uid, (side, amount, bettor_name) in bets.items():
+                if side != correct_side:
                     msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"
 
         await deliver_pvp_message(context, chat_id, message_id, msg, inline_message_id=inline_message_id)
@@ -1721,7 +1844,8 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     perk_pool = [
         "عادی", "عادی", "عادی", "عادی", "عادی", "عادی", "عادی",
         "جاکش", "کص‌کش", "حرومزاده", "لاشی", "خایه‌مال", "کون‌گشاد", "زن جنده", "جقی",
-        "کیرکلفت", "کص‌شانس", "کیرشکسته", "کون‌سوخته", "حروم‌دست"
+        "کیرکلفت", "کص‌شانس", "کیرشکسته", "کون‌سوخته", "حروم‌دست",
+        "جیب‌بر", "شب‌رو", "دست‌کج", "سوراخ‌جیب", "خرشانس", "بدبیار"
     ]
     new_perk = random.choice(perk_pool)
     db.set_user_perk(user.id, chat_id, new_perk)
@@ -2015,6 +2139,12 @@ async def show_inv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================================
 
 STREAK_MAX_BONUS = 10
+
+
+def _jaghi_swing(val):
+    """جقی: a wild swing on the die, in whichever direction the coin lands. This is
+    what the perk's description has always promised players."""
+    return max(1, val - 3) if random.random() < 0.5 else min(6, val + 3)
 
 # The crown taxes the group daily, which is what makes being #1 worth chasing - but it
 # also makes its wearer the only player consensus protection doesn't cover and doubles
@@ -2362,7 +2492,8 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    ok, remaining = db.try_start_theft(user.id, chat_id, THEFT_COOLDOWN_SECONDS)
+    cooldown = THEFT_COOLDOWN_SECONDS // 2 if thief_perk == "شب‌رو" else THEFT_COOLDOWN_SECONDS
+    ok, remaining = db.try_start_theft(user.id, chat_id, cooldown)
     if not ok:
         hours, minutes = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
@@ -2378,6 +2509,31 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chance += THEFT_LUCKY_PERK_BONUS
     if db.is_traitor(target_id, chat_id):
         chance += 0.20  # nobody guards a traitor
+
+    # The thief's own perk of the day.
+    chance += THEFT_CHANCE_PERKS.get(thief_perk, 0.0)
+    loot_mult = THEFT_LOOT_PERKS.get(thief_perk, 1.0)
+
+    # ...and the victim's, which is what makes a bad perk roll something the whole
+    # group can smell blood on rather than a private inconvenience.
+    _, _, victim_perk = db.get_user(target_id, chat_id, None, None)
+    v_chance, v_loot = VICTIM_SOFT_PERKS.get(victim_perk, (0.0, 1.0))
+    chance += v_chance
+    loot_mult *= v_loot
+
+    # An armed theft item, consumed on this attempt whether or not it lands - same
+    # bargain as a challenge item.
+    theft_item = db.get_user_active_theft_item(user.id, chat_id)
+    item_note = ""
+    if theft_item:
+        db.clear_user_active_theft_item(user.id, chat_id)
+        if theft_item == "دستکش":
+            chance += THEFT_ITEM_CHANCE_BONUS
+            item_note = "\n🧤 دستکش دستت بود."
+        elif theft_item == "کیسه":
+            loot_mult *= THEFT_ITEM_LOOT_MULT
+            item_note = "\n🎒 کیسه آورده بودی."
+
     chance = min(max(chance, 0.15), 0.75)
 
     # Per-player luck dial (1.0 for everyone by default), applied after the normal floor
@@ -2390,15 +2546,30 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if theft_luck != 1.0:
         chance = min(max(chance * theft_luck, 0.0), 0.95)
 
-    loot = max(1, int(target_size * random.uniform(THEFT_MIN_RATIO, THEFT_MAX_RATIO)))
+    loot = max(1, int(target_size * random.uniform(THEFT_MIN_RATIO, THEFT_MAX_RATIO) * loot_mult))
 
     # قفل is bought precisely for this moment: it eats one theft attempt and is spent.
     # Checked before the roll, so a lock is never wasted on an attempt that would have
     # failed anyway - the thief still burns their cooldown either way.
+    if db.use_inventory(target_id, chat_id, "آژیر"):
+        fine = max(1, int(loot * ALARM_FINE_RATIO))
+        if db.try_deduct_size(user.id, chat_id, fine):
+            db.update_size(target_id, chat_id, fine)
+            await update.message.reply_text(
+                f"🚨 آژیر {target_name} به صدا در اومد!\n{user.first_name} فرار کرد ولی "
+                f"{int(fine)} سانت جا گذاشت.\n(آژیر {target_name} مصرف شد){item_note}"
+            )
+        else:
+            await update.message.reply_text(
+                f"🚨 آژیر {target_name} به صدا در اومد و {user.first_name} دست خالی فرار کرد!\n"
+                f"(آژیر {target_name} مصرف شد){item_note}"
+            )
+        return
+
     if db.use_inventory(target_id, chat_id, "قفل"):
         await update.message.reply_text(
             f"🔒 {target_name} قفل داشت!\n{user.first_name} به در بسته خورد و دست خالی برگشت.\n"
-            f"(قفل {target_name} مصرف شد)"
+            f"(قفل {target_name} مصرف شد){item_note}"
         )
         return
 
@@ -2408,23 +2579,127 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db.update_size(user.id, chat_id, loot)
         await update.message.reply_text(
-            f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!"
+            f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!{item_note}"
         )
         earned = award(user.id, chat_id, 'thief')
         await announce_achievements(context, chat_id, user.first_name, earned)
         await announce_achievements(context, chat_id, target_name, award(target_id, chat_id, 'robbed'))
     else:
         fine = max(1, loot // 2)
+        if thief_perk == "دست‌کج":
+            fine *= 2
         if db.try_deduct_size(user.id, chat_id, fine):
             db.update_size(target_id, chat_id, fine)
             await update.message.reply_text(
                 f"🚨 مچ‌گیری!\n\n{user.first_name} می‌خواست از {target_name} بدزده ولی گیر افتاد "
-                f"و {int(fine)} سانت غرامت داد!"
+                f"و {int(fine)} سانت غرامت داد!{item_note}"
             )
         else:
             await update.message.reply_text(
-                f"🚨 {user.first_name} گیر افتاد ولی اونقدر فقیره که غرامتی هم نداشت بده 😂"
+                f"🚨 {user.first_name} گیر افتاد ولی اونقدر فقیره که غرامتی هم نداشت بده 😂{item_note}"
             )
+
+
+
+# ---------------------------------------------------------------- auto-handicap
+#
+# The problem this solves, measured from the ledger rather than guessed at: in the
+# busiest group the top three players had captured 82% of every centimetre gained,
+# and the leader sat at 7x the median. Nothing in the game pushed back on a runaway -
+# a big balance made the next PvP stake safer to cover, a bigger stake won more, and
+# the daily growth roll was the same 20cm ceiling for the player on 722 as for the
+# player on 50.
+#
+# Rather than nerfing anyone by hand, this reads how much each player actually *gained*
+# over the recent window and leans on the two dials that already exist: growth_mult
+# (the daily roll's ceiling) and theft_luck (the /dozdi success chance). Whoever is
+# running away gets a slightly lower ceiling, whoever is being left behind gets a
+# slightly better one. Nobody is ever pushed outside HANDICAP_* bounds, the pull is
+# proportional to how far from the group's median they are, and every decision is
+# written to rebalance_log so "why did my growth drop?" has a real answer.
+#
+# Deliberate design choices:
+#  - It reads *recent gains*, not balance. A player sitting on size they earned last
+#    week is not the one currently running away with the game.
+#  - The median, not the mean, is the reference point: one whale would otherwise drag
+#    the average up and hand the whole group a catch-up bonus.
+#  - Dials move a fraction of the way to their target each night rather than snapping,
+#    so a single loud day doesn't swing someone's whole week.
+#  - Players whose dials an owner pinned by hand (/setgrowth, /setluck) are skipped.
+HANDICAP_WINDOW_DAYS = 3
+HANDICAP_MIN_PLAYERS = 4        # below this a "median" is noise, so leave the group alone
+HANDICAP_GROWTH_RANGE = (0.70, 1.35)
+HANDICAP_LUCK_RANGE = (0.80, 1.25)
+HANDICAP_SMOOTHING = 0.5        # how far a dial travels toward its target each night
+
+
+def _handicap_targets(net, median, spread):
+    """The dials this player's recent net earns them. Symmetric around the median: at
+    the median both come out 1.0, and the further above it they are the lower they go."""
+    if spread <= 0:
+        return 1.0, 1.0
+    z = (net - median) / spread
+    z = max(-2.0, min(2.0, z))
+    growth = 1.0 - 0.18 * z
+    luck = 1.0 - 0.12 * z
+    growth = max(HANDICAP_GROWTH_RANGE[0], min(HANDICAP_GROWTH_RANGE[1], growth))
+    luck = max(HANDICAP_LUCK_RANGE[0], min(HANDICAP_LUCK_RANGE[1], luck))
+    return growth, luck
+
+
+async def auto_handicap_job(context: ContextTypes.DEFAULT_TYPE):
+    """Nightly: re-derive every active player's dials from the recent ledger."""
+    run_date = tehran_today_str()
+    for chat_id in db.get_all_chats():
+        try:
+            rows = db.get_recent_net_by_user(chat_id, HANDICAP_WINDOW_DAYS)
+            rows = [r for r in rows if r[0] != BOT_USER_ID]
+            if len(rows) < HANDICAP_MIN_PLAYERS:
+                continue
+
+            nets = sorted(float(r[2] or 0) for r in rows)
+            mid = len(nets) // 2
+            median = nets[mid] if len(nets) % 2 else (nets[mid - 1] + nets[mid]) / 2.0
+            # Mean absolute deviation from the median: a spread measure that one
+            # runaway player can't inflate the way a standard deviation would.
+            spread = sum(abs(n - median) for n in nets) / len(nets)
+            if spread <= 0:
+                continue
+
+            for user_id, _name, net, _events in rows:
+                if db.is_dials_locked(user_id, chat_id):
+                    continue
+                luck_before, growth_before = db.get_modifiers(user_id, chat_id)
+                t_growth, t_luck = _handicap_targets(float(net or 0), median, spread)
+                growth_after = round(growth_before + (t_growth - growth_before) * HANDICAP_SMOOTHING, 3)
+                luck_after = round(luck_before + (t_luck - luck_before) * HANDICAP_SMOOTHING, 3)
+                if abs(growth_after - growth_before) < 0.01 and abs(luck_after - luck_before) < 0.01:
+                    continue
+                db.set_modifier(user_id, chat_id, 'growth_mult', growth_after)
+                db.set_modifier(user_id, chat_id, 'theft_luck', luck_after)
+                db.record_rebalance(chat_id, user_id, run_date, float(net or 0), median,
+                                    growth_before, growth_after, luck_before, luck_after)
+        except Exception:
+            logging.exception(f"auto-handicap failed for {chat_id}")
+
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: what the auto-handicap last did in a group, and why."""
+    if not _owner_only(update):
+        return
+    parts = update.message.text.split()
+    chat_id = int(parts[1]) if len(parts) > 1 and parts[1].lstrip('-').isdigit() else update.effective_chat.id
+    rows = db.get_last_rebalance(chat_id, 25)
+    if not rows:
+        await update.message.reply_text("هنوز هیچ تنظیم خودکاری برای این گروه ثبت نشده.")
+        return
+    lines = [f"⚖️ آخرین تنظیمات خودکار تعادل (chat {chat_id}):", ""]
+    for run_date, name, net, median, gb, ga, lb, la in rows:
+        lines.append(
+            f"• {run_date} — {_esc(name or '?')}: خالص {net:+.0f} (میانه {median:+.0f})\n"
+            f"   رشد {gb:g}→{ga:g} | شانس {lb:g}→{la:g}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 def build_shop_keyboard(user_id):
@@ -2639,8 +2914,8 @@ async def lottery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_lottery_view(chat_id, user_id):
     entries = db.get_lottery_entries(chat_id, tehran_today_str())
-    pot = sum(t for _, _, t in entries) * LOTTERY_TICKET_PRICE
-    mine = next((t for uid, _, t in entries if uid == user_id), 0)
+    pot = sum(p for _, _, _, p in entries)
+    mine = next((t for uid, _, t, _p in entries if uid == user_id), 0)
     lines = [
         "🎟️ **لاتاری امشب**",
         f"💰 جایزه: {int(pot * (1 - LOTTERY_BURN_RATIO))} سانتی‌متر",
@@ -2651,7 +2926,7 @@ def build_lottery_view(chat_id, user_id):
     ]
     if entries:
         lines.append("\n👥 شرکت‌کننده‌ها:")
-        for _uid, fname, t in entries:
+        for _uid, fname, t, _p in entries:
             lines.append(f"- {fname}: {t} بلیت")
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🎫 ۱ بلیت", callback_data=f"lot_{user_id}_1"),
@@ -2683,18 +2958,27 @@ async def lottery_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     cost = count * LOTTERY_TICKET_PRICE
-    db.get_user(user.id, chat_id, user.username, user.first_name)
+    _, _, buyer_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+    if buyer_perk == "بدبیار":
+        await query.answer("امروز پرک بدبیار 🚫 داری و نمی‌تونی بلیت لاتاری بخری!", show_alert=True)
+        return
     if not db.try_deduct_size(user.id, chat_id, cost):
         size, _, _ = db.get_user(user.id, chat_id, None, None)
         await query.answer(f"پول کافی نداری! {count} بلیت {cost} سانته، تو {int(size)} داری.", show_alert=True)
         return
+    # خرشانس buys odds, not size: the pot only ever grows by what was actually paid in,
+    # so the extra entries change who is likely to win without minting any prize money.
+    entries = count * 2 if buyer_perk == "خرشانس" else count
     try:
-        db.buy_lottery_tickets(chat_id, tehran_today_str(), user.id, user.first_name, count)
+        db.buy_lottery_tickets(chat_id, tehran_today_str(), user.id, user.first_name, entries)
     except Exception:
         db.update_size(user.id, chat_id, cost)
         raise
 
-    await query.answer(f"{count} بلیت خریدی! 🎟️")
+    if entries != count:
+        await query.answer(f"{count} بلیت خریدی و خرشانس 🎰 کردش {entries} تا! 🎟️", show_alert=True)
+    else:
+        await query.answer(f"{count} بلیت خریدی! 🎟️")
     text, keyboard = build_lottery_view(chat_id, user.id)
     try:
         await query.edit_message_text(text, reply_markup=keyboard)
@@ -2898,6 +3182,10 @@ async def _set_modifier_cmd(update, context, column, label):
     if not db.set_modifier(target_id, chat_id, column, value):
         await update.message.reply_text("این کاربر تو این گروه پیدا نشد. /luck رو چک کن.")
         return
+    # Pin it: a hand-set dial is a decision, and the nightly auto-handicap must not
+    # quietly walk it back a few hours later. Setting a dial back to exactly 1.0
+    # releases the pin and hands the player back to the automatic system.
+    db.set_dials_locked(target_id, chat_id, value != 1.0)
 
     info = db.get_user_info(target_id, chat_id)
     name = info[0] if info else str(target_id)
@@ -2941,6 +3229,9 @@ if __name__ == '__main__':
 
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
+    # 00:20 Tehran: after midnight_tasks has settled the lottery, expired bosses and
+    # collected the crown's tax, so the handicap reads a closed, complete day.
+    app.job_queue.run_daily(auto_handicap_job, time=time(hour=0, minute=20, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(random_event_job, interval=RANDOM_EVENT_INTERVAL_SECONDS, first=300)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
     app.job_queue.run_once(recover_expired_consensus, when=7)
@@ -2976,6 +3267,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/luck\b'), luck_cmd))
     app.add_handler(MessageHandler(cmd(r'^/setluck\b'), setluck_cmd))
     app.add_handler(MessageHandler(cmd(r'^/setgrowth\b'), setgrowth_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/balance\b'), balance_cmd))
 
     app.add_handler(CallbackQueryHandler(accept_challenge_callback, pattern=r'^chal_'))
     app.add_handler(CallbackQueryHandler(rematch_callback, pattern=r'^rematch_'))

@@ -361,7 +361,7 @@ def group(chat_id):
   {% if lot_entries %}
   <div class="tablewrap"><table style="min-width:0">
     <tr><th>بازیکن</th><th>بلیت</th><th>شانس</th></tr>
-    {% for uid, fname, t in lot_entries %}
+    {% for uid, fname, t, paid in lot_entries %}
     <tr><td>{{ fname }}</td><td>{{ t }}</td>
         <td class="dim">{{ '%.0f'|format(t / lot_tickets * 100) }}٪</td></tr>
     {% endfor %}

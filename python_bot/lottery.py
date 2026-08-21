@@ -33,16 +33,18 @@ def draw(chat_id, draw_date):
         return None
 
     pool = []
-    for uid, fname, tickets in entries:
+    for uid, fname, tickets, _paid in entries:
         pool.extend([(uid, fname)] * tickets)
-    pot = len(pool) * TICKET_PRICE
+    # The pot is what was actually paid in, not the entry count: bonus entries (a
+    # perk, a golden ticket) buy odds, never prize money that nobody funded.
+    pot = sum(paid for _, _, _, paid in entries)
     prize = int(pot * (1 - BURN_RATIO))
     if not pool or prize <= 0:
         return None
 
     winner_id, winner_name = _rng.choice(pool)
     db.update_size(winner_id, chat_id, prize, note=f"لاتاری {draw_date}")
-    winner_tickets = sum(t for uid, _, t in entries if uid == winner_id)
+    winner_tickets = sum(t for uid, _, t, _p in entries if uid == winner_id)
 
     return {
         "chat_id": chat_id,
@@ -73,5 +75,6 @@ def pending_pot(chat_id, draw_date):
     """(total_tickets, prize_if_drawn_now) for a group's open pot — what the panel shows
     next to the draw button so it isn't a blind action."""
     entries = db.get_lottery_entries(chat_id, draw_date)
-    tickets = sum(t for _, _, t in entries)
-    return tickets, int(tickets * TICKET_PRICE * (1 - BURN_RATIO)), entries
+    tickets = sum(t for _, _, t, _p in entries)
+    pot = sum(p for _, _, _, p in entries)
+    return tickets, int(pot * (1 - BURN_RATIO)), entries

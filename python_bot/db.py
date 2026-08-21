@@ -105,6 +105,34 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS growth_mult DOUBLE PRECISION DEFAULT 1.0")
         c.execute("UPDATE users SET theft_luck = 1.0 WHERE theft_luck IS NULL")
         c.execute("UPDATE users SET growth_mult = 1.0 WHERE growth_mult IS NULL")
+        # Set when a human deliberately pins a player's dials with /setgrowth or
+        # /setluck. The nightly auto-handicap skips locked players entirely, so an
+        # owner's manual decision is never quietly undone a few hours later by the
+        # rebalancer - the two systems write the same two columns and this flag is
+        # what keeps them from fighting over them.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS dials_locked BOOLEAN DEFAULT FALSE")
+        c.execute("UPDATE users SET dials_locked = FALSE WHERE dials_locked IS NULL")
+        # A tiny key/value table for one-shot migrations. init_db runs on every single
+        # startup, so a backfill that must happen exactly once needs somewhere to
+        # record that it already did - without this, the lock migration below would
+        # re-fire on each restart and permanently freeze every dial the nightly
+        # handicap had legitimately moved.
+        c.execute('CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)')
+        c.execute("SELECT value FROM bot_meta WHERE key = 'dials_lock_migrated'")
+        if not c.fetchone():
+            # Any dial already off 1.0 when this ships was set by hand by an owner, so
+            # pin it: the auto-handicap must not quietly undo a deliberate decision on
+            # its very first night. They can be handed back to the automatic system
+            # with /setgrowth ... 1 (setting a dial to exactly 1.0 releases the pin).
+            c.execute("UPDATE users SET dials_locked = TRUE "
+                      "WHERE COALESCE(theft_luck, 1.0) <> 1.0 OR COALESCE(growth_mult, 1.0) <> 1.0")
+            c.execute("INSERT INTO bot_meta (key, value) VALUES ('dials_lock_migrated', '1') "
+                      "ON CONFLICT (key) DO NOTHING")
+        # Theft items are activated into their own slot rather than the challenge slot:
+        # one shared slot meant arming a glove silently disarmed your condom, and the
+        # two are used in completely different moments.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_theft_item TEXT DEFAULT ''")
+        c.execute("UPDATE users SET active_theft_item = '' WHERE active_theft_item IS NULL")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS chats (
@@ -231,6 +259,13 @@ def init_db():
                 PRIMARY KEY (chat_id, draw_date, user_id)
             )
         ''')
+        # `tickets` is entries (odds); `paid` is the size actually spent on them. They
+        # used to be the same thing, which meant any bonus entry - a perk, a golden
+        # ticket - silently inflated the prize as well as the odds, paying out money
+        # nobody put in. Keeping them apart lets a bonus change who wins without
+        # changing how much is won.
+        c.execute("ALTER TABLE lottery_tickets ADD COLUMN IF NOT EXISTS paid INTEGER")
+        c.execute("UPDATE lottery_tickets SET paid = tickets * 10 WHERE paid IS NULL")
 
         # Every movement of size, ever. Written from inside update_size/try_deduct_size
         # so coverage is complete by construction rather than depending on 50-odd call
@@ -248,6 +283,25 @@ def init_db():
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
+
+        # Every decision the nightly auto-handicap makes, so a player asking "why did my
+        # growth drop?" has an answer that can be looked up instead of guessed at.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS rebalance_log (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                user_id BIGINT,
+                run_date TEXT,
+                net_recent DOUBLE PRECISION,
+                group_median DOUBLE PRECISION,
+                growth_before DOUBLE PRECISION,
+                growth_after DOUBLE PRECISION,
+                luck_before DOUBLE PRECISION,
+                luck_after DOUBLE PRECISION,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS rebalance_log_chat_idx ON rebalance_log (chat_id, run_date)')
         c.execute("CREATE INDEX IF NOT EXISTS size_log_chat_user_idx ON size_log (chat_id, user_id, created_at DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_created_idx ON size_log (created_at DESC)")
 
@@ -684,6 +738,31 @@ def clear_user_active_item(user_id, chat_id):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute("UPDATE users SET active_item = '' WHERE user_id = %s AND chat_id = %s", (user_id, chat_id))
+
+
+def get_user_active_theft_item(user_id, chat_id):
+    """The item armed for the player's next /dozdi attempt, or '' if none."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(active_theft_item, %s) FROM users WHERE user_id = %s AND chat_id = %s',
+                  ('', user_id, chat_id))
+        row = c.fetchone()
+        return row[0] if row else ''
+
+
+def set_user_active_theft_item(user_id, chat_id, item_name):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET active_theft_item = %s WHERE user_id = %s AND chat_id = %s',
+                  (item_name, user_id, chat_id))
+
+
+def clear_user_active_theft_item(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET active_theft_item = %s WHERE user_id = %s AND chat_id = %s',
+                  ('', user_id, chat_id))
+
 
 
 def get_active_today_count(chat_id, today_str):
@@ -1195,15 +1274,22 @@ def expire_bosses():
 
 # ---------------------------------------------------------------- lottery
 
-def buy_lottery_tickets(chat_id, draw_date, user_id, first_name, tickets):
+def buy_lottery_tickets(chat_id, draw_date, user_id, first_name, tickets, paid=None):
+    """Adds `tickets` entries to a day's pot. `paid` is what the player actually spent;
+    it defaults to full price so existing callers keep their old meaning. A bonus entry
+    passes paid=0 - it buys odds, not prize money."""
+    if paid is None:
+        paid = tickets * 10
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'INSERT INTO lottery_tickets (chat_id, draw_date, user_id, first_name, tickets) '
-            'VALUES (%s, %s, %s, %s, %s) '
+            'INSERT INTO lottery_tickets (chat_id, draw_date, user_id, first_name, tickets, paid) '
+            'VALUES (%s, %s, %s, %s, %s, %s) '
             'ON CONFLICT (chat_id, draw_date, user_id) DO UPDATE SET '
-            'tickets = lottery_tickets.tickets + EXCLUDED.tickets, first_name = EXCLUDED.first_name',
-            (chat_id, draw_date, user_id, first_name, tickets)
+            'tickets = lottery_tickets.tickets + EXCLUDED.tickets, '
+            'paid = COALESCE(lottery_tickets.paid, 0) + EXCLUDED.paid, '
+            'first_name = EXCLUDED.first_name',
+            (chat_id, draw_date, user_id, first_name, tickets, paid)
         )
 
 
@@ -1211,7 +1297,7 @@ def get_lottery_entries(chat_id, draw_date):
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'SELECT user_id, first_name, tickets FROM lottery_tickets '
+            'SELECT user_id, first_name, tickets, COALESCE(paid, tickets * 10) FROM lottery_tickets '
             'WHERE chat_id = %s AND draw_date = %s AND tickets > 0 ORDER BY user_id',
             (chat_id, draw_date)
         )
@@ -1225,7 +1311,7 @@ def claim_lottery_draw(chat_id, draw_date):
         c = conn.cursor()
         c.execute(
             'DELETE FROM lottery_tickets WHERE chat_id = %s AND draw_date = %s AND tickets > 0 '
-            'RETURNING user_id, first_name, tickets',
+            'RETURNING user_id, first_name, tickets, COALESCE(paid, tickets * 10)',
             (chat_id, draw_date)
         )
         return sorted(c.fetchall(), key=lambda r: r[0])
@@ -1328,6 +1414,74 @@ def get_group_modifiers(chat_id):
             (chat_id,)
         )
         return c.fetchall()
+
+
+def is_dials_locked(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(dials_locked, FALSE) FROM users WHERE user_id = %s AND chat_id = %s',
+                  (user_id, chat_id))
+        row = c.fetchone()
+        return bool(row[0]) if row else False
+
+
+def set_dials_locked(user_id, chat_id, locked):
+    """Pins (or unpins) a player's dials against the nightly auto-handicap."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET dials_locked = %s WHERE user_id = %s AND chat_id = %s',
+                  (bool(locked), user_id, chat_id))
+        return c.rowcount > 0
+
+
+def get_recent_net_by_user(chat_id, days):
+    """(user_id, first_name, net_delta, events) per player over the last `days` days of
+    the ledger - the input the nightly auto-handicap reads the group's shape from.
+
+    Deliberately ledger-derived rather than size-derived: what matters for a handicap is
+    how much a player *gained recently*, not how big they happen to be. Someone sitting
+    on a big balance they earned a week ago is not the one running away with the game.
+    Only players who actually did something in the window appear here."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT l.user_id, MAX(COALESCE(u.first_name, %s)), SUM(l.delta), COUNT(*) '
+            'FROM size_log l LEFT JOIN users u '
+            '  ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
+            'WHERE l.chat_id = %s AND l.created_at >= NOW() - (%s || %s)::interval '
+            'GROUP BY l.user_id',
+            ('', chat_id, days, ' days')
+        )
+        return c.fetchall()
+
+
+def record_rebalance(chat_id, user_id, run_date, net_recent, group_median,
+                     growth_before, growth_after, luck_before, luck_after):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO rebalance_log (chat_id, user_id, run_date, net_recent, group_median, '
+            'growth_before, growth_after, luck_before, luck_after) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)',
+            (chat_id, user_id, run_date, net_recent, group_median,
+             growth_before, growth_after, luck_before, luck_after)
+        )
+
+
+def get_last_rebalance(chat_id, limit=25):
+    """Newest auto-handicap decisions for a group, names joined on for display."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT r.run_date, COALESCE(u.first_name, %s), r.net_recent, r.group_median, '
+            'r.growth_before, r.growth_after, r.luck_before, r.luck_after '
+            'FROM rebalance_log r LEFT JOIN users u '
+            '  ON u.user_id = r.user_id AND u.chat_id = r.chat_id '
+            'WHERE r.chat_id = %s ORDER BY r.id DESC LIMIT %s',
+            ('', chat_id, limit)
+        )
+        return c.fetchall()
+
 
 
 # ---------------------------------------------------------------- audit ledger
