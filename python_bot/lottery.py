@@ -11,7 +11,9 @@ import random
 import db
 
 TICKET_PRICE = 10
-# Burned rather than paid out, so the lottery is a size sink and not just a shuffle.
+# Held back from the prize rather than paid out, so the lottery is a size sink and not
+# just a shuffle. The rake is swept into the group's bank treasury, where it funds
+# deposit interest instead of being deleted outright.
 BURN_RATIO = 0.10
 
 # SystemRandom for the same reason the dice use it: the draw decides real payouts, so
@@ -44,6 +46,9 @@ def draw(chat_id, draw_date):
 
     winner_id, winner_name = _rng.choice(pool)
     db.update_size(winner_id, chat_id, prize, note=f"لاتاری {draw_date}")
+    rake = pot - prize
+    if rake > 0:
+        db.treasury_add(chat_id, rake, note=f"کارمزد لاتاری {draw_date}")
     winner_tickets = sum(t for uid, _, t, _p in entries if uid == winner_id)
 
     return {

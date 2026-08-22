@@ -129,6 +129,10 @@ BOT_COMMANDS = [
     ("khianat", "🗡️ (همسر پادشاه) خیانت — /khianat @user"),
     ("talagh", "💔 (پادشاه) طلاق همسر"),
     ("lottery", "🎟️ لاتاری روزانه"),
+    ("bank", "🏦 بانک — سود روزانه و حساب امن"),
+    ("variz", "📥 واریز به بانک — /variz 50"),
+    ("bardasht", "🏧 برداشت از بانک — /bardasht 50"),
+    ("sarghat", "🚨 سرقت از بانک گروه!"),
     ("ach", "🏅 نشان‌ها و استریک من"),
     ("wr", "📊 آمار برد و باخت"),
     ("help", "❓ راهنمای کامل بازی"),
@@ -455,16 +459,21 @@ def claim_dose_slot(item_name, target_id, target_name, chat_id):
 
 
 def apply_direct_item(item_name, target_user_id, target_name, chat_id):
-    """Applies a direct item's effect to a target and returns the result message."""
+    """Applies a direct item's effect to a target and returns the result message.
+
+    Size these items take off a target is destroyed rather than transferred, so it goes
+    into the treasury and comes back to the group later as bank interest."""
     if item_name == "ویاگرا":
         db.update_size(target_user_id, chat_id, 40)
         return f"شما با ویاگرا ۴۰ سانت به {target_name} اضافه کردید!"
     elif item_name == "قرص اورژانسی":
         db.update_size(target_user_id, chat_id, -40)
+        db.treasury_add(chat_id, 40, note="قرص اورژانسی")
         return f"شما با قرص اورژانسی ۴۰ سانت از {target_name} کم کردید!"
     elif item_name == "زعفرون":
         loss = random.randint(50, 150)
         db.update_size(target_user_id, chat_id, -loss)
+        db.treasury_add(chat_id, loss, note="زعفرون")
         return f"شما با زعفرون {loss} سانت از {target_name} کم کردید!"
     return "آیتم نامشخص."
 
@@ -574,6 +583,10 @@ HELP_TEXT = (
     "💔 /talagh — پادشاه همسرش رو طلاق می‌ده\n\n"
     "**اقتصاد و سرگرمی**\n"
     "🏪 /shop — خرید آیتم با سانت\n"
+    "🏦 /bank — بانک: سود روزانه، امن از دزدی\n"
+    "📥 /variz <مقدار> — واریز به بانک (سقف روزانه داره)\n"
+    "🏧 /bardasht <مقدار> — برداشت از بانک\n"
+    "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
     "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
     "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
@@ -1076,6 +1089,9 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
     if yes_count >= required_votes:
         if db.resolve_consensus_success(vote_id, chat_id, target_id, target_name):
             db.update_size(target_id, chat_id, -amount)
+            # Shrinking someone by group vote destroys the size; it now lands in the
+            # treasury so the group's collective spite pays everyone's interest.
+            db.treasury_add(chat_id, amount, note="اجماع")
             new_size, _, _ = db.get_user(target_id, chat_id, None, None)
             await query.answer("اجماع موفق شد!")
             msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
@@ -2183,6 +2199,34 @@ LOTTERY_BURN_RATIO = lottery.BURN_RATIO
 RANDOM_EVENT_INTERVAL_SECONDS = 3 * 3600
 RANDOM_EVENT_CHANCE = 0.18
 
+# ---------------------------------------------------------------- bank
+# The bank buys safety, not size. Deposits sit outside users.size, so they are invisible
+# to /dozdi, to the leaderboard and to the crown - hiding your size from thieves costs
+# you your place on the table, and that trade is the entire design.
+#
+# Interest is paid strictly out of the group's treasury, which is filled only by real
+# sinks (shop purchases, the lottery rake, /ejma, shrink items, earthquakes). An empty
+# treasury simply pays nothing. The bank can never invent size.
+BANK_INTEREST_RATE = 0.04          # 4% a day on your balance, if the vault can afford it
+BANK_INTEREST_MAX_TREASURY_SHARE = 0.25  # never drain more than a quarter of the vault in one night
+# You cannot shovel a whole balance in at once: a day's deposits are capped at a share
+# of your wallet, with a floor so small players can still use the bank at all. This is
+# what keeps size in circulation - and keeps /dozdi worth typing.
+BANK_DAILY_DEPOSIT_RATIO = 0.30
+BANK_DAILY_DEPOSIT_FLOOR = 25
+BANK_MIN_DEPOSIT = 5
+
+# A heist is the counterweight to all that safety. It is rare, it is group-wide, and it
+# can fail expensively - but it reaches the deposits themselves, so no vault is ever a
+# guaranteed hiding place.
+HEIST_COOLDOWN_SECONDS = 20 * 3600
+HEIST_MIN_VAULT = 60               # not worth cracking an empty vault
+HEIST_BASE_CHANCE = 0.30
+HEIST_TREASURY_RATIO = 0.50        # of the treasury on success
+HEIST_DEPOSIT_RATIO = 0.15         # of every other depositor's balance on success
+HEIST_FINE_RATIO = 0.25            # of the would-be loot, paid by a caught thief
+HEIST_JAIL_HOURS = 12              # a caught thief also loses their next theft window
+
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
     'streak_7': ('🔥', 'هفتهٔ کامل', '۷ روز پشت سر هم دودولش رو مالید'),
@@ -2683,6 +2727,269 @@ async def auto_handicap_job(context: ContextTypes.DEFAULT_TYPE):
             logging.exception(f"auto-handicap failed for {chat_id}")
 
 
+# ---------------------------------------------------------------- bank commands
+
+def _bank_daily_cap(wallet_size):
+    """A day's deposit allowance: a share of what you're holding, never below the floor
+    (so someone with 12 sanet can still open an account) and never more than you have."""
+    return max(BANK_DAILY_DEPOSIT_FLOOR, int(wallet_size * BANK_DAILY_DEPOSIT_RATIO))
+
+
+def _parse_amount(parts, wallet_size, bank_balance, mode):
+    """Reads the amount argument. Accepts a plain number or 'همه' / 'all' / 'max',
+    which resolves against whichever balance the command is moving size out of."""
+    if len(parts) < 2:
+        return None
+    raw = parts[1].strip()
+    if raw in ('همه', 'all', 'max', 'هرچی'):
+        return int(wallet_size if mode == 'deposit' else bank_balance)
+    try:
+        val = int(float(raw))
+    except ValueError:
+        return None
+    return val if val > 0 else None
+
+
+async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/bank` - your account, the group vault, and what today's interest looked like."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("بانک فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    balance, dep_date, dep_today = db.get_bank(user.id, chat_id)
+    if dep_date != tehran_today_str():
+        dep_today = 0.0
+    treasury, _, _ = db.get_treasury(chat_id)
+    total_dep, holders = db.get_bank_totals(chat_id)
+    cap = _bank_daily_cap(wallet)
+    remaining = max(0, cap - int(dep_today))
+
+    msg = (
+        f"🏦 **بانک دودول**\n\n"
+        f"👤 حساب {user.first_name}\n"
+        f"   💼 جیب (قابل دزدیدن): {int(wallet)} سانت\n"
+        f"   🔒 بانک (امن از دزدی): {int(balance)} سانت\n"
+        f"   📥 سقف واریز امروز: {remaining} از {cap} سانت\n\n"
+        f"🏛 صندوق گروه\n"
+        f"   💰 خزانه: {int(treasury)} سانت\n"
+        f"   🧾 کل سپرده‌ها: {int(total_dep)} سانت از {holders} نفر\n\n"
+        f"📈 سود روزانه: {int(BANK_INTEREST_RATE*100)}٪ — ولی فقط تا جایی که خزانه بکشه.\n"
+        f"⚠️ سایزِ بانک تو لیدربرد و تاج حساب نمی‌شه.\n"
+        f"🥷 خزانه و سپرده‌ها با /sarghat قابل سرقتن!\n\n"
+        f"دستورها: /variz <مقدار> • /bardasht <مقدار> • /sarghat"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/variz <amount>` - move size from the wallet into the bank, up to today's cap."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("بانک فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    balance, dep_date, dep_today = db.get_bank(user.id, chat_id)
+    if dep_date != tehran_today_str():
+        dep_today = 0.0
+    cap = _bank_daily_cap(wallet)
+    remaining = max(0, cap - int(dep_today))
+
+    amount = _parse_amount(update.message.text.split(), wallet, balance, 'deposit')
+    if amount is None:
+        await update.message.reply_text(
+            f"چقدر می‌خوای بریزی تو بانک؟\n/variz 50\n\n"
+            f"💼 جیبت: {int(wallet)} سانت\n📥 امروز تا {remaining} سانت می‌تونی بریزی."
+        )
+        return
+    if amount < BANK_MIN_DEPOSIT:
+        await update.message.reply_text(f"حداقل واریز {BANK_MIN_DEPOSIT} سانته.")
+        return
+    # Clamp to the allowance instead of rejecting, so "/variz همه" does the sensible thing.
+    if amount > remaining:
+        amount = remaining
+    if amount < BANK_MIN_DEPOSIT:
+        await update.message.reply_text(
+            f"سقف واریز امروزت پر شده! 📥\nفردا دوباره تا {cap} سانت می‌تونی بریزی.\n"
+            f"(یه‌جا نمی‌شه همه‌چیو ریخت تو بانک — بخشیش باید تو جیبت بمونه.)"
+        )
+        return
+
+    ok, res, used = db.bank_deposit(user.id, chat_id, amount, tehran_today_str(), cap)
+    if not ok:
+        if res == 'cap':
+            await update.message.reply_text(f"سقف واریز امروزت پر شده! فردا دوباره تا {cap} سانت.")
+        else:
+            await update.message.reply_text(f"جیبت این‌قدر سانت نداره! 💼 {int(wallet)} سانت داری.")
+        return
+    wallet_now, _, _ = db.get_user(user.id, chat_id, None, None)
+    await update.message.reply_text(
+        f"🏦 {int(amount)} سانت ریختی تو بانک.\n\n"
+        f"🔒 موجودی بانک: {int(res)} سانت\n💼 جیب: {int(wallet_now)} سانت\n"
+        f"📥 سقف باقی‌مونده امروز: {max(0, cap - int(used))} سانت\n\n"
+        f"از دزدی امنه، ولی تو لیدربرد حساب نمی‌شه."
+    )
+
+
+async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/bardasht <amount>` - pull size back out of the bank into the wallet."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("بانک فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    balance, _, _ = db.get_bank(user.id, chat_id)
+
+    amount = _parse_amount(update.message.text.split(), wallet, balance, 'withdraw')
+    if amount is None:
+        await update.message.reply_text(
+            f"چقدر برداریم؟\n/bardasht 50  یا  /bardasht همه\n\n🔒 موجودی بانکت: {int(balance)} سانت"
+        )
+        return
+    if balance <= 0:
+        await update.message.reply_text("چیزی تو بانک نداری! 🏦")
+        return
+    if amount > balance:
+        amount = int(balance)
+
+    ok, new_balance = db.bank_withdraw(user.id, chat_id, amount)
+    if not ok:
+        await update.message.reply_text("موجودی بانکت کافی نیست!")
+        return
+    wallet_now, _, _ = db.get_user(user.id, chat_id, None, None)
+    await update.message.reply_text(
+        f"🏧 {int(amount)} سانت از بانک برداشتی.\n\n"
+        f"🔒 بانک: {int(new_balance)} سانت\n💼 جیب: {int(wallet_now)} سانت\n\n"
+        f"حالا دوباره تو لیدربرد حساب می‌شه — ولی قابل دزدیدن هم هست!"
+    )
+
+
+async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/sarghat` - try to crack the group vault. Hits the treasury AND everyone's
+    deposits, which is what stops the bank being a risk-free hiding place.
+
+    Deliberately hostile: one attempt per group per cooldown (not per player), a real
+    chance of failure, and a fine for getting caught. Strictly zero-sum either way."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("سرقت از بانک فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+    # Same gate as /dozdi: you have to actually be playing today to move other people's size.
+    if thief_last_grown != tehran_today_str():
+        await update.message.reply_text("اول امروز /d بزن بعد برو سراغ بانک! 🥷")
+        return
+
+    treasury, _, _ = db.get_treasury(chat_id)
+    total_dep, holders = db.get_bank_totals(chat_id)
+    # What's actually stealable: the treasury plus everyone else's deposits.
+    others = max(0.0, total_dep - db.get_bank(user.id, chat_id)[0])
+    vault = treasury + others
+    if vault < HEIST_MIN_VAULT:
+        await update.message.reply_text(
+            f"🏦 صندوق تقریباً خالیه ({int(vault)} سانت) — ارزش سرقت نداره.\n"
+            f"(حداقل {HEIST_MIN_VAULT} سانت باید توش باشه)"
+        )
+        return
+
+    ok, remaining = db.try_start_heist(chat_id, HEIST_COOLDOWN_SECONDS)
+    if not ok:
+        hours, minutes = remaining // 3600, (remaining % 3600) // 60
+        await update.message.reply_text(
+            f"🚨 بانک هنوز تو حالت آماده‌باشه!\nتا {hours} ساعت و {minutes} دقیقهٔ دیگه کسی نمی‌تونه بزنه بهش."
+        )
+        return
+
+    # Robbing a fat vault is harder - the more there is to protect, the better guarded
+    # it is. Luck dials and the lucky perk apply, same as ordinary theft.
+    chance = HEIST_BASE_CHANCE
+    if thief_perk == "کص‌شانس":
+        chance += THEFT_LUCKY_PERK_BONUS
+    theft_luck, _ = db.get_modifiers(user.id, chat_id)
+    if theft_luck != 1.0:
+        chance *= theft_luck
+    chance = min(max(chance, 0.05), 0.70)
+
+    would_be = vault * (HEIST_TREASURY_RATIO if treasury else HEIST_DEPOSIT_RATIO)
+
+    if random.random() < chance:
+        total, treasury_part, victims = db.heist_take(
+            chat_id, user.id, HEIST_TREASURY_RATIO, HEIST_DEPOSIT_RATIO
+        )
+        if total <= 0:
+            await update.message.reply_text("🏦 صندوق خالی بود! دست خالی برگشتی.")
+            return
+        lines = [
+            f"🚨💰 **سرقت از بانک!**\n",
+            f"{user.first_name} زد به صندوق گروه و **{int(total)} سانت** بالا کشید!\n",
+            f"🏛 از خزانه: {int(treasury_part)} سانت",
+        ]
+        if victims:
+            lines.append(f"🧾 از سپردهٔ {len(victims)} نفر:")
+            for _uid, name, amount in victims[:8]:
+                lines.append(f"   • {_esc(name)}: −{int(amount)} سانت")
+            if len(victims) > 8:
+                lines.append(f"   • و {len(victims) - 8} نفر دیگه")
+        lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 3600} ساعت دیگه بانک آماده‌باشه‌ست)")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await announce_achievements(context, chat_id, user.first_name,
+                                    award(user.id, chat_id, 'thief'))
+    else:
+        # Caught. The fine is a transfer into the treasury, not a deletion, so a failed
+        # heist actually makes the next payday slightly better for the depositors.
+        fine = max(1, int(would_be * HEIST_FINE_RATIO))
+        if db.try_deduct_size(user.id, chat_id, fine):
+            db.treasury_add(chat_id, fine, note="جریمهٔ سرقت ناموفق")
+            await update.message.reply_text(
+                f"🚔 **دزدگیر بانک زد!**\n\n"
+                f"{user.first_name} سر بزنگاه گیر افتاد و **{int(fine)} سانت** جریمه شد.\n"
+                f"جریمه رفت تو خزانه — یعنی سود سپرده‌گذارها بیشتر شد. 😎",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"🚔 دزدگیر بانک زد و {user.first_name} گیر افتاد!\n"
+                f"(اون‌قدر فقیر بود که حتی جریمه هم نتونست بده 💀)"
+            )
+
+
+async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
+    """Nightly: pay each group's depositors out of that group's treasury, and nothing
+    more. Claimed once per day per group so a restart can never pay twice."""
+    today_str = tehran_today_str()
+    for chat_id in db.get_all_chats():
+        try:
+            if not db.claim_interest_run(chat_id, today_str):
+                continue
+            rows, paid, left = db.pay_interest(
+                chat_id, BANK_INTEREST_RATE, BANK_INTEREST_MAX_TREASURY_SHARE
+            )
+            if rows <= 0 or paid <= 0:
+                continue
+            total_dep, _ = db.get_bank_totals(chat_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(f"🏦 **سود روزانهٔ بانک**\n\n"
+                      f"به {rows} سپرده‌گذار در مجموع {int(paid)} سانت سود داده شد.\n"
+                      f"🧾 کل سپرده‌ها: {int(total_dep)} سانت\n"
+                      f"💰 باقی‌ماندهٔ خزانه: {int(left)} سانت\n\n"
+                      f"با /bank حسابت رو ببین."),
+                parse_mode="Markdown"
+            )
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception:
+            logging.exception(f"bank interest failed for {chat_id}")
+
+
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner-only: what the auto-handicap last did in a group, and why."""
     if not _owner_only(update):
@@ -2759,6 +3066,9 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         db.update_size(user.id, chat_id, price)
         raise
+    # The price used to simply vanish. It funds the bank's interest now - that is what
+    # lets the bank pay a yield without minting a single centimetre of new size.
+    db.treasury_add(chat_id, price, note=f"خرید {item_name}")
 
     size, _, _ = db.get_user(user.id, chat_id, None, None)
     await query.answer(f"{item_name} خریدی! 🛍️\nموجودی جدید: {int(size)} سانت", show_alert=True)
@@ -3018,10 +3328,13 @@ async def random_event_job(context: ContextTypes.DEFAULT_TYPE):
             event = random.choice(['earthquake', 'viagra_rain', 'storm', 'treasure', 'blessing'])
 
             if event == 'earthquake':
+                rubble = 0
                 for uid, _n, size in players:
                     cut = max(1, int((size or 0) * 0.08))
-                    if (size or 0) > 0:
-                        db.try_deduct_size(uid, chat_id, cut)
+                    if (size or 0) > 0 and db.try_deduct_size(uid, chat_id, cut):
+                        rubble += cut
+                # What the earthquake swallows is added to the vault rather than deleted.
+                db.treasury_add(chat_id, rubble, note="زلزله")
                 text = "🌍 زلزله!\nزمین لرزید و ۸٪ از سایز همه ریخت پایین."
             elif event == 'viagra_rain':
                 for uid, _n, _s in players:
@@ -3231,6 +3544,7 @@ if __name__ == '__main__':
     app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
     # 00:20 Tehran: after midnight_tasks has settled the lottery, expired bosses and
     # collected the crown's tax, so the handicap reads a closed, complete day.
+    app.job_queue.run_daily(bank_interest_job, time=time(hour=0, minute=10, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(auto_handicap_job, time=time(hour=0, minute=20, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(random_event_job, interval=RANDOM_EVENT_INTERVAL_SECONDS, first=300)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
@@ -3260,6 +3574,10 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(dozdi|steal)\b'), steal_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(shop|forushgah)\b'), shop_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(lottery|lotari)\b'), lottery_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(bank|banak)\b'), bank_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(variz|deposit)\b'), deposit_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(bardasht|withdraw)\b'), withdraw_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(sarghat|heist)\b'), heist_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).

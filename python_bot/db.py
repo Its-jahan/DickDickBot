@@ -302,6 +302,46 @@ def init_db():
             )
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS rebalance_log_chat_idx ON rebalance_log (chat_id, run_date)')
+
+        # ---------------------------------------------------------------- bank
+        # Banked size lives OUTSIDE users.size on purpose. The leaderboard, the crown
+        # and /dozdi all read users.size, so parking size here really does buy safety
+        # from theft at the cost of dropping down the table - that trade is the whole
+        # point of the feature, and it only works if the two balances stay separate.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS bank_accounts (
+                user_id BIGINT,
+                chat_id BIGINT,
+                balance DOUBLE PRECISION DEFAULT 0,
+                deposit_date TEXT DEFAULT '',
+                deposited_today DOUBLE PRECISION DEFAULT 0,
+                opened_at TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (user_id, chat_id)
+            )
+        ''')
+        # One treasury per group. Interest is paid strictly out of this, so the bank can
+        # never mint size: what the sinks put in is the ceiling on what interest pays out.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS bank_treasury (
+                chat_id BIGINT PRIMARY KEY,
+                balance DOUBLE PRECISION DEFAULT 0,
+                last_interest_date TEXT DEFAULT '',
+                last_heist_at TIMESTAMPTZ
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS bank_log (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                user_id BIGINT,
+                kind TEXT,
+                amount DOUBLE PRECISION,
+                balance_after DOUBLE PRECISION,
+                note TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS bank_log_chat_idx ON bank_log (chat_id, created_at DESC)')
         c.execute("CREATE INDEX IF NOT EXISTS size_log_chat_user_idx ON size_log (chat_id, user_id, created_at DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_created_idx ON size_log (created_at DESC)")
 
@@ -1441,7 +1481,13 @@ def get_recent_net_by_user(chat_id, days):
     Deliberately ledger-derived rather than size-derived: what matters for a handicap is
     how much a player *gained recently*, not how big they happen to be. Someone sitting
     on a big balance they earned a week ago is not the one running away with the game.
-    Only players who actually did something in the window appear here."""
+    Only players who actually did something in the window appear here.
+
+    Bank transfers are excluded. A deposit leaves the wallet and so lands in the ledger
+    as a large negative delta, which would read here as "this player is losing badly"
+    and hand them a growth bonus - making a deposit/withdraw round trip the cheapest
+    handicap exploit in the game. Moving size between your own two pockets is not a
+    gain or a loss, so neither leg counts."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
@@ -1449,8 +1495,9 @@ def get_recent_net_by_user(chat_id, days):
             'FROM size_log l LEFT JOIN users u '
             '  ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
             'WHERE l.chat_id = %s AND l.created_at >= NOW() - (%s || %s)::interval '
+            '  AND COALESCE(l.source, %s) NOT IN (%s, %s) '
             'GROUP BY l.user_id',
-            ('', chat_id, days, ' days')
+            ('', chat_id, days, ' days', '', 'bank_deposit', 'bank_withdraw')
         )
         return c.fetchall()
 
@@ -1659,3 +1706,294 @@ for _name, _obj in list(globals().items()):
     if (isinstance(_obj, types.FunctionType) and _obj.__module__ == __name__
             and not _name.startswith('_') and _name not in ('get_connection', 'init_db')):
         globals()[_name] = _retry_transient(_obj)
+
+
+# ---------------------------------------------------------------- bank
+# Two rules hold this feature together and every function below is written to keep
+# them true:
+#   1. Banked size is not wallet size. It lives in bank_accounts, so the leaderboard,
+#      the crown and /dozdi (all of which read users.size) simply never see it.
+#   2. The bank cannot mint. Interest is paid only out of bank_treasury, which is
+#      filled by real sinks (shop, burnt lottery rake, lost spectator bets, /ejma).
+#      When the treasury is empty, interest is zero. There is no other path in.
+
+def get_bank(user_id, chat_id):
+    """(balance, deposit_date, deposited_today), creating the account row on first look."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO bank_accounts (user_id, chat_id) VALUES (%s, %s) '
+                  'ON CONFLICT (user_id, chat_id) DO NOTHING', (user_id, chat_id))
+        c.execute('SELECT COALESCE(balance,0), COALESCE(deposit_date,%s), COALESCE(deposited_today,0) '
+                  'FROM bank_accounts WHERE user_id = %s AND chat_id = %s',
+                  ('', user_id, chat_id))
+        return c.fetchone() or (0.0, '', 0.0)
+
+
+def _bank_log(c, chat_id, user_id, kind, amount, balance_after, note=None):
+    c.execute('INSERT INTO bank_log (chat_id, user_id, kind, amount, balance_after, note) '
+              'VALUES (%s, %s, %s, %s, %s, %s)',
+              (chat_id, user_id, kind, amount, balance_after, note))
+
+
+def bank_deposit(user_id, chat_id, amount, today_str, daily_cap):
+    """Moves `amount` from wallet into the bank in ONE transaction.
+
+    Returns (True, new_balance, deposited_today) or (False, reason, remaining_cap).
+    The wallet deduction, the cap accounting and the bank credit all happen together:
+    a crash between them would otherwise either eat the size or duplicate it. The
+    daily cap counts *gross* deposits, so deposit->withdraw->deposit cannot be used to
+    refill it and sneak a whole balance in behind one day's allowance."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO bank_accounts (user_id, chat_id) VALUES (%s, %s) '
+                  'ON CONFLICT (user_id, chat_id) DO NOTHING', (user_id, chat_id))
+        # Roll the per-day allowance over first, so a stale date can't block today.
+        c.execute('UPDATE bank_accounts SET deposit_date = %s, deposited_today = 0 '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(deposit_date,%s) <> %s',
+                  (today_str, user_id, chat_id, '', today_str))
+        c.execute('SELECT COALESCE(deposited_today,0) FROM bank_accounts '
+                  'WHERE user_id = %s AND chat_id = %s FOR UPDATE', (user_id, chat_id))
+        row = c.fetchone()
+        used = float(row[0]) if row else 0.0
+        remaining = daily_cap - used
+        if remaining <= 0:
+            return (False, 'cap', 0.0)
+        if amount > remaining:
+            return (False, 'cap', remaining)
+
+        # Atomic check-and-take on the wallet, same pattern as try_deduct_size.
+        c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(size,0) >= %s RETURNING size',
+                  (amount, user_id, chat_id, amount))
+        wrow = c.fetchone()
+        if wrow is None:
+            return (False, 'funds', remaining)
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (chat_id, user_id, -amount, wrow[0], 'bank_deposit', None))
+
+        c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) + %s, '
+                  'deposited_today = COALESCE(deposited_today,0) + %s '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING balance, deposited_today',
+                  (amount, amount, user_id, chat_id))
+        brow = c.fetchone()
+        _bank_log(c, chat_id, user_id, 'deposit', amount, brow[0])
+        return (True, float(brow[0]), float(brow[1]))
+
+
+def bank_withdraw(user_id, chat_id, amount):
+    """Moves `amount` from the bank back into the wallet, atomically. Returns
+    (True, new_bank_balance) or (False, None) if the account is short."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(balance,0) >= %s '
+                  'RETURNING balance', (amount, user_id, chat_id, amount))
+        brow = c.fetchone()
+        if brow is None:
+            return (False, None)
+        c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                  (amount, user_id, chat_id))
+        wrow = c.fetchone()
+        if wrow is None:
+            # No wallet row to receive it - undo rather than vanish the size.
+            raise RuntimeError('no users row to withdraw into')
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (chat_id, user_id, amount, wrow[0], 'bank_withdraw', None))
+        _bank_log(c, chat_id, user_id, 'withdraw', -amount, brow[0])
+        return (True, float(brow[0]))
+
+
+def treasury_add(chat_id, amount, note=None):
+    """The only way size enters the treasury: a sink hands over what it just destroyed.
+    Called from the spots that used to simply delete size."""
+    if amount <= 0:
+        return
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET balance = COALESCE(bank_treasury.balance,0) + %s '
+                  'RETURNING balance', (chat_id, amount, amount))
+        row = c.fetchone()
+        _bank_log(c, chat_id, None, 'treasury_in', amount, row[0], note)
+
+
+def get_treasury(chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(balance,0), COALESCE(last_interest_date,%s), last_heist_at '
+                  'FROM bank_treasury WHERE chat_id = %s', ('', chat_id))
+        return c.fetchone() or (0.0, '', None)
+
+
+def get_bank_totals(chat_id):
+    """(total_deposits, depositor_count) for a group - what a heist is sizing up."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(SUM(balance),0), COUNT(*) FROM bank_accounts '
+                  'WHERE chat_id = %s AND COALESCE(balance,0) > 0', (chat_id,))
+        return c.fetchone() or (0.0, 0)
+
+
+def get_bank_holders(chat_id):
+    """(user_id, first_name, balance) for everyone with size in the bank, biggest first."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT b.user_id, COALESCE(u.first_name, %s), COALESCE(b.balance,0) '
+                  'FROM bank_accounts b LEFT JOIN users u '
+                  '  ON u.user_id = b.user_id AND u.chat_id = b.chat_id '
+                  'WHERE b.chat_id = %s AND COALESCE(b.balance,0) > 0 '
+                  'ORDER BY b.balance DESC', ('?', chat_id))
+        return c.fetchall()
+
+
+def claim_interest_run(chat_id, today_str):
+    """Atomically claims the right to pay interest for `today_str` in this group.
+    Returns True for exactly one caller per day, so a restart can't pay twice."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO bank_treasury (chat_id, last_interest_date) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET last_interest_date = %s '
+                  'WHERE COALESCE(bank_treasury.last_interest_date, %s) <> %s '
+                  'RETURNING chat_id', (chat_id, today_str, today_str, '', today_str))
+        return c.fetchone() is not None
+
+
+def pay_interest(chat_id, rate, max_share):
+    """Pays one day's interest out of the treasury and returns
+    (rows_paid, total_paid, treasury_left).
+
+    The treasury is the hard ceiling. If what everyone is owed exceeds what the
+    treasury can afford (capped further by `max_share` of it, so one day never drains
+    the whole thing), every depositor is scaled down by the same factor rather than
+    the early rows being paid in full and the late ones getting nothing."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE', (chat_id,))
+        row = c.fetchone()
+        treasury = float(row[0]) if row else 0.0
+        if treasury <= 0:
+            return (0, 0.0, treasury)
+
+        c.execute('SELECT user_id, COALESCE(balance,0) FROM bank_accounts '
+                  'WHERE chat_id = %s AND COALESCE(balance,0) > 0', (chat_id,))
+        holders = c.fetchall()
+        if not holders:
+            return (0, 0.0, treasury)
+
+        owed = {uid: bal * rate for uid, bal in holders}
+        want = sum(owed.values())
+        budget = min(treasury * max_share, treasury)
+        if want <= 0:
+            return (0, 0.0, treasury)
+        factor = min(1.0, budget / want)
+
+        paid_total = 0.0
+        paid_rows = 0
+        for uid, amount in owed.items():
+            pay = round(amount * factor, 2)
+            if pay <= 0:
+                continue
+            c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) + %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING balance', (pay, uid, chat_id))
+            brow = c.fetchone()
+            if brow is None:
+                continue
+            _bank_log(c, chat_id, uid, 'interest', pay, brow[0])
+            paid_total += pay
+            paid_rows += 1
+
+        if paid_total > 0:
+            c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
+                      'WHERE chat_id = %s RETURNING balance', (paid_total, chat_id))
+            trow = c.fetchone()
+            _bank_log(c, chat_id, None, 'interest_out', -paid_total, trow[0])
+            treasury = float(trow[0])
+        return (paid_rows, paid_total, treasury)
+
+
+def try_start_heist(chat_id, cooldown_seconds):
+    """Group-wide heist cooldown, claimed atomically so two simultaneous attempts
+    can't both rob the same vault. Returns (True, 0) or (False, seconds_remaining)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO bank_treasury (chat_id, last_heist_at) VALUES (%s, NOW()) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET last_heist_at = NOW() '
+                  'WHERE bank_treasury.last_heist_at IS NULL '
+                  '   OR bank_treasury.last_heist_at < NOW() - (%s || %s)::interval '
+                  'RETURNING last_heist_at', (chat_id, cooldown_seconds, ' seconds'))
+        if c.fetchone() is not None:
+            return (True, 0)
+        c.execute('SELECT CEIL(EXTRACT(EPOCH FROM (last_heist_at + (%s || %s)::interval - NOW()))) '
+                  'FROM bank_treasury WHERE chat_id = %s', (cooldown_seconds, ' seconds', chat_id))
+        row = c.fetchone()
+        return (False, int(row[0]) if row and row[0] and row[0] > 0 else 0)
+
+
+def heist_take(chat_id, thief_id, treasury_ratio, deposit_ratio):
+    """Drains the vault for a successful heist: `treasury_ratio` of the treasury plus
+    `deposit_ratio` of every depositor's balance, all in one transaction.
+
+    Strictly zero-sum - every centimetre handed to the thief is one taken from the
+    treasury or from a named depositor, and the per-victim amounts are returned so the
+    group can be told exactly who paid for it.
+
+    Returns (total_loot, treasury_part, [(user_id, name, amount), ...])."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE', (chat_id,))
+        row = c.fetchone()
+        treasury = float(row[0]) if row else 0.0
+        treasury_part = round(max(0.0, treasury) * treasury_ratio, 2)
+        if treasury_part > 0:
+            c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
+                      'WHERE chat_id = %s RETURNING balance', (treasury_part, chat_id))
+            trow = c.fetchone()
+            _bank_log(c, chat_id, thief_id, 'heist_treasury', -treasury_part, trow[0])
+
+        c.execute('SELECT b.user_id, COALESCE(u.first_name, %s), COALESCE(b.balance,0) '
+                  'FROM bank_accounts b LEFT JOIN users u '
+                  '  ON u.user_id = b.user_id AND u.chat_id = b.chat_id '
+                  'WHERE b.chat_id = %s AND COALESCE(b.balance,0) > 0 '
+                  'ORDER BY b.balance DESC FOR UPDATE OF b', ('?', chat_id))
+        victims = []
+        deposit_part = 0.0
+        for uid, name, bal in c.fetchall():
+            if uid == thief_id:
+                continue  # you don't rob your own deposit
+            cut = round(float(bal) * deposit_ratio, 2)
+            if cut <= 0:
+                continue
+            c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING balance', (cut, uid, chat_id))
+            brow = c.fetchone()
+            if brow is None:
+                continue
+            _bank_log(c, chat_id, uid, 'heist_loss', -cut, brow[0])
+            victims.append((uid, name, cut))
+            deposit_part += cut
+
+        total = round(treasury_part + deposit_part, 2)
+        if total > 0:
+            c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                      (total, thief_id, chat_id))
+            wrow = c.fetchone()
+            if wrow is None:
+                raise RuntimeError('thief has no users row')
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s, %s, %s, %s, %s, %s)',
+                      (chat_id, thief_id, total, wrow[0], 'bank_heist', 'سرقت از بانک'))
+        return (total, treasury_part, victims)
+
+
+def get_bank_log(chat_id, limit=20):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT l.created_at, COALESCE(u.first_name, %s), l.kind, l.amount, l.note '
+                  'FROM bank_log l LEFT JOIN users u '
+                  '  ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
+                  'WHERE l.chat_id = %s ORDER BY l.id DESC LIMIT %s', ('—', chat_id, limit))
+        return c.fetchall()

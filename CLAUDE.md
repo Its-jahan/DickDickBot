@@ -90,6 +90,43 @@ A daily perk is granted alongside a growth roll, so `last_grown` (the growth dat
 - `random_event_job` — every 3h, small per-group chance of an earthquake/viagra-rain/treasure event.
 - `recover_stuck_pvp_matches` — one-shot, 5s after startup; sweeps `pvp_matches` for anything stale.
 
+## The bank is deliberately outside `users.size`
+
+`bank_accounts.balance` is a second balance per (user, chat) that is **not** part of
+`users.size`. Nothing that reads `users.size` — the leaderboard (`get_top_users_full`),
+the crown (`refresh_king`), `/dozdi`, `/ejma`, challenge stakes — can see banked size.
+That is the whole trade the feature sells: deposits are safe from theft precisely
+because they cost you your position on the table. Do not "fix" this by adding banked
+size into the leaderboard; it would turn the bank into a strictly-dominant safe box and
+kill theft and challenges in one move.
+
+Two invariants hold the economy together, and both have regression coverage:
+
+- **The bank cannot mint size.** Interest is paid *only* out of `bank_treasury`, and
+  `pay_interest` scales every depositor down by the same factor when the treasury can't
+  cover what's owed. An empty treasury pays exactly zero. The treasury's only inflows
+  are real sinks — shop purchases, the lottery rake (`lottery.BURN_RATIO`), `/ejma`,
+  shrink items (قرص/زعفرون), and earthquakes — each of which used to simply delete
+  size. If you add a new sink, route it through `db.treasury_add` rather than dropping
+  the size on the floor.
+- **A heist is zero-sum.** `heist_take` moves treasury + a slice of every *other*
+  depositor's balance into the thief's wallet in one transaction, and returns the
+  per-victim amounts so the group message can name who paid.
+
+### Deposits must never count as ledger losses
+
+A deposit leaves the wallet, so it lands in `size_log` as a large negative delta. The
+nightly auto-handicap reads `size_log` to decide who is winning, so an uncounted deposit
+would read as "this player is losing badly" and reward them with a growth bonus —
+deposit, withdraw, repeat is then the cheapest exploit in the game.
+`get_recent_net_by_user` therefore excludes the `bank_deposit` and `bank_withdraw`
+sources. Any future feature that shuffles size between two pockets of the same player
+must be excluded there too.
+
+The per-day deposit cap counts **gross** deposits (`deposited_today`), so
+deposit → withdraw → deposit cannot refill the allowance. This is what keeps size in
+circulation and keeps `/dozdi` worth typing.
+
 ## Admin panel
 
 `python_bot/admin_panel.py` is a separate Flask/gunicorn service (`dickbot-admin`,
