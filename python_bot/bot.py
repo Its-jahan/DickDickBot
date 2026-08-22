@@ -2328,6 +2328,7 @@ UNREST_DAILY_COOLDOWN = 4     # anger fades a little on its own
 # trade - six ways to get richer or get thanked - and can never blame the draw.
 DECREE_GOOD_CHOICES = 3
 DECREE_BAD_CHOICES = 3
+DECREE_OFFER_HOUR, DECREE_OFFER_MINUTE = 21, 30
 
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
@@ -3602,27 +3603,61 @@ def _render_decree_offer(king_name, codes, econ):
     return "\n".join(lines)
 
 
+async def _offer_decrees_to(context, chat_id, today_str):
+    """Post tonight's hand to one group. Returns True if an offer actually went out.
+
+    Skips a group that has no king, that already signed today, or that is already
+    holding an unsigned offer - so this is safe to call more than once a night."""
+    kingdom, _ = refresh_king(chat_id)
+    if not kingdom or not kingdom[0]:
+        return False
+    full = db.get_economy_full(chat_id)
+    if full and full[6] == today_str:
+        return False  # the king already signed today
+    entry = pending_decrees.get(chat_id)
+    if entry and entry[0] == today_str and entry[2] == kingdom[0]:
+        return False  # already offered tonight, to this same king
+
+    king_id, king_name = kingdom[0], kingdom[1]
+    codes = _roll_decrees(chat_id, today_str, king_id)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=_render_decree_offer(king_name, codes, db.get_economy(chat_id)),
+        reply_markup=_decree_keyboard(chat_id, codes),
+        parse_mode="HTML"
+    )
+    return True
+
+
 async def decree_offer_job(context: ContextTypes.DEFAULT_TYPE):
-    """Each night, hand the sitting king three choices. No king, no decree."""
+    """Each night, hand the sitting king his six choices. No king, no decree."""
     today_str = tehran_today_str()
     for chat_id in db.get_all_chats():
         try:
-            kingdom, _ = refresh_king(chat_id)
-            if not kingdom or not kingdom[0]:
-                continue
-            king_id, king_name = kingdom[0], kingdom[1]
-            econ = db.get_economy(chat_id)
-            codes = _roll_decrees(chat_id, today_str, king_id)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=_render_decree_offer(king_name, codes, econ),
-                reply_markup=_decree_keyboard(chat_id, codes),
-                parse_mode="HTML"
-            )
+            await _offer_decrees_to(context, chat_id, today_str)
         except Forbidden:
             db.remove_chat(chat_id)
         except Exception:
             logging.exception(f"decree offer failed for {chat_id}")
+
+
+async def recover_decree_offer(context: ContextTypes.DEFAULT_TYPE):
+    """Startup catch-up. run_daily only fires at its appointed minute, so a bot that was
+    down - or freshly deployed - past that minute would silently skip the whole night's
+    decree. This posts the offer on boot instead, but only once the hour has actually
+    come round, and only where tonight's offer is genuinely still missing."""
+    now = datetime.datetime.now(IRAN_TZ)
+    if (now.hour, now.minute) < (DECREE_OFFER_HOUR, DECREE_OFFER_MINUTE):
+        return
+    today_str = tehran_today_str()
+    for chat_id in db.get_all_chats():
+        try:
+            if await _offer_decrees_to(context, chat_id, today_str):
+                logging.info(f"decree offer recovered on startup for {chat_id}")
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception:
+            logging.exception(f"decree recovery failed for {chat_id}")
 
 
 async def decree_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4554,7 +4589,7 @@ if __name__ == '__main__':
 
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
-    app.job_queue.run_daily(decree_offer_job, time=time(hour=21, minute=30, second=0, tzinfo=IRAN_TZ))
+    app.job_queue.run_daily(decree_offer_job, time=time(hour=DECREE_OFFER_HOUR, minute=DECREE_OFFER_MINUTE, second=0, tzinfo=IRAN_TZ))
     # 00:20 Tehran: after midnight_tasks has settled the lottery, expired bosses and
     # collected the crown's tax, so the handicap reads a closed, complete day.
     app.job_queue.run_daily(economy_tick_job, time=time(hour=0, minute=5, second=0, tzinfo=IRAN_TZ))
@@ -4565,6 +4600,7 @@ if __name__ == '__main__':
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
     app.job_queue.run_once(recover_expired_consensus, when=7)
     app.job_queue.run_once(recover_pending_lotteries, when=9)
+    app.job_queue.run_once(recover_decree_offer, when=12)
 
     app.add_error_handler(on_error)
 

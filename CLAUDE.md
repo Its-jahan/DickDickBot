@@ -252,6 +252,12 @@ reserved for the worst decrees deliberately — that is what makes debasement ge
 corrosive rather than merely unfair, and it is why the bank's "cannot mint" rule is
 written the way it is.
 
+`recover_decree_offer` is a startup catch-up, following the same pattern as the other
+recovery sweeps. `run_daily` only fires at its appointed minute, so a bot deployed or
+restarted past 21:30 would silently skip that night's decree entirely. The sweep posts
+it on boot instead — gated on the hour having actually come round, and on tonight's
+offer being genuinely missing, so it can never double-post or re-offer a signed day.
+
 ### Two things to be careful of here
 
 `apply_decree` must `INSERT ... ON CONFLICT DO NOTHING` the economy row before it reads
