@@ -28,6 +28,16 @@ DB_URL = os.environ.get('SUPABASE_DB_URL') or os.environ.get('DATABASE_URL')
 # Kept here rather than imported from bot.py because init_db must not depend on bot.
 BACKFILL_DEPOSIT_FEE_RATIO = 0.02
 
+# Credit scoring. Kept here rather than in bot.py because settle_loan applies the score
+# change in the same transaction that moves the money.
+CREDIT_BASE = 100
+CREDIT_MIN, CREDIT_MAX = 0, 200
+CREDIT_ON_TIME = 10       # paid up before the due date
+CREDIT_LATE = -12         # paid voluntarily, but after the due date
+CREDIT_FORCED = -20       # the nightly sweep had to take it from their wallet
+CREDIT_BANK_SEIZED = -30  # ...and had to reach into their bank deposit
+CREDIT_SHORTFALL = -45    # ...and they still could not cover it
+
 
 @contextmanager
 def get_connection():
@@ -376,6 +386,12 @@ def init_db():
         # and used to price future loans.
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loan_defaults INTEGER DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_xfer_at TIMESTAMPTZ")
+        # Credit history. The score starts at CREDIT_BASE and is the multiplier on how
+        # much a player is allowed to borrow, so behaviour feeds straight back into
+        # access to money rather than sitting in a cosmetic stat.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_score INTEGER DEFAULT 100")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loans_repaid INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loans_late INTEGER DEFAULT 0")
 
         # One-time: charge the deposit fee on money that was banked before the fee
         # existed. Everyone who deposited in that window got in free, which is both
@@ -2301,8 +2317,40 @@ def settle_loan(loan_id, forced):
             if interest > 0:
                 _size_move(c, chat_id, lender_id, interest, 'loan_interest', f'سود نزول #{loan_id}')
 
+        # Score the borrower's behaviour in the same transaction that settles the
+        # money, so a credit rating can never disagree with the loan book it describes.
+        # The penalty is graded by how far the collector had to go: paying late is a
+        # slip, being force-collected is a failure, and having to be dug out of your
+        # bank deposit or left in the red is a worse one.
+        c.execute('SELECT due_at < NOW() FROM loans WHERE id = %s', (loan_id,))
+        drow = c.fetchone()
+        was_late = bool(drow and drow[0])
+        if not forced:
+            delta = CREDIT_LATE if was_late else CREDIT_ON_TIME
+            outcome = 'late' if was_late else 'on_time'
+        elif shortfall > 0:
+            delta, outcome = CREDIT_SHORTFALL, 'shortfall'
+        elif from_bank > 0:
+            delta, outcome = CREDIT_BANK_SEIZED, 'bank_seized'
+        else:
+            delta, outcome = CREDIT_FORCED, 'forced'
+
+        c.execute('UPDATE users SET credit_score = LEAST(%s, GREATEST(%s, '
+                  'COALESCE(credit_score, %s) + %s)) '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING credit_score',
+                  (CREDIT_MAX, CREDIT_MIN, CREDIT_BASE, delta, borrower_id, chat_id))
+        srow = c.fetchone()
+        new_score = int(srow[0]) if srow else CREDIT_BASE
+
         if forced:
             c.execute('UPDATE users SET loan_defaults = COALESCE(loan_defaults,0) + 1 '
+                      'WHERE user_id = %s AND chat_id = %s', (borrower_id, chat_id))
+        elif was_late:
+            c.execute('UPDATE users SET loans_late = COALESCE(loans_late,0) + 1, '
+                      'loans_repaid = COALESCE(loans_repaid,0) + 1 '
+                      'WHERE user_id = %s AND chat_id = %s', (borrower_id, chat_id))
+        else:
+            c.execute('UPDATE users SET loans_repaid = COALESCE(loans_repaid,0) + 1 '
                       'WHERE user_id = %s AND chat_id = %s', (borrower_id, chat_id))
 
         return {
@@ -2310,7 +2358,8 @@ def settle_loan(loan_id, forced):
             'borrower_id': borrower_id, 'borrower_name': borrower_name,
             'principal': principal, 'due_amount': due_amount, 'interest': interest,
             'from_wallet': from_wallet, 'from_bank': from_bank, 'shortfall': shortfall,
-            'forced': forced,
+            'forced': forced, 'outcome': outcome, 'credit_delta': delta,
+            'credit_score': new_score, 'was_late': was_late,
         }
 
 
@@ -2446,3 +2495,36 @@ def cross_group_transfer(user_id, from_chat, to_chat, amount, fee_ratio):
                   (to_chat, user_id, delivered, drow[0], 'xfer_principal',
                    f'انتقال از گروه {from_chat}'))
         return (True, delivered, fee)
+
+
+def get_credit(user_id, chat_id):
+    """(score, repaid, late, defaults) - the whole credit file for one player."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(credit_score, %s), COALESCE(loans_repaid,0), '
+                  'COALESCE(loans_late,0), COALESCE(loan_defaults,0) '
+                  'FROM users WHERE user_id = %s AND chat_id = %s',
+                  (CREDIT_BASE, user_id, chat_id))
+        return c.fetchone() or (CREDIT_BASE, 0, 0, 0)
+
+
+def charge_credit_check(user_id, chat_id, fee):
+    """Takes the credit-check fee and puts it in the treasury, atomically. Returns True
+    if the caller could afford it. Like every other fee this is a transfer, not a burn."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(size,0) >= %s RETURNING size',
+                  (fee, user_id, chat_id, fee))
+        row = c.fetchone()
+        if row is None:
+            return False
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (chat_id, user_id, -fee, row[0], 'credit_check', 'کارمزد اعتبارسنجی'))
+        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET '
+                  'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                  (chat_id, fee, fee))
+        _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد اعتبارسنجی')
+        return True

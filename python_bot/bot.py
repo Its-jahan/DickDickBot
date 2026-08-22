@@ -138,6 +138,7 @@ BOT_COMMANDS = [
     ("bedehi", "📜 بدهی‌ها و طلب‌های من"),
     ("pardakht", "✅ تسویهٔ بدهی"),
     ("enteghal", "🔁 انتقال سایز به گروه دیگه (کارمزد بالا)"),
+    ("etebar", "📊 اعتبارسنجی — /etebar @user (۵ سانت)"),
     ("ach", "🏅 نشان‌ها و استریک من"),
     ("wr", "📊 آمار برد و باخت"),
     ("help", "❓ راهنمای کامل بازی"),
@@ -594,7 +595,7 @@ HELP_TEXT = (
     "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
     "🏛 /vam <مقدار> — وام رسمی از بانک\n"
     "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
-    "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (کارمزد سنگین)\n"
+    "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (کارمزد سنگین)\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
     "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
     "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
@@ -2289,6 +2290,17 @@ XFER_FEE_RATIO = 0.30
 XFER_COOLDOWN_SECONDS = 24 * 3600
 XFER_MIN_AMOUNT = 50
 
+# ---------------------------------------------------------------- credit scoring
+# A borrower's score IS their borrowing limit: the cap is their size multiplied by
+# score/100, so behaviour feeds straight back into how much money they can get hold of
+# instead of sitting in a cosmetic stat. Paying on time climbs; paying late slips; being
+# force-collected drops hard, and drops harder the further the collector had to reach.
+CREDIT_CHECK_FEE = 5
+CREDIT_MIN_FACTOR, CREDIT_MAX_FACTOR = 0.2, 1.5
+# The official bank refuses bad credit outright. Loan sharks do not care - that is what
+# /etebar is for, so a lender can price the risk themselves before offering.
+BANK_LOAN_MIN_SCORE = 60
+
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
     'streak_7': ('🔥', 'هفتهٔ کامل', '۷ روز پشت سر هم دودولش رو مالید'),
@@ -3135,11 +3147,14 @@ async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     borrower_size = (db.get_user_info(target_id, chat_id) or (None, 0))[1] or 0
-    max_principal = max(LOAN_MIN_PRINCIPAL, int(borrower_size * LOAN_MAX_PRINCIPAL_RATIO))
+    b_score, b_repaid, b_late, b_defaults = db.get_credit(target_id, chat_id)
+    max_principal = _credit_cap(borrower_size, b_score)
     if principal > max_principal:
         await update.message.reply_text(
             f"بیشتر از توانِ {_esc(target_name)} نمی‌شه بهش قرض داد!\n"
-            f"سقف براش الان {max_principal} سانته (سایز فعلیش {int(borrower_size)}).",
+            f"سقف براش الان <b>{max_principal}</b> سانته "
+            f"(سایز {int(borrower_size)} × ضریب اعتبار {_credit_factor(b_score):.2f}).\n"
+            f"📊 امتیاز اعتباریش: {b_score}/200 — {_credit_grade(b_score)}",
             parse_mode="HTML"
         )
         return
@@ -3153,8 +3168,8 @@ async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loan_id, due_amount = db.create_loan_offer(
         chat_id, user.id, user.first_name, target_id, target_name, principal, rate, LOAN_TERM_DAYS
     )
-    defaults = db.get_loan_defaults(chat_id, target_id)
-    warn = f"\n⚠️ سابقهٔ نکول: {defaults} بار" if defaults else ""
+    warn = (f"\n📊 اعتبار {_esc(target_name)}: <b>{b_score}</b>/200 — {_credit_grade(b_score)}"
+            f" (سروقت {b_repaid - b_late} / با تأخیر {b_late} / نکول {b_defaults})")
     keyboard = [[InlineKeyboardButton("✍️ قبول می‌کنم", callback_data=f"loanok_{loan_id}")]]
     await update.message.reply_text(
         f"🤝 <b>پیشنهاد نزول</b>\n\n"
@@ -3226,8 +3241,20 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.track_chat(chat_id)
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     treasury, _, _ = db.get_treasury(chat_id)
-    ceiling = int(min(max(size * LOAN_MAX_PRINCIPAL_RATIO, LOAN_MIN_PRINCIPAL),
-                      treasury * BANK_LOAN_MAX_TREASURY_SHARE))
+    score, repaid, late, defaults = db.get_credit(user.id, chat_id)
+    # The official bank is the strict lender: bad credit is refused outright rather
+    # than priced. Loan sharks are still an option, which is the point.
+    if score < BANK_LOAN_MIN_SCORE:
+        await update.message.reply_text(
+            f"🏛 بانک به تو وام نمی‌ده!\n\n"
+            f"📊 امتیاز اعتباریت: <b>{score}</b>/200 — {_credit_grade(score)}\n"
+            f"حداقل لازم برای وام بانکی: {BANK_LOAN_MIN_SCORE}\n\n"
+            f"🚔 نکول: {defaults} بار | 🐌 تأخیر: {late} بار\n\n"
+            f"با تسویهٔ سروقت بدهی‌هات امتیازت بالا میره. فعلاً باید بری سراغ نزول‌خورها.",
+            parse_mode="HTML"
+        )
+        return
+    ceiling = int(min(_credit_cap(size, score), treasury * BANK_LOAN_MAX_TREASURY_SHARE))
 
     parts = update.message.text.split()
     amount = None
@@ -3240,6 +3267,7 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🏛 وام رسمی بانک\n\n"
             f"نرخ: {int(BANK_LOAN_RATE*100)}٪ — سررسید {LOAN_TERM_DAYS} روز\n"
+            f"📊 امتیاز اعتباریت: {score}/200 — {_credit_grade(score)}\n"
             f"💰 خزانه: {int(treasury)} سانت\n"
             f"📈 سقف وام تو الان: {ceiling} سانت\n\n"
             f"/vam <مقدار>"
@@ -3251,7 +3279,8 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if amount > ceiling:
         await update.message.reply_text(
             f"سقف وام تو الان {ceiling} سانته.\n"
-            f"(هم به سایز خودت بستگی داره، هم به موجودی خزانه: {int(treasury)} سانت)"
+            f"(سایز {int(size)} × ضریب اعتبار {_credit_factor(score):.2f}، "
+            f"و سقف خزانه: {int(treasury)} سانت)"
         )
         return
     if db.count_active_loans(chat_id, user.id, as_lender=False) >= LOAN_MAX_BORROWER_LOANS:
@@ -3280,8 +3309,11 @@ async def debts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
         return
     borrowed, lent = db.get_user_loans(chat_id, user.id)
-    defaults = db.get_loan_defaults(chat_id, user.id)
-    lines = [f"📜 <b>دفتر بدهی {_esc(user.first_name)}</b>", ""]
+    score, repaid, late, defaults = db.get_credit(user.id, chat_id)
+    size, _, _ = db.get_user(user.id, chat_id, None, None)
+    lines = [f"📜 <b>دفتر بدهی {_esc(user.first_name)}</b>",
+             f"📊 اعتبار: <b>{score}</b>/200 — {_credit_grade(score)} "
+             f"(سقف وام: {_credit_cap(size, score)} سانت)", ""]
     if borrowed:
         lines.append("💸 <b>بدهکاری:</b>")
         for lid, lname, l_id, due, due_at, principal, rate in borrowed:
@@ -3295,8 +3327,8 @@ async def debts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          f"(اصل {int(principal)}، سود {int(rate*100)}٪) — {_fmt_due(due_at)}")
     if not borrowed and not lent:
         lines.append("نه بدهکاری، نه طلبکاری. پاک و تمیز 😇")
-    if defaults:
-        lines.append(f"\n⚠️ سابقهٔ نکول: {defaults} بار")
+    if defaults or late:
+        lines.append(f"\n⚠️ سابقه: {defaults} نکول، {late} تأخیر")
     if borrowed:
         lines.append("\nبرای تسویهٔ زودتر: /pardakht &lt;شماره&gt;")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -3340,10 +3372,13 @@ async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         extra += f"\n🏦 {int(result['from_bank'])} سانتش از سپردهٔ بانکیت برداشته شد."
     if result['shortfall'] > 0:
         extra += f"\n🔻 {int(result['shortfall'])} سانت کم آوردی و سایزت رفت زیر صفر."
+    d = result['credit_delta']
+    credit_line = (f"\n\n📊 اعتبارت {d:+d} شد → <b>{result['credit_score']}</b>/200"
+                   + (" (دیر تسویه کردی!)" if result['was_late'] else " (سروقت تسویه کردی 👌)"))
     await update.message.reply_text(
         f"✅ بدهی #{loan_id} تسویه شد.\n\n"
         f"💸 {int(result['due_amount'])} سانت به {_esc(who or '?')} پرداخت شد "
-        f"(اصل {int(result['principal'])} + سود {int(result['interest'])}).{extra}",
+        f"(اصل {int(result['principal'])} + سود {int(result['interest'])}).{extra}{credit_line}",
         parse_mode="HTML"
     )
 
@@ -3374,12 +3409,77 @@ async def collect_loans_job(context: ContextTypes.DEFAULT_TYPE):
             if r['shortfall'] > 0:
                 bits.append(f"🔻 بازم کم آورد: {int(r['shortfall'])} سانت — سایزش رفت زیر صفر!")
                 bits.append("🏷 از این به بعد <b>بدهکار</b>ه.")
+            bits.append(f"📊 اعتبارش {r['credit_delta']:+d} شد → <b>{r['credit_score']}</b>/200 "
+                        f"(سقف وام‌های بعدیش کمتر شد)")
             await context.bot.send_message(chat_id=r['chat_id'], text="\n".join(bits),
                                            parse_mode="HTML")
         except Forbidden:
             pass
         except Exception:
             logging.exception(f"collecting loan {loan_id} failed")
+
+
+def _credit_factor(score):
+    """Score -> how much of their size a player may borrow. 100 is par (1.0x)."""
+    return max(CREDIT_MIN_FACTOR, min(CREDIT_MAX_FACTOR, (score or 0) / 100.0))
+
+
+def _credit_cap(borrower_size, score):
+    """The most this player may owe on one loan, given their size and their record."""
+    return max(LOAN_MIN_PRINCIPAL,
+               int(borrower_size * LOAN_MAX_PRINCIPAL_RATIO * _credit_factor(score)))
+
+
+def _credit_grade(score):
+    if score >= 150: return "عالی 🟢"
+    if score >= 110: return "خوب 🟢"
+    if score >= 80:  return "متوسط 🟡"
+    if score >= 50:  return "ضعیف 🟠"
+    return "خراب 🔴"
+
+
+def _credit_report(name, score, repaid, late, defaults, size):
+    bar = "█" * max(1, round(score / 20)) + "░" * max(0, 10 - round(score / 20))
+    return (f"📊 <b>اعتبارسنجی {_esc(name)}</b>\n\n"
+            f"امتیاز: <b>{score}</b>/200 — {_credit_grade(score)}\n"
+            f"<code>{bar}</code>\n\n"
+            f"✅ تسویهٔ سروقت: {repaid - late}\n"
+            f"🐌 تسویهٔ با تأخیر: {late}\n"
+            f"🚔 نکول (وصول اجباری): {defaults}\n\n"
+            f"💳 سقف وامش الان: <b>{_credit_cap(size, score)}</b> سانت "
+            f"(ضریب {_credit_factor(score):.2f}× روی سایز {int(size)})")
+
+
+async def credit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/etebar [@user]` - pull someone's credit file. Costs CREDIT_CHECK_FEE, which
+    goes to the treasury like every other fee. Charging for it is the point: a lender
+    deciding whether to trust someone should pay for the diligence."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("اعتبارسنجی فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    target_id, target_name = get_target_user(update, update.message.text, chat_id)
+    if not target_id:
+        target_id, target_name = user.id, user.first_name
+
+    if not db.charge_credit_check(user.id, chat_id, CREDIT_CHECK_FEE):
+        size, _, _ = db.get_user(user.id, chat_id, None, None)
+        await update.message.reply_text(
+            f"اعتبارسنجی {CREDIT_CHECK_FEE} سانت هزینه داره و تو {int(size)} سانت داری!"
+        )
+        return
+
+    score, repaid, late, defaults = db.get_credit(target_id, chat_id)
+    t_size = (db.get_user_info(target_id, chat_id) or (None, 0))[1] or 0
+    await update.message.reply_text(
+        _credit_report(target_name, score, repaid, late, defaults, t_size)
+        + f"\n\n🧾 هزینهٔ اعتبارسنجی: {CREDIT_CHECK_FEE} سانت → خزانه",
+        parse_mode="HTML"
+    )
 
 
 async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4106,6 +4206,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(bedehi|debts)\b'), debts_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(pardakht|repay)\b'), repay_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(enteghal|transfer)\b'), transfer_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(etebar|credit)\b'), credit_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).

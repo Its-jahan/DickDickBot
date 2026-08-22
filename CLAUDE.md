@@ -193,6 +193,29 @@ it safe to leave in place — `init_db()` runs on every startup, so an unguarded
 migration would re-charge on every restart. There is a regression test that runs
 `init_db()` three times and asserts the balances only move once.
 
+## The credit score IS the borrowing limit
+
+`users.credit_score` starts at `CREDIT_BASE` (100) and is applied as a multiplier —
+`score / 100`, clamped to `[CREDIT_MIN_FACTOR, CREDIT_MAX_FACTOR]` — on top of
+`LOAN_MAX_PRINCIPAL_RATIO` when working out how much a player may borrow. It is
+deliberately not a cosmetic stat: behaviour feeds straight back into access to money, so
+a player who defaults twice genuinely cannot get the loan that would let them do it
+again.
+
+The penalty is graded by how far the collector had to reach, which is the part worth
+preserving if these numbers get retuned: paying late voluntarily (`CREDIT_LATE`) is a
+slip; being force-collected from the wallet (`CREDIT_FORCED`) is a failure; having the
+sweep dig into your bank deposit (`CREDIT_BANK_SEIZED`) or leave you in the red
+(`CREDIT_SHORTFALL`) is worse. `settle_loan` decides which of these applies and writes
+the score in the *same transaction* that moves the money, so a rating can never disagree
+with the loan book it describes.
+
+`BANK_LOAN_MIN_SCORE` gates `/vam` only. The official bank refuses bad credit outright;
+loan sharks are unregulated and will lend to anyone, which is what `/etebar` is for — a
+lender pays `CREDIT_CHECK_FEE` to price the risk themselves before making an offer. That
+fee is a transfer to the treasury like every other fee, and unlike loan principal it
+*does* count toward the nightly handicap, because it is a real cost.
+
 ## Admin panel
 
 `python_bot/admin_panel.py` is a separate Flask/gunicorn service (`dickbot-admin`,
