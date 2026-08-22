@@ -127,6 +127,35 @@ The per-day deposit cap counts **gross** deposits (`deposited_today`), so
 deposit → withdraw → deposit cannot refill the allowance. This is what keeps size in
 circulation and keeps `/dozdi` worth typing.
 
+## Loans split principal from interest in the ledger
+
+`loans` covers both lenders: `lender_id IS NULL` is the treasury-funded `/vam`, anything
+else is a player-to-player `/nozul`. Both settle through `settle_loan`, so the two can
+never drift apart.
+
+The ledger split is the part that is easy to get wrong. A loan's **principal** is a
+transfer between two pockets — not income for the borrower, not a loss for the lender —
+so it is logged as `loan_principal`, which `get_recent_net_by_user` ignores exactly the
+way it ignores bank transfers. Without that, taking a loan would look to the nightly
+handicap like a catastrophic loss and quietly pay the borrower a growth bonus for
+borrowing. The **interest** is the only real profit and loss in the arrangement, so it is
+logged separately as `loan_interest` and *does* count — a player getting rich from usury
+gets throttled like one getting rich from dice.
+
+`_collect` charges interest against the wallet first and books at most what the wallet
+actually paid. The size_log rows for a repayment must sum to the real change in
+`users.size`, so interest paid out of a seized bank deposit is recorded in `bank_log`
+only — the ledger cannot book money the wallet never paid.
+
+Debt collection deliberately reaches into `bank_accounts`. The bank is safe from
+*theft*; if it were safe from *debt* as well, then borrowing and immediately hiding the
+proceeds in it would be a free money printer. Order is wallet → bank → negative wallet,
+and the lender is made whole in every case, so a default is still zero-sum.
+
+`LOAN_MAX_PRINCIPAL_RATIO` caps a loan at the borrower's current size. That bound is what
+stops a single default from burying a player past any hope of recovery, and it is the
+main lever if usury turns out to be too safe for lenders.
+
 ## Admin panel
 
 `python_bot/admin_panel.py` is a separate Flask/gunicorn service (`dickbot-admin`,

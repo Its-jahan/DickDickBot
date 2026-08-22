@@ -133,6 +133,10 @@ BOT_COMMANDS = [
     ("variz", "📥 واریز به بانک — /variz 50"),
     ("bardasht", "🏧 برداشت از بانک — /bardasht 50"),
     ("sarghat", "🚨 سرقت از بانک گروه!"),
+    ("nozul", "🤝 نزول دادن به یکی — /nozul @user 100 25"),
+    ("vam", "🏛 وام از بانک — /vam 100"),
+    ("bedehi", "📜 بدهی‌ها و طلب‌های من"),
+    ("pardakht", "✅ تسویهٔ بدهی"),
     ("ach", "🏅 نشان‌ها و استریک من"),
     ("wr", "📊 آمار برد و باخت"),
     ("help", "❓ راهنمای کامل بازی"),
@@ -586,7 +590,10 @@ HELP_TEXT = (
     "🏦 /bank — بانک: سود روزانه، امن از دزدی\n"
     "📥 /variz <مقدار> — واریز به بانک (سقف روزانه داره)\n"
     "🏧 /bardasht <مقدار> — برداشت از بانک\n"
-    "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"
+    "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
+    "🏛 /vam <مقدار> — وام رسمی از بانک\n"
+    "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
+    "✅ /pardakht — تسویهٔ زودتر بدهی\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
     "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
     "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
@@ -2227,6 +2234,29 @@ HEIST_DEPOSIT_RATIO = 0.15         # of every other depositor's balance on succe
 HEIST_FINE_RATIO = 0.25            # of the would-be loot, paid by a caught thief
 HEIST_JAIL_HOURS = 12              # a caught thief also loses their next theft window
 
+# ---------------------------------------------------------------- loans (نزول)
+# Two lenders, one settlement path. /vam borrows from the group treasury at a flat
+# official rate; /nozul is player-to-player usury where the lender names their own rate.
+# Both are collected by the same nightly sweep and both split principal from interest in
+# the ledger, so neither can be used to fool the handicap.
+LOAN_TERM_DAYS = 2
+LOAN_MIN_PRINCIPAL = 10
+LOAN_OFFER_TTL_SECONDS = 30 * 60
+# The borrower can never be lent more than they are currently worth. This is what bounds
+# how deep a default can drive someone negative - without it, one loan could bury a
+# player past any hope of digging out.
+LOAN_MAX_PRINCIPAL_RATIO = 1.0
+LOAN_MAX_BORROWER_LOANS = 2
+LOAN_MAX_LENDER_LOANS = 5
+# Usury rates are the lender's call, but bounded: below the floor it isn't نزول, and
+# above the ceiling it stops being a deal anyone can survive.
+NOZUL_MIN_RATE = 0.10
+NOZUL_MAX_RATE = 1.00
+# The official loan is cheap by comparison, and capped so one borrower cannot empty the
+# vault that everyone else's interest is paid from.
+BANK_LOAN_RATE = 0.20
+BANK_LOAN_MAX_TREASURY_SHARE = 0.30
+
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
     'streak_7': ('🔥', 'هفتهٔ کامل', '۷ روز پشت سر هم دودولش رو مالید'),
@@ -2768,8 +2798,8 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remaining = max(0, cap - int(dep_today))
 
     msg = (
-        f"🏦 **بانک دودول**\n\n"
-        f"👤 حساب {user.first_name}\n"
+        f"🏦 <b>بانک دودول</b>\n\n"
+        f"👤 حساب {_esc(user.first_name)}\n"
         f"   💼 جیب (قابل دزدیدن): {int(wallet)} سانت\n"
         f"   🔒 بانک (امن از دزدی): {int(balance)} سانت\n"
         f"   📥 سقف واریز امروز: {remaining} از {cap} سانت\n\n"
@@ -2779,9 +2809,9 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 سود روزانه: {int(BANK_INTEREST_RATE*100)}٪ — ولی فقط تا جایی که خزانه بکشه.\n"
         f"⚠️ سایزِ بانک تو لیدربرد و تاج حساب نمی‌شه.\n"
         f"🥷 خزانه و سپرده‌ها با /sarghat قابل سرقتن!\n\n"
-        f"دستورها: /variz <مقدار> • /bardasht <مقدار> • /sarghat"
+        f"دستورها: /variz &lt;مقدار&gt; • /bardasht &lt;مقدار&gt; • /sarghat"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2928,8 +2958,8 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🏦 صندوق خالی بود! دست خالی برگشتی.")
             return
         lines = [
-            f"🚨💰 **سرقت از بانک!**\n",
-            f"{user.first_name} زد به صندوق گروه و **{int(total)} سانت** بالا کشید!\n",
+            f"🚨💰 <b>سرقت از بانک!</b>\n",
+            f"{_esc(user.first_name)} زد به صندوق گروه و <b>{int(total)} سانت</b> بالا کشید!\n",
             f"🏛 از خزانه: {int(treasury_part)} سانت",
         ]
         if victims:
@@ -2939,7 +2969,7 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(victims) > 8:
                 lines.append(f"   • و {len(victims) - 8} نفر دیگه")
         lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 3600} ساعت دیگه بانک آماده‌باشه‌ست)")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         await announce_achievements(context, chat_id, user.first_name,
                                     award(user.id, chat_id, 'thief'))
     else:
@@ -2949,14 +2979,14 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if db.try_deduct_size(user.id, chat_id, fine):
             db.treasury_add(chat_id, fine, note="جریمهٔ سرقت ناموفق")
             await update.message.reply_text(
-                f"🚔 **دزدگیر بانک زد!**\n\n"
-                f"{user.first_name} سر بزنگاه گیر افتاد و **{int(fine)} سانت** جریمه شد.\n"
+                f"🚔 <b>دزدگیر بانک زد!</b>\n\n"
+                f"{_esc(user.first_name)} سر بزنگاه گیر افتاد و <b>{int(fine)} سانت</b> جریمه شد.\n"
                 f"جریمه رفت تو خزانه — یعنی سود سپرده‌گذارها بیشتر شد. 😎",
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         else:
             await update.message.reply_text(
-                f"🚔 دزدگیر بانک زد و {user.first_name} گیر افتاد!\n"
+                f"🚔 دزدگیر بانک زد و {_esc(user.first_name)} گیر افتاد!\n"
                 f"(اون‌قدر فقیر بود که حتی جریمه هم نتونست بده 💀)"
             )
 
@@ -2977,17 +3007,334 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
             total_dep, _ = db.get_bank_totals(chat_id)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=(f"🏦 **سود روزانهٔ بانک**\n\n"
+                text=(f"🏦 <b>سود روزانهٔ بانک</b>\n\n"
                       f"به {rows} سپرده‌گذار در مجموع {int(paid)} سانت سود داده شد.\n"
                       f"🧾 کل سپرده‌ها: {int(total_dep)} سانت\n"
                       f"💰 باقی‌ماندهٔ خزانه: {int(left)} سانت\n\n"
                       f"با /bank حسابت رو ببین."),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         except Forbidden:
             db.remove_chat(chat_id)
         except Exception:
             logging.exception(f"bank interest failed for {chat_id}")
+
+
+# ---------------------------------------------------------------- loan commands
+
+def _fmt_due(due_at):
+    """Time left on a loan, in the group's own words."""
+    if not due_at:
+        return "؟"
+    delta = due_at - datetime.datetime.now(datetime.timezone.utc)
+    secs = int(delta.total_seconds())
+    if secs <= 0:
+        return "سررسید گذشته!"
+    h, m = secs // 3600, (secs % 3600) // 60
+    if h >= 24:
+        return f"{h // 24} روز و {h % 24} ساعت"
+    return f"{h} ساعت و {m} دقیقه"
+
+
+async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/nozul @user <amount> <rate%>` - offer someone a loan at a rate you pick.
+
+    The lender is not charged anything until the borrower actually accepts, so an
+    ignored offer costs nothing and cannot be used to tie up a rival's balance."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("نزول فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    lender_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    target_id, target_name = get_target_user(update, update.message.text, chat_id)
+    if not target_id:
+        await update.message.reply_text(
+            "به کی می‌خوای نزول بدی؟\n"
+            "/nozul @username <مقدار> <درصد>\n"
+            "مثال: /nozul @ali 100 25  →  ۱۰۰ سانت قرض بده، ۱۲۵ پس بگیر"
+        )
+        return
+    if target_id == user.id:
+        await update.message.reply_text("به خودت نزول بدی؟ 😐")
+        return
+
+    nums = [p for p in update.message.text.split()[1:] if p.lstrip('-').replace('.', '', 1).isdigit()]
+    if len(nums) < 2:
+        await update.message.reply_text(
+            "مقدار و درصد رو بگو!\n/nozul @username <مقدار> <درصد>\n"
+            f"درصد بین {int(NOZUL_MIN_RATE*100)} تا {int(NOZUL_MAX_RATE*100)}."
+        )
+        return
+    try:
+        principal = int(float(nums[0])); rate_pct = float(nums[1])
+    except ValueError:
+        await update.message.reply_text("عدد نامعتبره!")
+        return
+
+    if principal < LOAN_MIN_PRINCIPAL:
+        await update.message.reply_text(f"حداقل مبلغ نزول {LOAN_MIN_PRINCIPAL} سانته.")
+        return
+    if lender_size < principal:
+        await update.message.reply_text(
+            f"خودت این‌قدر سانت نداری! 💼 {int(lender_size)} سانت داری."
+        )
+        return
+    rate = rate_pct / 100.0
+    if not (NOZUL_MIN_RATE - 1e-9 <= rate <= NOZUL_MAX_RATE + 1e-9):
+        await update.message.reply_text(
+            f"درصد باید بین {int(NOZUL_MIN_RATE*100)} تا {int(NOZUL_MAX_RATE*100)} باشه."
+        )
+        return
+
+    borrower_size = (db.get_user_info(target_id, chat_id) or (None, 0))[1] or 0
+    max_principal = max(LOAN_MIN_PRINCIPAL, int(borrower_size * LOAN_MAX_PRINCIPAL_RATIO))
+    if principal > max_principal:
+        await update.message.reply_text(
+            f"بیشتر از توانِ {_esc(target_name)} نمی‌شه بهش قرض داد!\n"
+            f"سقف براش الان {max_principal} سانته (سایز فعلیش {int(borrower_size)}).",
+            parse_mode="HTML"
+        )
+        return
+    if db.count_active_loans(chat_id, target_id, as_lender=False) >= LOAN_MAX_BORROWER_LOANS:
+        await update.message.reply_text(f"{target_name} همین الان بدهی باز داره؛ اول اونا رو تسویه کنه.")
+        return
+    if db.count_active_loans(chat_id, user.id, as_lender=True) >= LOAN_MAX_LENDER_LOANS:
+        await update.message.reply_text("تو همین الان کلی نزول باز داری! اول جمعشون کن.")
+        return
+
+    loan_id, due_amount = db.create_loan_offer(
+        chat_id, user.id, user.first_name, target_id, target_name, principal, rate, LOAN_TERM_DAYS
+    )
+    defaults = db.get_loan_defaults(chat_id, target_id)
+    warn = f"\n⚠️ سابقهٔ نکول: {defaults} بار" if defaults else ""
+    keyboard = [[InlineKeyboardButton("✍️ قبول می‌کنم", callback_data=f"loanok_{loan_id}")]]
+    await update.message.reply_text(
+        f"🤝 <b>پیشنهاد نزول</b>\n\n"
+        f"{_esc(user.first_name)} به {_esc(target_name)} پیشنهاد داد:\n"
+        f"💵 الان بگیر: <b>{principal}</b> سانت\n"
+        f"💸 تا {LOAN_TERM_DAYS} روز دیگه پس بده: <b>{int(due_amount)}</b> سانت "
+        f"(سود {int(rate*100)}٪){warn}\n\n"
+        f"⛔️ سر موعد نداشته باشی، اول از جیبت، بعد از <b>سپردهٔ بانکیت</b> برداشته می‌شه — "
+        f"و اگه بازم کم بیاد سایزت می‌ره زیر صفر.\n\n"
+        f"فقط {_esc(target_name)} می‌تونه قبول کنه. ({LOAN_OFFER_TTL_SECONDS // 60} دقیقه اعتبار)",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+    )
+
+
+async def loan_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن!", show_alert=True)
+        return
+    try:
+        loan_id = int(query.data.split('_', 1)[1])
+    except (IndexError, ValueError):
+        return
+
+    loan = db.get_loan(loan_id)
+    if not loan or loan[10] != 'offered':
+        await query.answer("این پیشنهاد دیگه معتبر نیست!", show_alert=True)
+        return
+    # The borrower is checked here AND again inside accept_loan's conditional UPDATE, so
+    # a forged callback_data cannot make someone else's loan land on this user.
+    if user.id != loan[4]:
+        await query.answer("این پیشنهاد برای تو نیست!", show_alert=True)
+        return
+
+    ok, principal, due_amount = db.accept_loan(loan_id, user.id, LOAN_TERM_DAYS)
+    if not ok:
+        reasons = {
+            'gone': "این پیشنهاد دیگه معتبر نیست!",
+            'treasury': "خزانهٔ بانک الان این‌قدر پول نداره!",
+            'lender_broke': "نزول‌خور دیگه این‌قدر سانت نداره! 😂",
+        }
+        await query.answer(reasons.get(principal, "نشد!"), show_alert=True)
+        return
+
+    lender_label = "بانک" if loan[2] is None else loan[3]
+    await query.answer(f"{int(principal)} سانت گرفتی! یادت نره پس بدی 😈")
+    try:
+        await query.edit_message_text(
+            f"🤝 <b>نزول بسته شد!</b>\n\n"
+            f"{_esc(loan[5])} از {_esc(lender_label)} <b>{int(principal)}</b> سانت گرفت.\n"
+            f"💸 باید تا {LOAN_TERM_DAYS} روز دیگه <b>{int(due_amount)}</b> سانت پس بده.\n\n"
+            f"با /pardakht زودتر تسویه کن، وگرنه خودکار وصول می‌شه.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/vam <amount>` - the official loan, funded by the group treasury at a flat rate.
+    Repayment goes back into the treasury, which is what pays everyone's bank interest."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("وام فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    treasury, _, _ = db.get_treasury(chat_id)
+    ceiling = int(min(max(size * LOAN_MAX_PRINCIPAL_RATIO, LOAN_MIN_PRINCIPAL),
+                      treasury * BANK_LOAN_MAX_TREASURY_SHARE))
+
+    parts = update.message.text.split()
+    amount = None
+    if len(parts) > 1:
+        try:
+            amount = int(float(parts[1]))
+        except ValueError:
+            amount = None
+    if amount is None or amount <= 0:
+        await update.message.reply_text(
+            f"🏛 وام رسمی بانک\n\n"
+            f"نرخ: {int(BANK_LOAN_RATE*100)}٪ — سررسید {LOAN_TERM_DAYS} روز\n"
+            f"💰 خزانه: {int(treasury)} سانت\n"
+            f"📈 سقف وام تو الان: {ceiling} سانت\n\n"
+            f"/vam <مقدار>"
+        )
+        return
+    if amount < LOAN_MIN_PRINCIPAL:
+        await update.message.reply_text(f"حداقل وام {LOAN_MIN_PRINCIPAL} سانته.")
+        return
+    if amount > ceiling:
+        await update.message.reply_text(
+            f"سقف وام تو الان {ceiling} سانته.\n"
+            f"(هم به سایز خودت بستگی داره، هم به موجودی خزانه: {int(treasury)} سانت)"
+        )
+        return
+    if db.count_active_loans(chat_id, user.id, as_lender=False) >= LOAN_MAX_BORROWER_LOANS:
+        await update.message.reply_text("بدهی بازِ زیادی داری! اول تسویه کن.")
+        return
+
+    loan_id, due_amount = db.create_loan_offer(
+        chat_id, None, "بانک", user.id, user.first_name, amount, BANK_LOAN_RATE, LOAN_TERM_DAYS
+    )
+    keyboard = [[InlineKeyboardButton("✍️ امضا می‌کنم", callback_data=f"loanok_{loan_id}")]]
+    await update.message.reply_text(
+        f"🏛 <b>وام بانکی</b>\n\n"
+        f"{_esc(user.first_name)} می‌خواد <b>{amount}</b> سانت وام بگیره.\n"
+        f"💸 بازپرداخت: <b>{int(due_amount)}</b> سانت تا {LOAN_TERM_DAYS} روز دیگه "
+        f"(سود {int(BANK_LOAN_RATE*100)}٪)\n\n"
+        f"⛔️ سر موعد نداشته باشی، از جیب و بعد از سپردهٔ بانکیت وصول می‌شه.",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+    )
+
+
+async def debts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/bedehi` - what you owe and what you're owed."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        return
+    borrowed, lent = db.get_user_loans(chat_id, user.id)
+    defaults = db.get_loan_defaults(chat_id, user.id)
+    lines = [f"📜 <b>دفتر بدهی {_esc(user.first_name)}</b>", ""]
+    if borrowed:
+        lines.append("💸 <b>بدهکاری:</b>")
+        for lid, lname, l_id, due, due_at, principal, rate in borrowed:
+            who = "بانک" if l_id is None else lname
+            lines.append(f"  #{lid} به {_esc(who or '?')}: <b>{int(due)}</b> سانت "
+                         f"(اصل {int(principal)}، سود {int(rate*100)}٪) — {_fmt_due(due_at)}")
+    if lent:
+        lines.append("\n💰 <b>طلبکاری:</b>")
+        for lid, bname, due, due_at, principal, rate in lent:
+            lines.append(f"  #{lid} از {_esc(bname or '?')}: <b>{int(due)}</b> سانت "
+                         f"(اصل {int(principal)}، سود {int(rate*100)}٪) — {_fmt_due(due_at)}")
+    if not borrowed and not lent:
+        lines.append("نه بدهکاری، نه طلبکاری. پاک و تمیز 😇")
+    if defaults:
+        lines.append(f"\n⚠️ سابقهٔ نکول: {defaults} بار")
+    if borrowed:
+        lines.append("\nبرای تسویهٔ زودتر: /pardakht &lt;شماره&gt;")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/pardakht [id]` - settle a loan early, at the same amount it would cost at
+    maturity. Paying early costs nothing extra and clears the debt off your book."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        return
+    borrowed, _ = db.get_user_loans(chat_id, user.id)
+    if not borrowed:
+        await update.message.reply_text("بدهی‌ای نداری! 😇")
+        return
+
+    parts = update.message.text.split()
+    loan_id = None
+    if len(parts) > 1 and parts[1].lstrip('#').isdigit():
+        loan_id = int(parts[1].lstrip('#'))
+    elif len(borrowed) == 1:
+        loan_id = borrowed[0][0]
+    if loan_id is None:
+        await update.message.reply_text(
+            "کدوم بدهی رو تسویه کنم؟ با /bedehi شماره‌ها رو ببین، بعد /pardakht <شماره>"
+        )
+        return
+    if loan_id not in [b[0] for b in borrowed]:
+        await update.message.reply_text("این شماره جزو بدهی‌های باز تو نیست!")
+        return
+
+    result = db.settle_loan(loan_id, forced=False)
+    if not result:
+        await update.message.reply_text("این بدهی همین الان تسویه شد!")
+        return
+    who = "بانک" if result['lender_id'] is None else result['lender_name']
+    extra = ""
+    if result['from_bank'] > 0:
+        extra += f"\n🏦 {int(result['from_bank'])} سانتش از سپردهٔ بانکیت برداشته شد."
+    if result['shortfall'] > 0:
+        extra += f"\n🔻 {int(result['shortfall'])} سانت کم آوردی و سایزت رفت زیر صفر."
+    await update.message.reply_text(
+        f"✅ بدهی #{loan_id} تسویه شد.\n\n"
+        f"💸 {int(result['due_amount'])} سانت به {_esc(who or '?')} پرداخت شد "
+        f"(اصل {int(result['principal'])} + سود {int(result['interest'])}).{extra}",
+        parse_mode="HTML"
+    )
+
+
+async def collect_loans_job(context: ContextTypes.DEFAULT_TYPE):
+    """Nightly: force-collect everything past its due date, and bin stale offers.
+
+    Runs before the handicap so the day's interest has already been booked as profit and
+    loss by the time the dials are recomputed."""
+    try:
+        db.expire_loan_offers(LOAN_OFFER_TTL_SECONDS)
+    except Exception:
+        logging.exception("expiring loan offers failed")
+
+    for loan_id in db.get_overdue_loans():
+        try:
+            r = db.settle_loan(loan_id, forced=True)
+            if not r:
+                continue
+            who = "بانک" if r['lender_id'] is None else r['lender_name']
+            bits = [f"🚔 <b>وصول اجباری بدهی #{loan_id}</b>\n",
+                    f"{_esc(r['borrower_name'] or '?')} سر موعد {int(r['due_amount'])} سانت "
+                    f"بدهی‌شو به {_esc(who or '?')} نداد."]
+            if r['from_wallet'] > 0:
+                bits.append(f"💼 از جیبش: {int(r['from_wallet'])} سانت")
+            if r['from_bank'] > 0:
+                bits.append(f"🏦 از سپردهٔ بانکیش: {int(r['from_bank'])} سانت")
+            if r['shortfall'] > 0:
+                bits.append(f"🔻 بازم کم آورد: {int(r['shortfall'])} سانت — سایزش رفت زیر صفر!")
+                bits.append("🏷 از این به بعد <b>بدهکار</b>ه.")
+            await context.bot.send_message(chat_id=r['chat_id'], text="\n".join(bits),
+                                           parse_mode="HTML")
+        except Forbidden:
+            pass
+        except Exception:
+            logging.exception(f"collecting loan {loan_id} failed")
 
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3545,6 +3892,7 @@ if __name__ == '__main__':
     # 00:20 Tehran: after midnight_tasks has settled the lottery, expired bosses and
     # collected the crown's tax, so the handicap reads a closed, complete day.
     app.job_queue.run_daily(bank_interest_job, time=time(hour=0, minute=10, second=0, tzinfo=IRAN_TZ))
+    app.job_queue.run_daily(collect_loans_job, time=time(hour=0, minute=15, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(auto_handicap_job, time=time(hour=0, minute=20, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(random_event_job, interval=RANDOM_EVENT_INTERVAL_SECONDS, first=300)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
@@ -3578,6 +3926,10 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(variz|deposit)\b'), deposit_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(bardasht|withdraw)\b'), withdraw_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(sarghat|heist)\b'), heist_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(nozul|nozool)\b'), nozul_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(vam|loan)\b'), vam_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(bedehi|debts)\b'), debts_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(pardakht|repay)\b'), repay_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).
@@ -3600,6 +3952,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy_'))
     app.add_handler(CallbackQueryHandler(boss_hit_callback, pattern=r'^bosshit_'))
     app.add_handler(CallbackQueryHandler(lottery_buy_callback, pattern=r'^lot_'))
+    app.add_handler(CallbackQueryHandler(loan_accept_callback, pattern=r'^loanok_'))
     
     app.add_handler(InlineQueryHandler(inline_query))
     

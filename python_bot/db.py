@@ -342,6 +342,35 @@ def init_db():
             )
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS bank_log_chat_idx ON bank_log (chat_id, created_at DESC)')
+
+        # ---------------------------------------------------------------- loans
+        # lender_id IS NULL means the group's treasury is the lender (the official
+        # /vam loan); any other value is a player-to-player نزول. Both settle through
+        # exactly the same repayment and collection code so the two can never drift.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS loans (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                lender_id BIGINT,
+                lender_name TEXT,
+                borrower_id BIGINT,
+                borrower_name TEXT,
+                principal DOUBLE PRECISION,
+                rate DOUBLE PRECISION,
+                due_amount DOUBLE PRECISION,
+                paid DOUBLE PRECISION DEFAULT 0,
+                status TEXT DEFAULT 'offered',
+                created_at TIMESTAMPTZ DEFAULT now(),
+                accepted_at TIMESTAMPTZ,
+                due_at TIMESTAMPTZ,
+                closed_at TIMESTAMPTZ
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS loans_chat_status_idx ON loans (chat_id, status)')
+        c.execute('CREATE INDEX IF NOT EXISTS loans_due_idx ON loans (status, due_at)')
+        # How many times this player has been force-collected. Worn publicly as بدهکار
+        # and used to price future loans.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loan_defaults INTEGER DEFAULT 0")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_chat_user_idx ON size_log (chat_id, user_id, created_at DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_created_idx ON size_log (created_at DESC)")
 
@@ -1483,11 +1512,17 @@ def get_recent_net_by_user(chat_id, days):
     on a big balance they earned a week ago is not the one running away with the game.
     Only players who actually did something in the window appear here.
 
-    Bank transfers are excluded. A deposit leaves the wallet and so lands in the ledger
-    as a large negative delta, which would read here as "this player is losing badly"
-    and hand them a growth bonus - making a deposit/withdraw round trip the cheapest
-    handicap exploit in the game. Moving size between your own two pockets is not a
-    gain or a loss, so neither leg counts."""
+    Transfers between a player's own pockets are excluded, and so is loan principal.
+
+    A bank deposit leaves the wallet and lands in the ledger as a large negative delta,
+    which would read here as "this player is losing badly" and hand them a growth bonus
+    - making a deposit/withdraw round trip the cheapest handicap exploit in the game.
+    Loan principal is the same story from the other direction: borrowing would look like
+    a windfall and repaying like a disaster, when in truth neither is income.
+
+    Loan *interest* is deliberately NOT excluded. That is the one part of a loan that is
+    real profit for the lender and a real cost to the borrower, so a player getting rich
+    from usury gets throttled by the handicap exactly like one getting rich from dice."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
@@ -1495,9 +1530,9 @@ def get_recent_net_by_user(chat_id, days):
             'FROM size_log l LEFT JOIN users u '
             '  ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
             'WHERE l.chat_id = %s AND l.created_at >= NOW() - (%s || %s)::interval '
-            '  AND COALESCE(l.source, %s) NOT IN (%s, %s) '
+            '  AND COALESCE(l.source, %s) NOT IN (%s, %s, %s) '
             'GROUP BY l.user_id',
-            ('', chat_id, days, ' days', '', 'bank_deposit', 'bank_withdraw')
+            ('', chat_id, days, ' days', '', 'bank_deposit', 'bank_withdraw', 'loan_principal')
         )
         return c.fetchall()
 
@@ -1997,3 +2032,264 @@ def get_bank_log(chat_id, limit=20):
                   '  ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
                   'WHERE l.chat_id = %s ORDER BY l.id DESC LIMIT %s', ('—', chat_id, limit))
         return c.fetchall()
+
+
+# ---------------------------------------------------------------- loans
+# The ledger split is the subtle part. A loan's *principal* is a transfer between two
+# pockets - it is not income for the borrower and not a loss for the lender - so it is
+# logged under 'loan_principal', which get_recent_net_by_user ignores exactly the way it
+# ignores bank transfers. The *interest* is the only real profit and loss in the whole
+# arrangement, so it is logged separately under 'loan_interest' and does count. Without
+# that split, taking a loan would look like a catastrophic loss to the nightly handicap
+# and quietly pay the borrower a growth bonus for borrowing money.
+
+def _size_move(c, chat_id, user_id, delta, source, note=None):
+    """Applies a size change and writes the matching ledger row with an EXPLICIT source
+    (rather than the caller-name guess update_size makes), inside the caller's
+    transaction. Returns the new balance, or None if the user has no row."""
+    c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+              'WHERE user_id = %s AND chat_id = %s RETURNING size',
+              (delta, user_id, chat_id))
+    row = c.fetchone()
+    if row is None:
+        return None
+    c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+              'VALUES (%s, %s, %s, %s, %s, %s)',
+              (chat_id, user_id, delta, row[0], source, note))
+    return float(row[0])
+
+
+def create_loan_offer(chat_id, lender_id, lender_name, borrower_id, borrower_name,
+                      principal, rate, term_days):
+    """Records a pending offer. Nothing moves until the borrower accepts - so an offer
+    that is never taken up costs the lender nothing and cannot be used to lock up
+    someone's balance."""
+    due_amount = round(principal * (1.0 + rate), 2)
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO loans (chat_id, lender_id, lender_name, borrower_id, borrower_name, '
+            'principal, rate, due_amount, status) '
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'offered') RETURNING id",
+            (chat_id, lender_id, lender_name, borrower_id, borrower_name,
+             principal, rate, due_amount)
+        )
+        return c.fetchone()[0], due_amount
+
+
+def get_loan(loan_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT id, chat_id, lender_id, lender_name, borrower_id, borrower_name, '
+                  'principal, rate, due_amount, COALESCE(paid,0), status, due_at '
+                  'FROM loans WHERE id = %s', (loan_id,))
+        return c.fetchone()
+
+
+def count_active_loans(chat_id, user_id, as_lender):
+    col = 'lender_id' if as_lender else 'borrower_id'
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(f"SELECT COUNT(*) FROM loans WHERE chat_id = %s AND {col} = %s "
+                  "AND status IN ('offered','active')", (chat_id, user_id))
+        return c.fetchone()[0]
+
+
+def accept_loan(loan_id, borrower_id, term_days):
+    """Atomically turns an offer into an active loan and hands over the principal.
+
+    Claims the row with a conditional UPDATE first, so two taps on the same button
+    cannot disburse twice. Returns (True, principal, due_amount) or (False, reason)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE loans SET status = 'active', accepted_at = NOW(), "
+                  "due_at = NOW() + (%s || %s)::interval "
+                  "WHERE id = %s AND status = 'offered' AND borrower_id = %s "
+                  'RETURNING chat_id, lender_id, principal, due_amount',
+                  (term_days, ' days', loan_id, borrower_id))
+        row = c.fetchone()
+        if row is None:
+            return (False, 'gone', 0)
+        chat_id, lender_id, principal, due_amount = row
+
+        if lender_id is None:
+            # Treasury loan: the vault funds it, and must actually have the money.
+            c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
+                      (chat_id,))
+            trow = c.fetchone()
+            if not trow or float(trow[0]) < principal:
+                c.execute("UPDATE loans SET status = 'offered', accepted_at = NULL, due_at = NULL "
+                          'WHERE id = %s', (loan_id,))
+                return (False, 'treasury', 0)
+            c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
+                      'WHERE chat_id = %s RETURNING balance', (principal, chat_id))
+            _bank_log(c, chat_id, borrower_id, 'loan_out', -principal, c.fetchone()[0],
+                      f'وام #{loan_id}')
+        else:
+            # Player lender: atomic check-and-take, so they cannot lend size they no
+            # longer have by the time the borrower gets around to tapping accept.
+            c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                      'WHERE user_id = %s AND chat_id = %s AND COALESCE(size,0) >= %s '
+                      'RETURNING size', (principal, lender_id, chat_id, principal))
+            lrow = c.fetchone()
+            if lrow is None:
+                c.execute("UPDATE loans SET status = 'offered', accepted_at = NULL, due_at = NULL "
+                          'WHERE id = %s', (loan_id,))
+                return (False, 'lender_broke', 0)
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s, %s, %s, %s, %s, %s)',
+                      (chat_id, lender_id, -principal, lrow[0], 'loan_principal', f'نزول #{loan_id}'))
+
+        if _size_move(c, chat_id, borrower_id, principal, 'loan_principal', f'وام #{loan_id}') is None:
+            raise RuntimeError('borrower has no users row')
+        return (True, float(principal), float(due_amount))
+
+
+def _collect(c, chat_id, borrower_id, principal, interest, loan_id):
+    """Pulls a whole debt out of a borrower: wallet first, then their bank deposit, and
+    if they are still short the remainder is driven negative on the wallet.
+
+    Reaching into the bank is deliberate. The bank is safe from *theft*, but if it were
+    safe from *debt* too then borrowing and immediately hiding the money in it would be
+    a free money printer.
+
+    The wallet-borne part of the debt is logged as two rows, not one: the interest under
+    'loan_interest' (real cost the handicap counts) and the rest under 'loan_principal'
+    (a transfer it ignores). Interest is charged against the wallet first, so the two
+    rows always sum to exactly the change the wallet actually saw - the ledger has to
+    reconstruct the balance, so it cannot book money the wallet never paid.
+
+    Returns (from_wallet, from_bank, shortfall)."""
+    total = round(principal + interest, 2)
+
+    c.execute('SELECT COALESCE(size,0) FROM users WHERE user_id = %s AND chat_id = %s FOR UPDATE',
+              (borrower_id, chat_id))
+    row = c.fetchone()
+    wallet = float(row[0]) if row else 0.0
+
+    from_wallet = round(min(max(wallet, 0.0), total), 2)
+    remaining = round(total - from_wallet, 2)
+
+    from_bank = 0.0
+    if remaining > 0.009:
+        c.execute('SELECT COALESCE(balance,0) FROM bank_accounts '
+                  'WHERE user_id = %s AND chat_id = %s FOR UPDATE', (borrower_id, chat_id))
+        brow = c.fetchone()
+        bank_bal = float(brow[0]) if brow else 0.0
+        from_bank = round(min(max(bank_bal, 0.0), remaining), 2)
+        if from_bank > 0:
+            c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING balance',
+                      (from_bank, borrower_id, chat_id))
+            _bank_log(c, chat_id, borrower_id, 'debt_seized', -from_bank, c.fetchone()[0],
+                      f'بدهی #{loan_id}')
+            remaining = round(remaining - from_bank, 2)
+
+    # Nothing left to take: the debt is still owed in full, so the wallet goes negative
+    # for the rest. The lender is made whole either way - that is what the borrower
+    # agreed to - and the hole is the borrower's problem to dig out of.
+    shortfall = remaining if remaining > 0.009 else 0.0
+    wallet_total = round(from_wallet + shortfall, 2)
+
+    interest_w = round(min(interest, wallet_total), 2)
+    principal_w = round(wallet_total - interest_w, 2)
+    if principal_w > 0.009:
+        _size_move(c, chat_id, borrower_id, -principal_w, 'loan_principal',
+                   f'بازپرداخت #{loan_id}')
+    if interest_w > 0.009:
+        _size_move(c, chat_id, borrower_id, -interest_w, 'loan_interest',
+                   f'سود بدهی #{loan_id}')
+
+    return (from_wallet, from_bank, shortfall)
+
+
+def settle_loan(loan_id, forced):
+    """Collects a loan in full and pays the lender. One transaction, so the borrower is
+    never debited without the lender being credited.
+
+    The money is split at payout: `principal` goes back under 'loan_principal' (a
+    transfer the handicap ignores) and the interest under 'loan_interest' (real profit
+    that it counts). Returns a dict describing what happened, or None if already closed."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE loans SET status = CASE WHEN %s THEN 'defaulted' ELSE 'repaid' END, "
+                  'closed_at = NOW(), paid = due_amount '
+                  "WHERE id = %s AND status = 'active' "
+                  'RETURNING chat_id, lender_id, lender_name, borrower_id, borrower_name, '
+                  'principal, due_amount', (forced, loan_id))
+        row = c.fetchone()
+        if row is None:
+            return None
+        chat_id, lender_id, lender_name, borrower_id, borrower_name, principal, due_amount = row
+        principal = float(principal); due_amount = float(due_amount)
+        interest = round(due_amount - principal, 2)
+
+        from_wallet, from_bank, shortfall = _collect(c, chat_id, borrower_id,
+                                                     principal, interest, loan_id)
+
+        if lender_id is None:
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                      (chat_id, due_amount, due_amount))
+            _bank_log(c, chat_id, borrower_id, 'loan_repaid', due_amount, c.fetchone()[0],
+                      f'وام #{loan_id}')
+        else:
+            _size_move(c, chat_id, lender_id, principal, 'loan_principal', f'اصل نزول #{loan_id}')
+            if interest > 0:
+                _size_move(c, chat_id, lender_id, interest, 'loan_interest', f'سود نزول #{loan_id}')
+
+        if forced:
+            c.execute('UPDATE users SET loan_defaults = COALESCE(loan_defaults,0) + 1 '
+                      'WHERE user_id = %s AND chat_id = %s', (borrower_id, chat_id))
+
+        return {
+            'chat_id': chat_id, 'lender_id': lender_id, 'lender_name': lender_name,
+            'borrower_id': borrower_id, 'borrower_name': borrower_name,
+            'principal': principal, 'due_amount': due_amount, 'interest': interest,
+            'from_wallet': from_wallet, 'from_bank': from_bank, 'shortfall': shortfall,
+            'forced': forced,
+        }
+
+
+def get_overdue_loans():
+    """Active loans whose due date has passed, oldest first - the collection sweep's input."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM loans WHERE status = 'active' AND due_at IS NOT NULL "
+                  'AND due_at <= NOW() ORDER BY due_at')
+        return [r[0] for r in c.fetchall()]
+
+
+def expire_loan_offers(ttl_seconds):
+    """Drops offers nobody accepted. No money has moved, so this is pure cleanup."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE loans SET status = 'expired', closed_at = NOW() "
+                  "WHERE status = 'offered' AND created_at < NOW() - (%s || %s)::interval",
+                  (ttl_seconds, ' seconds'))
+        return c.rowcount
+
+
+def get_user_loans(chat_id, user_id):
+    """(as_borrower, as_lender) active loans for the /bedehi screen."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT id, lender_name, lender_id, due_amount, due_at, principal, rate '
+                  "FROM loans WHERE chat_id = %s AND borrower_id = %s AND status = 'active' "
+                  'ORDER BY due_at', (chat_id, user_id))
+        borrowed = c.fetchall()
+        c.execute('SELECT id, borrower_name, due_amount, due_at, principal, rate '
+                  "FROM loans WHERE chat_id = %s AND lender_id = %s AND status = 'active' "
+                  'ORDER BY due_at', (chat_id, user_id))
+        lent = c.fetchall()
+        return borrowed, lent
+
+
+def get_loan_defaults(chat_id, user_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(loan_defaults,0) FROM users WHERE user_id = %s AND chat_id = %s',
+                  (user_id, chat_id))
+        row = c.fetchone()
+        return int(row[0]) if row else 0
