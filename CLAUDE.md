@@ -272,15 +272,19 @@ all 200.
 
 ## Martial law: the crown's veto over mob rule
 
-`/hokm` lets the sitting king dissolve one open `/ejma` and put whoever called it in the
-motley for `JESTER_HOURS`. Rationed to once per three days **per group** — the slot lives
+`/hokm` lets the sitting king dissolve the open `/ejma` **aimed at him** and put whoever
+called it in the motley for `JESTER_HOURS`. It reaches that vote and no other: martial
+law is self-defence, not patronage. Selecting the oldest open vote instead would let a
+king spend his one declaration shielding a friend while the group's case against *him*
+ran on, and with several votes open at once the one that got dissolved would come down
+to whichever happened to be filed first. Rationed to once per three days **per group** — the slot lives
 on `economy.last_martial_at`, not on the king, so abdicating and being re-crowned cannot
 refresh it.
 
 A cancelled vote is `status='cancelled'`, and deliberately does **not** call
 `set_consensus_protection` the way `fail_open_consensus` does. A vote that was dissolved
 by decree was never actually decided, so the group is free to open another one tomorrow:
-the king bought his favourite a night, not immunity. Getting this backwards would make a
+the king bought himself a night, not immunity. Getting this backwards would make a
 single `/hokm` worth three days of protection and turn the power from strong into
 unanswerable.
 

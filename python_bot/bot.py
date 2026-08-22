@@ -3949,11 +3949,12 @@ async def _revolt(context, chat_id, kingdom):
 
 
 async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/hokm` - the king dissolves an open /ejma and makes its caller his jester.
+    """`/hokm` - the king dissolves the open /ejma against HIM and jesters its caller.
 
-    Only the sitting king, only on a vote that is genuinely still open, and only once
-    every three days per group. Every use raises unrest: the group can see perfectly
-    well that a vote was cancelled by decree rather than lost."""
+    Only the sitting king, only on a vote actually aimed at the crown, only while that
+    vote is still open, and only once every three days per group. Every use raises
+    unrest: the group can see perfectly well that a vote was cancelled by decree rather
+    than lost."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
@@ -3973,14 +3974,27 @@ async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     openv = [v for v in db.get_any_open_consensus(chat_id)
              if v[5] < CONSENSUS_VOTE_WINDOW_SECONDS]
-    if not openv:
-        await update.message.reply_text(
-            "الان هیچ اجماع بازی وجود نداره که کنسلش کنی. 🤷\n"
-            "(حکومت نظامی فقط روی رأی‌گیری در جریان کار می‌کنه)")
+    # Martial law is self-defence, not patronage: it only ever reaches the vote aimed at
+    # the crown itself. Picking the oldest open vote instead would let a king spend his
+    # one declaration shielding a friend while the group's case against HIM ran on - and
+    # with several votes open at once, which one got dissolved would come down to
+    # whichever happened to be filed first.
+    mine = [v for v in openv if v[1] == kingdom[0]]
+    if not mine:
+        if openv:
+            others = "، ".join(_esc(v[2] or '?') for v in openv[:3])
+            await update.message.reply_text(
+                f"🪖 حکومت نظامی فقط اجماعی رو منحل می‌کنه که <b>علیه خودت</b> باشه.\n\n"
+                f"الان اجماع‌های باز علیه: {others}\n"
+                f"اونا به تاج ربطی ندارن — بذار مردم کارشون رو بکنن. 🤷",
+                parse_mode="HTML")
+        else:
+            await update.message.reply_text(
+                "الان هیچ اجماعی علیه تو باز نیست. 🤷\n"
+                "(حکومت نظامی فقط روی رأی‌گیریِ در جریانِ علیه پادشاه کار می‌کنه)")
         return
 
-    # Aim at the oldest open vote - the one closest to actually passing.
-    vote_id, target_id, target_name, initiator_id, amount, _age = openv[0]
+    vote_id, target_id, target_name, initiator_id, amount, _age = mine[0]
     if initiator_id == user.id:
         await update.message.reply_text("اجماع رو خودت راه انداختی! می‌خوای خودت رو دلقک کنی؟ 🤡")
         return
@@ -4016,8 +4030,8 @@ async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🪖 <b>حکومت نظامی!</b>\n\n"
-        f"پادشاه {_esc(kingdom[1] or '?')} اجماع علیه {_esc(t_name or '?')} رو منحل کرد.\n"
-        f"💨 اون {int(amt or 0)} سانت جایی نرفت.\n\n"
+        f"پادشاه {_esc(kingdom[1] or '?')} اجماعی که علیه <b>خودش</b> راه افتاده بود رو منحل کرد.\n"
+        f"💨 اون {int(amt or 0)} سانت از جیبش نرفت.\n\n"
         f"🤡 <b>{_esc(init_name)}</b> که این اجماع رو راه انداخته بود، "
         f"تا {JESTER_HOURS} ساعت <b>دلقک دربار</b>ه:\n"
         f"   • نمی‌تونه اجماع راه بندازه یا رأی بده\n"
