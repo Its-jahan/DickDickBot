@@ -24,6 +24,7 @@ def tehran_today_str():
 
 import db
 import lottery
+import decrees
 
 async def midnight_tasks(context: ContextTypes.DEFAULT_TYPE):
     """Everything that closes out a Tehran day, in the order that keeps the books
@@ -139,6 +140,9 @@ BOT_COMMANDS = [
     ("pardakht", "✅ تسویهٔ بدهی"),
     ("enteghal", "🔁 انتقال سایز به گروه دیگه (کارمزد بالا)"),
     ("etebar", "📊 اعتبارسنجی — /etebar @user (۵ سانت)"),
+    ("farman", "👑 (پادشاه) فرمان امروز رو امضا کن"),
+    ("eghtesad", "📊 وضعیت اقتصاد گروه"),
+    ("farmanha", "📜 تاریخچهٔ فرمان‌های سلطنتی"),
     ("ach", "🏅 نشان‌ها و استریک من"),
     ("wr", "📊 آمار برد و باخت"),
     ("help", "❓ راهنمای کامل بازی"),
@@ -595,7 +599,9 @@ HELP_TEXT = (
     "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
     "🏛 /vam <مقدار> — وام رسمی از بانک\n"
     "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
-    "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (کارمزد سنگین)\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"
+    "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (کارمزد سنگین)\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"    "👑 /farman — (پادشاه) فرمان روزانه\n"
+    "📊 /eghtesad — تورم، خشم مردم و اهرم‌های تاج\n"
+    "📜 /farmanha — تاریخچهٔ فرمان‌ها\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
     "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
     "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
@@ -1471,7 +1477,7 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         # full) used to simply evaporate; it goes to the vault now too. Both are
         # transfers, so the match stays zero-sum: loser_loss leaves the loser and
         # exactly loser_loss arrives, split between the winner and the treasury.
-        house_cut = int(winner_gain * CHALLENGE_FEE_RATIO)
+        house_cut = int(winner_gain * fee_of(chat_id, CHALLENGE_FEE_RATIO))
         spread = int(max(0, loser_loss - winner_gain))
         winner_take = winner_gain - house_cut
 
@@ -1861,6 +1867,11 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # exactly what gets credited and exactly what the player is shown. The downside
     # bound is left alone, so this only ever takes away good days.
     _, growth_mult = db.get_modifiers(user.id, chat_id)
+    # Wages track prices: the group-wide dial the crown sets, and the price level itself,
+    # both widen the roll. Without this, inflation would quietly impoverish everyone who
+    # earns rather than only everyone who saves - which is not inflation, just a tax.
+    econ = db.get_economy(chat_id)
+    growth_mult *= econ[4] * max(INFLATION_PRICE_FLOOR, econ[0])
     if growth_mult != 1.0:
         high = max(1, int(round(high * growth_mult)))
 
@@ -2301,6 +2312,19 @@ CREDIT_MIN_FACTOR, CREDIT_MAX_FACTOR = 0.2, 1.5
 # /etebar is for, so a lender can price the risk themselves before offering.
 BANK_LOAN_MIN_SCORE = 60
 
+# ---------------------------------------------------------------- inflation
+# The index is a real price level, not decoration. Everything the game charges is
+# multiplied by it and everything it pays out is too, which is what makes inflation
+# behave the way it does in life: flows keep pace, but STOCKS do not. A player sitting
+# on a banked fortune watches it buy less every day, while anyone carrying a debt - the
+# amount of which is fixed in nominal size - is quietly let off. That single asymmetry
+# is the whole reason the king's choice between printing and squeezing matters to
+# everyone, and it is why savers and debtors want opposite kings.
+INFLATION_PRICE_FLOOR = 0.4   # never make things absurdly cheap
+UNREST_REVOLT_THRESHOLD = 75  # above this, the throne starts wobbling nightly
+UNREST_DAILY_COOLDOWN = 4     # anger fades a little on its own
+DECREE_CHOICES = 3            # how many the king is offered each night
+
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
     'streak_7': ('🔥', 'هفتهٔ کامل', '۷ روز پشت سر هم دودولش رو مالید'),
@@ -2698,7 +2722,7 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # The vault takes its cut. Stolen size stays inside the group either way, but a
         # slice of it now funds everyone's deposit interest instead of all landing on
         # the thief.
-        theft_fee = int(loot * THEFT_FEE_RATIO)
+        theft_fee = int(loot * fee_of(chat_id, THEFT_FEE_RATIO))
         db.update_size(user.id, chat_id, loot - theft_fee)
         if theft_fee > 0:
             db.treasury_add(chat_id, theft_fee, note="کارمزد دزدی")
@@ -2902,7 +2926,7 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ok, res, used, fee = db.bank_deposit(user.id, chat_id, amount, tehran_today_str(), cap,
-                                         BANK_DEPOSIT_FEE_RATIO)
+                                         fee_of(chat_id, BANK_DEPOSIT_FEE_RATIO))
     if not ok:
         if res == 'cap':
             await update.message.reply_text(f"سقف واریز امروزت پر شده! فردا دوباره تا {cap} سانت.")
@@ -2943,7 +2967,7 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = int(balance)
 
     ok, new_balance, paid_out, fee = db.bank_withdraw(user.id, chat_id, amount,
-                                                      BANK_WITHDRAW_FEE_RATIO)
+                                                      fee_of(chat_id, BANK_WITHDRAW_FEE_RATIO))
     if not ok:
         await update.message.reply_text("موجودی بانکت کافی نیست!")
         return
@@ -3056,8 +3080,13 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             if not db.claim_interest_run(chat_id, today_str):
                 continue
+            econ = db.get_economy(chat_id)
+            # The nominal rate is the crown's to set. Note it is NOT inflation-adjusted:
+            # that is the point - depositors carry the inflation risk themselves, so a
+            # money-printing king really does rob the savers.
+            rate = max(0.0, min(0.50, BANK_INTEREST_RATE * econ[3]))
             rows, paid, left = db.pay_interest(
-                chat_id, BANK_INTEREST_RATE, BANK_INTEREST_MAX_TREASURY_SHARE
+                chat_id, rate, BANK_INTEREST_MAX_TREASURY_SHARE
             )
             if rows <= 0 or paid <= 0:
                 continue
@@ -3362,7 +3391,7 @@ async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("این شماره جزو بدهی‌های باز تو نیست!")
         return
 
-    result = db.settle_loan(loan_id, forced=False)
+    result = db.settle_loan(loan_id, forced=False, today_str=tehran_today_str())
     if not result:
         await update.message.reply_text("این بدهی همین الان تسویه شد!")
         return
@@ -3373,8 +3402,15 @@ async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result['shortfall'] > 0:
         extra += f"\n🔻 {int(result['shortfall'])} سانت کم آوردی و سایزت رفت زیر صفر."
     d = result['credit_delta']
-    credit_line = (f"\n\n📊 اعتبارت {d:+d} شد → <b>{result['credit_score']}</b>/200"
-                   + (" (دیر تسویه کردی!)" if result['was_late'] else " (سروقت تسویه کردی 👌)"))
+    if result['outcome'] == 'token':
+        why = " (وام خیلی کوچیک/زودگذر بود — اعتبار نمی‌آره)"
+    elif result['outcome'] == 'capped':
+        why = " (به سقف اعتبارِ امروزت رسیدی)"
+    elif result['was_late']:
+        why = " (دیر تسویه کردی!)"
+    else:
+        why = " (سروقت تسویه کردی 👌)"
+    credit_line = f"\n\n📊 اعتبارت {d:+d} شد → <b>{result['credit_score']}</b>/200{why}"
     await update.message.reply_text(
         f"✅ بدهی #{loan_id} تسویه شد.\n\n"
         f"💸 {int(result['due_amount'])} سانت به {_esc(who or '?')} پرداخت شد "
@@ -3395,7 +3431,7 @@ async def collect_loans_job(context: ContextTypes.DEFAULT_TYPE):
 
     for loan_id in db.get_overdue_loans():
         try:
-            r = db.settle_loan(loan_id, forced=True)
+            r = db.settle_loan(loan_id, forced=True, today_str=tehran_today_str())
             if not r:
                 continue
             who = "بانک" if r['lender_id'] is None else r['lender_name']
@@ -3480,6 +3516,345 @@ async def credit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"\n\n🧾 هزینهٔ اعتبارسنجی: {CREDIT_CHECK_FEE} سانت → خزانه",
         parse_mode="HTML"
     )
+
+
+def inflation_of(chat_id):
+    return db.get_economy(chat_id)[0]
+
+
+def priced(base, chat_id, inflation=None):
+    """What something costs here and now. Every shop price, ticket and payout goes
+    through this rather than using its constant directly."""
+    infl = inflation if inflation is not None else inflation_of(chat_id)
+    return max(1, int(round(base * max(INFLATION_PRICE_FLOOR, infl))))
+
+
+def fee_of(chat_id, base_ratio, econ=None):
+    """A fee rate after the crown's dial. The king can halve fees or pile them on."""
+    e = econ or db.get_economy(chat_id)
+    return max(0.0, min(0.90, base_ratio * e[2]))
+
+
+# ---------------------------------------------------------------- royal decrees
+
+# What the king is offered tonight, per group: {chat_id: (date, [codes], king_id)}.
+# Held in memory on purpose - an offer that is lost to a restart simply gets re-rolled
+# by the next night's job, and nothing has moved until one is signed.
+pending_decrees = {}
+
+
+def _roll_decrees(chat_id, today_str, king_id):
+    """Deal tonight's hand: always a mix, so the king is always choosing between selling
+    the country and paying for it rather than being handed a single obvious move."""
+    bad = [d[0] for d in random.sample(decrees.BAD, 2)]
+    good = [d[0] for d in random.sample(decrees.GOOD, DECREE_CHOICES - 1)]
+    codes = bad[:1] + good + bad[1:2]
+    codes = codes[:DECREE_CHOICES]
+    random.shuffle(codes)
+    pending_decrees[chat_id] = (today_str, codes, king_id)
+    return codes
+
+
+def _decree_keyboard(chat_id, codes):
+    rows = []
+    for i, code in enumerate(codes, 1):
+        d = decrees.get(code)
+        if not d:
+            continue
+        mark = "😈" if d[4] == 'bad' else "😇"
+        rows.append([InlineKeyboardButton(f"{mark} {i}. {d[1]}", callback_data=f"decree_{code}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _render_decree_offer(king_name, codes, econ):
+    inflation, unrest, fee_m, int_m, grow_m = econ
+    lines = [
+        f"👑 <b>فرمان امشب — {_esc(king_name)}</b>", "",
+        f"📈 تورم: <b>{inflation:.2f}×</b>   😡 خشم مردم: <b>{unrest:.0f}</b>/100",
+        f"🧾 کارمزد ×{fee_m:.2f}   🏦 سود ×{int_m:.2f}   🌱 رشد ×{grow_m:.2f}", "",
+        "یکی رو باید امضا کنی:", "",
+    ]
+    for i, code in enumerate(codes, 1):
+        d = decrees.get(code)
+        if not d:
+            continue
+        _c, title, desc, eff, kind = d
+        mark = "😈 فاسد" if kind == 'bad' else "😇 سازنده"
+        lines.append(f"<b>{i}. {_esc(title)}</b> — {mark}")
+        lines.append(f"<i>{_esc(desc)}</i>")
+        for bit in decrees.summarize(eff):
+            lines.append(f"   • {bit}")
+        lines.append("")
+    lines.append("⚠️ تا فردا شب فقط یکی می‌تونی امضا کنی.")
+    return "\n".join(lines)
+
+
+async def decree_offer_job(context: ContextTypes.DEFAULT_TYPE):
+    """Each night, hand the sitting king three choices. No king, no decree."""
+    today_str = tehran_today_str()
+    for chat_id in db.get_all_chats():
+        try:
+            kingdom, _ = refresh_king(chat_id)
+            if not kingdom or not kingdom[0]:
+                continue
+            king_id, king_name = kingdom[0], kingdom[1]
+            econ = db.get_economy(chat_id)
+            codes = _roll_decrees(chat_id, today_str, king_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=_render_decree_offer(king_name, codes, econ),
+                reply_markup=_decree_keyboard(chat_id, codes),
+                parse_mode="HTML"
+            )
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception:
+            logging.exception(f"decree offer failed for {chat_id}")
+
+
+async def decree_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/farman` - the king pulls up tonight's choices if he missed the announcement."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("فرمان سلطنتی فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    kingdom, _ = refresh_king(chat_id)
+    if not kingdom or not kingdom[0]:
+        await update.message.reply_text("این گروه هنوز پادشاه نداره! با /king ببین چطور تاج می‌گیرن.")
+        return
+    if user.id != kingdom[0]:
+        await update.message.reply_text(
+            f"فقط پادشاه ({_esc(kingdom[1] or '?')}) می‌تونه فرمان بده! 👑", parse_mode="HTML"
+        )
+        return
+
+    today_str = tehran_today_str()
+    entry = pending_decrees.get(chat_id)
+    if not entry or entry[0] != today_str or entry[2] != kingdom[0]:
+        # No hand dealt yet today (or the crown changed hands) - deal one now.
+        codes = _roll_decrees(chat_id, today_str, kingdom[0])
+    else:
+        codes = entry[1]
+
+    econ = db.get_economy(chat_id)
+    full = db.get_economy_full(chat_id)
+    if full and full[6] == today_str:
+        await update.message.reply_text("امروز فرمانت رو امضا کردی! فردا دوباره. 👑")
+        return
+    await update.message.reply_text(
+        _render_decree_offer(kingdom[1] or '?', codes, econ),
+        reply_markup=_decree_keyboard(chat_id, codes), parse_mode="HTML"
+    )
+
+
+async def decree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن!", show_alert=True)
+        return
+    code = query.data.split('_', 1)[1] if '_' in query.data else ''
+    d = decrees.get(code)
+    if not d:
+        await query.answer("این فرمان معتبر نیست!", show_alert=True)
+        return
+
+    kingdom, _ = refresh_king(chat_id)
+    if not kingdom or user.id != kingdom[0]:
+        await query.answer("فقط پادشاه می‌تونه فرمان امضا کنه! 👑", show_alert=True)
+        return
+
+    today_str = tehran_today_str()
+    entry = pending_decrees.get(chat_id)
+    # Only a decree that was actually offered tonight can be signed - callback_data is
+    # client-supplied, so without this a king could pick his favourite out of all 200.
+    if not entry or entry[0] != today_str or code not in entry[1]:
+        await query.answer("این فرمان جزو گزینه‌های امشب نیست!", show_alert=True)
+        return
+    if not db.claim_decree_day(chat_id, today_str):
+        await query.answer("امروز فرمانت رو امضا کردی! فردا دوباره.", show_alert=True)
+        return
+
+    _c, title, desc, eff, kind = d
+    try:
+        res = db.apply_decree(chat_id, kingdom[0], kingdom[1] or '?', today_str,
+                              code, title, kind, eff)
+    except Exception:
+        db.release_decree_day(chat_id)
+        logging.exception(f"decree {code} failed in {chat_id}")
+        await query.answer("اجرای فرمان به مشکل خورد!", show_alert=True)
+        return
+
+    pending_decrees.pop(chat_id, None)
+    mark = "😈" if kind == 'bad' else "😇"
+    lines = [f"👑 <b>فرمان امضا شد</b> {mark}", "",
+             f"<b>{_esc(title)}</b>", f"<i>{_esc(desc)}</i>", ""]
+    if res['king_delta']:
+        verb = "گرفت" if res['king_delta'] > 0 else "داد"
+        lines.append(f"👑 پادشاه {abs(int(res['king_delta']))} سانت {verb}")
+    if res['minted']:
+        lines.append(f"🖨 {int(res['minted'])} سانت از هیچ چاپ شد")
+    if res['treasury_delta']:
+        lines.append(f"🏛 خزانه {int(res['treasury_delta']):+d}")
+    if res['players_delta']:
+        lines.append(f"👥 مردم در مجموع {int(res['players_delta']):+d}")
+    arrow = "📈" if res['inflation'] > res['inflation_before'] else (
+            "📉" if res['inflation'] < res['inflation_before'] else "➖")
+    lines.append(f"{arrow} تورم: {res['inflation_before']:.2f} → <b>{res['inflation']:.2f}</b>")
+    lines.append(f"😡 خشم مردم: <b>{res['unrest']:.0f}</b>/100")
+    if res['fee_mult'] != 1.0 or res['interest_mult'] != 1.0 or res['growth_mult'] != 1.0:
+        lines.append(f"🧾 کارمزد ×{res['fee_mult']}  🏦 سود ×{res['interest_mult']}  "
+                     f"🌱 رشد ×{res['growth_mult']}")
+    if res['unrest'] >= UNREST_REVOLT_THRESHOLD:
+        lines.append("\n🔥 <b>مردم دارن شورش می‌کنن!</b> اگه همین‌طور ادامه بدی، تاج رو از سرت برمی‌دارن.")
+
+    await query.answer("فرمان اجرا شد!")
+    try:
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+    except Exception:
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
+
+
+async def economy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/eghtesad` - the state of the economy, readable by anyone. Deliberately public:
+    the whole point of the unrest mechanic is that the group can see what the crown is
+    doing to them."""
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    full = db.get_economy_full(chat_id)
+    inflation, unrest, fee_m, int_m, grow_m, supply_last, last_decree, good, bad = full
+    supply = db.get_money_supply(chat_id)
+    treasury, _, _ = db.get_treasury(chat_id)
+    deposits, holders = db.get_bank_totals(chat_id)
+    kingdom = db.get_kingdom(chat_id)
+    king = kingdom[1] if kingdom and kingdom[1] else "—"
+
+    mood = ("😌 آروم" if unrest < 25 else "😐 ناراضی" if unrest < 50
+            else "😠 عصبانی" if unrest < UNREST_REVOLT_THRESHOLD else "🔥 در آستانهٔ شورش")
+    trend = ("🔥 تورم شدید" if inflation >= 2.0 else "📈 تورم بالا" if inflation >= 1.3
+             else "✅ باثبات" if inflation >= 0.85 else "📉 رکود / کاهش قیمت")
+
+    lines = [
+        f"📊 <b>اقتصاد گروه</b>", "",
+        f"👑 پادشاه: {_esc(king)}",
+        f"📈 شاخص قیمت: <b>{inflation:.2f}×</b> — {trend}",
+        f"😡 خشم مردم: <b>{unrest:.0f}</b>/100 — {mood}", "",
+        f"💵 کل پول در گردش: {int(supply)} سانت",
+        f"🏛 خزانه: {int(treasury)} سانت",
+        f"🏦 سپرده‌ها: {int(deposits)} سانت ({holders} نفر)", "",
+        f"<b>اهرم‌های تاج</b>",
+        f"🧾 کارمزدها: ×{fee_m:.2f}",
+        f"🏦 سود سپرده: ×{int_m:.2f}  (نرخ مؤثر {BANK_INTEREST_RATE*int_m*100:.1f}٪)",
+        f"🌱 رشد روزانه: ×{grow_m:.2f}", "",
+        f"📜 فرمان‌ها: {good} سازنده / {bad} فاسد", "",
+        f"<b>قیمت‌ها با تورم امروز</b>",
+        f"🍆 ویاگرا {priced(60, chat_id, inflation)} • 🎟 بلیت لاتاری "
+        f"{priced(LOTTERY_TICKET_PRICE, chat_id, inflation)} • 🐉 پاداش باس "
+        f"{priced(BOSS_REWARD_BASE, chat_id, inflation)}",
+    ]
+    if inflation > 1.15:
+        lines.append("\n💡 تورم بالاست: پسِ‌انداز آب می‌ره، بدهکارها برنده‌ان.")
+    elif inflation < 0.9:
+        lines.append("\n💡 قیمت‌ها پایینه: پس‌انداز می‌ارزه، بدهی سنگین‌تر شده.")
+    lines.append("\nتاریخچه: /farmanha")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def decree_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/farmanha` - what past kings actually did, so a record follows them around."""
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        return
+    rows = db.get_decree_history(chat_id, 12)
+    if not rows:
+        await update.message.reply_text("هنوز هیچ فرمانی امضا نشده.")
+        return
+    lines = ["📜 <b>دفتر فرمان‌ها</b>", ""]
+    for date, king_name, title, kind, inf_b, inf_a, king_delta in rows:
+        mark = "😈" if kind == 'bad' else "😇"
+        arrow = "📈" if (inf_a or 0) > (inf_b or 0) else ("📉" if (inf_a or 0) < (inf_b or 0) else "➖")
+        lines.append(f"{mark} <b>{date}</b> — {_esc(king_name or '?')}: {_esc(title)}")
+        lines.append(f"    {arrow} تورم {inf_b:.2f}→{inf_a:.2f} | 👑 {int(king_delta or 0):+d} سانت")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def economy_tick_job(context: ContextTypes.DEFAULT_TYPE):
+    """Nightly: let the price index chase the money supply, cool the mob a little, and
+    see whether a hated king still has a throne."""
+    today_str = tehran_today_str()
+    for chat_id in db.get_all_chats():
+        try:
+            tick = db.tick_inflation(chat_id, today_str)
+            unrest = db.cool_unrest(chat_id, UNREST_DAILY_COOLDOWN)
+            if tick:
+                before, after, growth = tick
+                if abs(after - before) >= 0.02:
+                    arrow = "📈" if after > before else "📉"
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(f"{arrow} <b>شاخص قیمت‌ها</b>\n\n"
+                              f"حجم پول {growth*100:+.1f}٪ تغییر کرد.\n"
+                              f"تورم: {before:.2f} → <b>{after:.2f}</b>\n\n"
+                              + ("قیمت‌ها گرون‌تر شد و ارزش پس‌اندازها کم شد."
+                                 if after > before else
+                                 "قیمت‌ها پایین اومد و پس‌اندازها باارزش‌تر شد.")),
+                        parse_mode="HTML")
+
+            # A furious population eventually removes the problem themselves.
+            if unrest >= UNREST_REVOLT_THRESHOLD:
+                kingdom = db.get_kingdom(chat_id)
+                if kingdom and kingdom[0]:
+                    chance = min(0.85, (unrest - UNREST_REVOLT_THRESHOLD) / 40.0 + 0.20)
+                    if random.random() < chance:
+                        await _revolt(context, chat_id, kingdom)
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception:
+            logging.exception(f"economy tick failed for {chat_id}")
+
+
+async def _revolt(context, chat_id, kingdom):
+    """The bill for a corrupt reign. The king's hoard is seized and handed straight back
+    to the people he took it from, which is what makes looting a loan against your own
+    future rather than free money."""
+    king_id, king_name = kingdom[0], kingdom[1]
+    size, _, _ = db.get_user(king_id, chat_id, None, None)
+    seized = max(0.0, size) * 0.40
+    if seized < 1:
+        return
+    players = [p for p in db.get_all_players(chat_id) if p[0] != king_id and p[0] != BOT_USER_ID]
+    if not players:
+        return
+    if not db.try_deduct_size(king_id, chat_id, seized):
+        return
+    share = seized / len(players)
+    for uid, _n, _s in players:
+        db.update_size(uid, chat_id, share)
+    db.cool_unrest(chat_id, 60)
+    # No need to strip the crown by hand: it is derived from the leaderboard, so losing
+    # 40% of his hoard is itself what unseats him - and if he is still the biggest
+    # player even after that, he has genuinely earned the right to keep it.
+    _kd, new_king = refresh_king(chat_id)
+    tail = (f"👑 {_esc(new_king[1])} پادشاه جدیده."
+            if new_king else
+            f"👑 با این‌همه، {_esc(king_name or '?')} هنوز بزرگ‌ترینه و تاج سرش موند!")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(f"🔥🔥 <b>شورش!</b>\n\n"
+              f"مردم ریختن تو قصر و {_esc(king_name or '?')} رو کشیدن پایین.\n"
+              f"💰 {int(seized)} سانت از دارایی‌ش مصادره و بین {len(players)} نفر تقسیم شد "
+              f"(هر نفر {int(share)} سانت).\n\n" + tail),
+        parse_mode="HTML")
+    if new_king:
+        await announce_achievements(context, chat_id, new_king[1],
+                                    award(new_king[0], chat_id, 'king'))
 
 
 async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3633,7 +4008,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_shop_keyboard(user_id):
     rows = []
-    items = list(SHOP_PRICES.items())
+    items = [(nm, priced(pr, chat_id)) for nm, pr in SHOP_PRICES.items()]
     for i in range(0, len(items), 2):
         row = [InlineKeyboardButton(f"{name} — {price}", callback_data=f"buy_{user_id}_{name}")
                for name, price in items[i:i + 2]]
@@ -3647,7 +4022,8 @@ async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.track_chat(chat_id)
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     lines = ["🏪 **فروشگاه دودول**\n", f"💰 موجودی شما: {int(size)} سانتی‌متر\n"]
-    for name, price in SHOP_PRICES.items():
+    for name, base_price in SHOP_PRICES.items():
+        price = priced(base_price, chat_id)
         lines.append(f"• {name} — {price} سانت\n  └ {ITEM_DESCRIPTIONS.get(name, '')}")
     lines.append("\nروی دکمه بزن تا بخری 👇")
     await update.message.reply_text("\n".join(lines), reply_markup=build_shop_keyboard(user.id))
@@ -3672,10 +4048,11 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id != owner_id:
         await query.answer("این فروشگاه مال شما نیست! خودت /shop بزن.", show_alert=True)
         return
-    price = SHOP_PRICES.get(item_name)
-    if price is None:
+    base_price = SHOP_PRICES.get(item_name)
+    if base_price is None:
         await query.answer("این آیتم تو فروشگاه نیست!", show_alert=True)
         return
+    price = priced(base_price, chat_id)
 
     db.get_user(user.id, chat_id, user.username, user.first_name)
     # Pay first, then hand over the goods; if the insert somehow fails the size goes back.
@@ -3801,7 +4178,7 @@ async def boss_hit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"🎉 گروه **{name}** رو کشت!", "", "💰 جایزه‌ها:"]
     top_damage = max((h[2] for h in hits), default=0)
     for uid, fname, dmg in hits:
-        reward = BOSS_REWARD_BASE + dmg // 2
+        reward = priced(BOSS_REWARD_BASE, chat_id) + dmg // 2
         if dmg == top_damage:
             reward += BOSS_TOP_DAMAGE_BONUS
         db.update_size(uid, chat_id, reward)
@@ -3851,7 +4228,7 @@ def build_lottery_view(chat_id, user_id):
     lines = [
         "🎟️ **لاتاری امشب**",
         f"💰 جایزه: {int(pot * (1 - LOTTERY_BURN_RATIO))} سانتی‌متر",
-        f"🎫 قیمت هر بلیت: {LOTTERY_TICKET_PRICE} سانت",
+        f"🎫 قیمت هر بلیت: {priced(LOTTERY_TICKET_PRICE, chat_id)} سانت",
         f"🎫 بلیت‌های تو: {mine}",
         "",
         "قرعه‌کشی نیمه‌شب به وقت تهران. هرچی بلیت بیشتر، شانس بیشتر.",
@@ -3889,7 +4266,7 @@ async def lottery_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if count not in (1, 5, 10):
         return
 
-    cost = count * LOTTERY_TICKET_PRICE
+    cost = count * priced(LOTTERY_TICKET_PRICE, chat_id)
     _, _, buyer_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
     if buyer_perk == "بدبیار":
         await query.answer("امروز پرک بدبیار 🚫 داری و نمی‌تونی بلیت لاتاری بخری!", show_alert=True)
@@ -4164,8 +4541,10 @@ if __name__ == '__main__':
 
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
+    app.job_queue.run_daily(decree_offer_job, time=time(hour=21, minute=30, second=0, tzinfo=IRAN_TZ))
     # 00:20 Tehran: after midnight_tasks has settled the lottery, expired bosses and
     # collected the crown's tax, so the handicap reads a closed, complete day.
+    app.job_queue.run_daily(economy_tick_job, time=time(hour=0, minute=5, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(bank_interest_job, time=time(hour=0, minute=10, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(collect_loans_job, time=time(hour=0, minute=15, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(auto_handicap_job, time=time(hour=0, minute=20, second=0, tzinfo=IRAN_TZ))
@@ -4207,6 +4586,9 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(pardakht|repay)\b'), repay_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(enteghal|transfer)\b'), transfer_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(etebar|credit)\b'), credit_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(farman|decree)\b'), decree_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(farmanha|decrees)\b'), decree_history_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(eghtesad|economy)\b'), economy_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).
@@ -4231,6 +4613,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(lottery_buy_callback, pattern=r'^lot_'))
     app.add_handler(CallbackQueryHandler(loan_accept_callback, pattern=r'^loanok_'))
     app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r'^xfer_'))
+    app.add_handler(CallbackQueryHandler(decree_callback, pattern=r'^decree_'))
     
     app.add_handler(InlineQueryHandler(inline_query))
     

@@ -216,6 +216,62 @@ lender pays `CREDIT_CHECK_FEE` to price the risk themselves before making an off
 fee is a transfer to the treasury like every other fee, and unlike loan principal it
 *does* count toward the nightly handicap, because it is a real cost.
 
+## The economy is political, and that is the design
+
+`economy` holds one row per group: an `inflation` price index, an `unrest` level, and
+three multipliers the crown controls (`fee_mult`, `interest_mult`, `growth_mult`).
+
+**Inflation is a real price level, not a stat.** Everything the game charges and
+everything it pays out goes through `bot.priced()`, so shop items, lottery tickets, boss
+rewards and the daily growth roll all scale with it. Flows keep pace; **stocks do not**.
+A banked fortune buys less every day the index rises, while a debt — fixed in nominal
+size — quietly shrinks. That single asymmetry is why savers and debtors want opposite
+kings, and it is the whole reason the crown's choices matter to anyone but the king.
+
+It moves two ways. `tick_inflation` runs nightly and chases the actual money supply
+(wallets + deposits + treasury), so a group that prints finds its shop expensive without
+anyone deciding that. Decrees push the same number deliberately.
+
+### The decrees are asymmetric on purpose
+
+`decrees.py` holds 100 corrupt and 100 honest decrees. **Every** corrupt one pays the
+king (`mint`, `treasury_to_king`, or `levy`) and raises `unrest`; **every** honest one
+costs him (`king_to_treasury`, `handout`, `relief`, or `burn_king`) and lowers it. There
+are regression tests asserting exactly that, 100/100 in both directions — if you add a
+decree that breaks the pattern, those tests fail, and they should.
+
+The tension this creates is the game. The crown belongs to whoever is biggest, so every
+honest decree pushes the king toward losing it, and every corrupt one raises unrest
+toward a revolt that seizes 40% of his size and hands it to everyone else. Ruling well
+is a slow way to lose power; ruling badly is a sudden one.
+
+`mint` is the only thing in the entire codebase that creates size from nothing. It is
+reserved for the worst decrees deliberately — that is what makes debasement genuinely
+corrosive rather than merely unfair, and it is why the bank's "cannot mint" rule is
+written the way it is.
+
+### Two things to be careful of here
+
+`apply_decree` must `INSERT ... ON CONFLICT DO NOTHING` the economy row before it reads
+and updates it. Without that, a group whose economy nobody has read yet silently absorbs
+every decree's inflation and unrest into a row that does not exist — the decree appears
+to work and changes nothing. That was a real bug, caught by test 9.
+
+Only a decree that was actually offered tonight can be signed. `callback_data` is
+client-supplied, so `decree_callback` checks the code against `pending_decrees` as well
+as checking the signer is the king — otherwise a king could pick his favourite out of
+all 200.
+
+## Credit gains are scaled; credit losses are not
+
+The obvious exploit is to borrow the minimum, repay it immediately, and repeat. Three
+independent brakes, because any one alone is dodgeable: the gain scales with the loan's
+size **relative to the borrower** (`size_at_accept`, snapshotted before the principal
+lands), a loan repaid inside `CREDIT_MIN_HOLD_RATIO` of its term earns nothing at all,
+and `CREDIT_DAILY_GAIN_CAP` bounds a day's total. Penalties are deliberately unscaled:
+credit should be slow to build and quick to lose, and a cheap practice default should
+still hurt.
+
 ## Admin panel
 
 `python_bot/admin_panel.py` is a separate Flask/gunicorn service (`dickbot-admin`,

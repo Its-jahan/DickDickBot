@@ -38,6 +38,18 @@ CREDIT_FORCED = -20       # the nightly sweep had to take it from their wallet
 CREDIT_BANK_SEIZED = -30  # ...and had to reach into their bank deposit
 CREDIT_SHORTFALL = -45    # ...and they still could not cover it
 
+# Anti-farming. Without these, the cheapest way to a perfect score is to borrow the
+# minimum, repay it seconds later, and repeat - no risk taken, full reward. Three
+# independent brakes, because any one of them alone is dodgeable:
+#   1. the gain scales with how big the loan was RELATIVE TO THE BORROWER, so a token
+#      loan earns a token amount (a 10 on a 1000-size player is worth nothing);
+#   2. a loan repaid almost immediately earns nothing at all - you carried no risk;
+#   3. a hard daily ceiling on credit gained, so grinding many loans cannot substitute.
+# Penalties are deliberately NOT scaled the same way. Credit should be slow to build and
+# quick to lose, and a cheap "practice default" should still hurt.
+CREDIT_MIN_HOLD_RATIO = 0.25   # of the term, before an early repayment counts at all
+CREDIT_DAILY_GAIN_CAP = 12
+
 
 @contextmanager
 def get_connection():
@@ -357,6 +369,46 @@ def init_db():
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS bank_log_chat_idx ON bank_log (chat_id, created_at DESC)')
 
+        # ---------------------------------------------------------------- economy
+        # One row per group. `inflation` is a price index: everything the game charges
+        # or pays out is multiplied by it, so a group that prints money finds its shop
+        # getting expensive. `unrest` is what a looted population does about it.
+        # The three multipliers are the levers the crown actually holds.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS economy (
+                chat_id BIGINT PRIMARY KEY,
+                inflation DOUBLE PRECISION DEFAULT 1.0,
+                unrest DOUBLE PRECISION DEFAULT 0,
+                fee_mult DOUBLE PRECISION DEFAULT 1.0,
+                interest_mult DOUBLE PRECISION DEFAULT 1.0,
+                growth_mult DOUBLE PRECISION DEFAULT 1.0,
+                supply_last DOUBLE PRECISION,
+                last_decree_date TEXT DEFAULT '',
+                last_tick_date TEXT DEFAULT '',
+                decrees_good INTEGER DEFAULT 0,
+                decrees_bad INTEGER DEFAULT 0
+            )
+        ''')
+        # The decrees a king was offered on a given day, and which one he signed.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS decree_log (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                king_id BIGINT,
+                king_name TEXT,
+                decree_date TEXT,
+                code TEXT,
+                title TEXT,
+                kind TEXT,
+                inflation_before DOUBLE PRECISION,
+                inflation_after DOUBLE PRECISION,
+                king_delta DOUBLE PRECISION,
+                unrest_after DOUBLE PRECISION,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS decree_log_chat_idx ON decree_log (chat_id, id DESC)')
+
         # ---------------------------------------------------------------- loans
         # lender_id IS NULL means the group's treasury is the lender (the official
         # /vam loan); any other value is a player-to-player نزول. Both settle through
@@ -382,6 +434,7 @@ def init_db():
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS loans_chat_status_idx ON loans (chat_id, status)')
         c.execute('CREATE INDEX IF NOT EXISTS loans_due_idx ON loans (status, due_at)')
+        c.execute("ALTER TABLE loans ADD COLUMN IF NOT EXISTS size_at_accept DOUBLE PRECISION")
         # How many times this player has been force-collected. Worn publicly as بدهکار
         # and used to price future loans.
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loan_defaults INTEGER DEFAULT 0")
@@ -392,6 +445,8 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_score INTEGER DEFAULT 100")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loans_repaid INTEGER DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loans_late INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_date TEXT DEFAULT ''")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_today INTEGER DEFAULT 0")
 
         # One-time: charge the deposit fee on money that was banked before the fee
         # existed. Everyone who deposited in that window got in free, which is both
@@ -2218,6 +2273,13 @@ def accept_loan(loan_id, borrower_id, term_days):
                       'VALUES (%s, %s, %s, %s, %s, %s)',
                       (chat_id, lender_id, -principal, lrow[0], 'loan_principal', f'نزول #{loan_id}'))
 
+        c.execute('SELECT COALESCE(size,0) FROM users WHERE user_id = %s AND chat_id = %s',
+                  (borrower_id, chat_id))
+        brow = c.fetchone()
+        # Snapshot taken BEFORE the principal lands, so it measures what they were worth
+        # when they asked - which is what makes the loan large or trivial for them.
+        c.execute('UPDATE loans SET size_at_accept = %s WHERE id = %s',
+                  (float(brow[0]) if brow else 0.0, loan_id))
         if _size_move(c, chat_id, borrower_id, principal, 'loan_principal', f'وام #{loan_id}') is None:
             raise RuntimeError('borrower has no users row')
         return (True, float(principal), float(due_amount))
@@ -2281,7 +2343,7 @@ def _collect(c, chat_id, borrower_id, principal, interest, loan_id):
     return (from_wallet, from_bank, shortfall)
 
 
-def settle_loan(loan_id, forced):
+def settle_loan(loan_id, forced, today_str=''):
     """Collects a loan in full and pays the lender. One transaction, so the borrower is
     never debited without the lender being credited.
 
@@ -2322,18 +2384,49 @@ def settle_loan(loan_id, forced):
         # The penalty is graded by how far the collector had to go: paying late is a
         # slip, being force-collected is a failure, and having to be dug out of your
         # bank deposit or left in the red is a worse one.
-        c.execute('SELECT due_at < NOW() FROM loans WHERE id = %s', (loan_id,))
+        c.execute('SELECT due_at < NOW(), COALESCE(size_at_accept,0), '
+                  '       EXTRACT(EPOCH FROM (NOW() - accepted_at)), '
+                  '       EXTRACT(EPOCH FROM (due_at - accepted_at)) '
+                  'FROM loans WHERE id = %s', (loan_id,))
         drow = c.fetchone()
         was_late = bool(drow and drow[0])
+        size_at_accept = float(drow[1]) if drow else 0.0
+        held = float(drow[2] or 0) if drow else 0.0
+        term = float(drow[3] or 1) if drow else 1.0
+
         if not forced:
-            delta = CREDIT_LATE if was_late else CREDIT_ON_TIME
-            outcome = 'late' if was_late else 'on_time'
+            if was_late:
+                delta, outcome = CREDIT_LATE, 'late'
+            else:
+                # A loan is only evidence of creditworthiness in proportion to what it
+                # was worth to the borrower, and only if they actually carried it.
+                significance = min(1.0, principal / max(1.0, size_at_accept))
+                held_enough = term <= 0 or (held / term) >= CREDIT_MIN_HOLD_RATIO
+                delta = int(round(CREDIT_ON_TIME * significance)) if held_enough else 0
+                outcome = 'on_time' if delta > 0 else 'token'
         elif shortfall > 0:
             delta, outcome = CREDIT_SHORTFALL, 'shortfall'
         elif from_bank > 0:
             delta, outcome = CREDIT_BANK_SEIZED, 'bank_seized'
         else:
             delta, outcome = CREDIT_FORCED, 'forced'
+
+        if delta > 0:
+            # Roll the day's allowance over, then spend from it. Losses are never capped.
+            c.execute("UPDATE users SET credit_gain_date = %s, credit_gain_today = 0 "
+                      "WHERE user_id = %s AND chat_id = %s "
+                      "AND COALESCE(credit_gain_date,'') <> %s",
+                      (today_str, borrower_id, chat_id, today_str))
+            c.execute('SELECT COALESCE(credit_gain_today,0) FROM users '
+                      'WHERE user_id = %s AND chat_id = %s FOR UPDATE', (borrower_id, chat_id))
+            grow = c.fetchone()
+            used_today = int(grow[0]) if grow else 0
+            delta = max(0, min(delta, CREDIT_DAILY_GAIN_CAP - used_today))
+            if delta > 0:
+                c.execute('UPDATE users SET credit_gain_today = COALESCE(credit_gain_today,0) + %s '
+                          'WHERE user_id = %s AND chat_id = %s', (delta, borrower_id, chat_id))
+            else:
+                outcome = 'capped'
 
         c.execute('UPDATE users SET credit_score = LEAST(%s, GREATEST(%s, '
                   'COALESCE(credit_score, %s) + %s)) '
@@ -2528,3 +2621,312 @@ def charge_credit_check(user_id, chat_id, fee):
                   (chat_id, fee, fee))
         _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد اعتبارسنجی')
         return True
+
+
+# ---------------------------------------------------------------- economy
+# The inflation index is the spine of this. Every price the game quotes and every payout
+# it makes is multiplied by it, so it is not a decorative number: printing money really
+# does make the shop expensive, and squeezing the supply really does make savings worth
+# more. It moves two ways - automatically, in response to how fast the group's money
+# supply is actually growing, and deliberately, whenever the king signs a decree.
+
+INFLATION_MIN, INFLATION_MAX = 0.40, 6.00
+UNREST_MIN, UNREST_MAX = 0.0, 100.0
+# How hard the index chases the money supply, and how much of that gap it closes a night.
+INFLATION_SENSITIVITY = 2.5
+INFLATION_SMOOTHING = 0.35
+MULT_MIN, MULT_MAX = 0.25, 3.00
+
+
+def get_economy(chat_id):
+    """(inflation, unrest, fee_mult, interest_mult, growth_mult), creating the row."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO economy (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute('SELECT COALESCE(inflation,1.0), COALESCE(unrest,0), COALESCE(fee_mult,1.0), '
+                  'COALESCE(interest_mult,1.0), COALESCE(growth_mult,1.0) '
+                  'FROM economy WHERE chat_id = %s', (chat_id,))
+        return c.fetchone() or (1.0, 0.0, 1.0, 1.0, 1.0)
+
+
+def get_economy_full(chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO economy (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute('SELECT COALESCE(inflation,1.0), COALESCE(unrest,0), COALESCE(fee_mult,1.0), '
+                  'COALESCE(interest_mult,1.0), COALESCE(growth_mult,1.0), supply_last, '
+                  "COALESCE(last_decree_date,''), COALESCE(decrees_good,0), COALESCE(decrees_bad,0) "
+                  'FROM economy WHERE chat_id = %s', (chat_id,))
+        return c.fetchone()
+
+
+def get_money_supply(chat_id):
+    """Everything in circulation in one group: wallets + deposits + the treasury."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE((SELECT SUM(size) FROM users WHERE chat_id = %s), 0) '
+                  '     + COALESCE((SELECT SUM(balance) FROM bank_accounts WHERE chat_id = %s), 0) '
+                  '     + COALESCE((SELECT balance FROM bank_treasury WHERE chat_id = %s), 0)',
+                  (chat_id, chat_id, chat_id))
+        return float(c.fetchone()[0] or 0)
+
+
+def tick_inflation(chat_id, today_str):
+    """Once a night: move the index toward what the money supply says it should be.
+
+    This is the automatic half of the system. If the group's total size grew 20% in a
+    day, prices are chasing a 1.5 index; if the supply shrank, the index falls and
+    savings gain. The king's decrees push the same number around on purpose - this only
+    reacts to what actually happened. Returns (before, after, supply_growth) or None if
+    it already ran today."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO economy (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute("UPDATE economy SET last_tick_date = %s "
+                  "WHERE chat_id = %s AND COALESCE(last_tick_date,'') <> %s "
+                  'RETURNING COALESCE(inflation,1.0), supply_last',
+                  (today_str, chat_id, today_str))
+        row = c.fetchone()
+        if row is None:
+            return None
+        inflation, supply_last = float(row[0]), row[1]
+
+        c.execute('SELECT COALESCE((SELECT SUM(size) FROM users WHERE chat_id = %s), 0) '
+                  '     + COALESCE((SELECT SUM(balance) FROM bank_accounts WHERE chat_id = %s), 0) '
+                  '     + COALESCE((SELECT balance FROM bank_treasury WHERE chat_id = %s), 0)',
+                  (chat_id, chat_id, chat_id))
+        supply = float(c.fetchone()[0] or 0)
+
+        if supply_last is None or float(supply_last) <= 0:
+            # First night: just record where we started, nothing to compare against.
+            c.execute('UPDATE economy SET supply_last = %s WHERE chat_id = %s', (supply, chat_id))
+            return (inflation, inflation, 0.0)
+
+        growth = (supply - float(supply_last)) / float(supply_last)
+        target = 1.0 + growth * INFLATION_SENSITIVITY
+        after = inflation + (target - inflation) * INFLATION_SMOOTHING
+        after = max(INFLATION_MIN, min(INFLATION_MAX, round(after, 4)))
+        c.execute('UPDATE economy SET inflation = %s, supply_last = %s WHERE chat_id = %s',
+                  (after, supply, chat_id))
+        return (inflation, after, growth)
+
+
+def claim_decree_day(chat_id, today_str):
+    """One signed decree per group per day, claimed atomically."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO economy (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute("UPDATE economy SET last_decree_date = %s "
+                  "WHERE chat_id = %s AND COALESCE(last_decree_date,'') <> %s RETURNING chat_id",
+                  (today_str, chat_id, today_str))
+        return c.fetchone() is not None
+
+
+def release_decree_day(chat_id):
+    """Hands the day back if applying the decree failed, so the king isn't locked out."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE economy SET last_decree_date = '' WHERE chat_id = %s", (chat_id,))
+
+
+def apply_decree(chat_id, king_id, king_name, today_str, code, title, kind, eff):
+    """Applies one decree's whole effect in a single transaction.
+
+    `eff` is the effect dict from decrees.py. Everything that moves size moves it
+    between real holders - the king, the treasury, the players - so a decree
+    redistributes and never conjures, with one deliberate exception: 'mint', which is
+    the king literally debasing the currency and is the only path in the game that
+    creates size. It is what makes the worst decrees genuinely corrosive rather than
+    merely unfair.
+
+    Returns a dict describing what happened."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        # The row has to exist before the UPDATE at the bottom, or a group whose economy
+        # nobody has read yet silently absorbs every decree's inflation and unrest into
+        # a row that isn't there - the decree appears to work and changes nothing.
+        c.execute('INSERT INTO economy (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute('SELECT COALESCE(inflation,1.0), COALESCE(unrest,0), COALESCE(fee_mult,1.0), '
+                  'COALESCE(interest_mult,1.0), COALESCE(growth_mult,1.0) '
+                  'FROM economy WHERE chat_id = %s FOR UPDATE', (chat_id,))
+        row = c.fetchone() or (1.0, 0.0, 1.0, 1.0, 1.0)
+        inflation, unrest, fee_m, int_m, grow_m = (float(x) for x in row)
+        inflation_before = inflation
+
+        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
+                  (chat_id,))
+        trow = c.fetchone()
+        treasury = float(trow[0]) if trow else 0.0
+
+        king_delta = 0.0
+        treasury_delta = 0.0
+        players_delta = 0.0
+        minted = 0.0
+        notes = []
+
+        # --- king takes a cut of the treasury (or pays into it) ---
+        if eff.get('treasury_to_king'):
+            amount = round(treasury * eff['treasury_to_king'], 2)
+            amount = min(amount, treasury)
+            if amount > 0:
+                treasury_delta -= amount
+                king_delta += amount
+                notes.append(f'{int(amount)} از خزانه')
+        if eff.get('king_to_treasury'):
+            c.execute('SELECT COALESCE(size,0) FROM users WHERE user_id = %s AND chat_id = %s',
+                      (king_id, chat_id))
+            krow = c.fetchone()
+            k_size = float(krow[0]) if krow else 0.0
+            amount = round(max(0.0, k_size) * eff['king_to_treasury'], 2)
+            if amount > 0:
+                treasury_delta += amount
+                king_delta -= amount
+                notes.append(f'{int(amount)} از جیب پادشاه به خزانه')
+
+        # --- levy on every other player, straight to the king ---
+        if eff.get('levy'):
+            c.execute('SELECT user_id, COALESCE(size,0) FROM users '
+                      'WHERE chat_id = %s AND user_id <> %s AND COALESCE(size,0) > 0',
+                      (chat_id, king_id))
+            for uid, usize in c.fetchall():
+                cut = round(float(usize) * eff['levy'], 2)
+                if cut <= 0:
+                    continue
+                c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                          'WHERE user_id = %s AND chat_id = %s RETURNING size', (cut, uid, chat_id))
+                r2 = c.fetchone()
+                if r2 is None:
+                    continue
+                c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                          'VALUES (%s,%s,%s,%s,%s,%s)',
+                          (chat_id, uid, -cut, r2[0], 'decree', title))
+                king_delta += cut
+                players_delta -= cut
+
+        # --- handout to every other player, from the king's own pocket ---
+        if eff.get('handout'):
+            c.execute('SELECT user_id FROM users WHERE chat_id = %s AND user_id <> %s',
+                      (chat_id, king_id))
+            targets = [r[0] for r in c.fetchall()]
+            per = float(eff['handout'])
+            for uid in targets:
+                c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                          'WHERE user_id = %s AND chat_id = %s RETURNING size', (per, uid, chat_id))
+                r2 = c.fetchone()
+                if r2 is None:
+                    continue
+                c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                          'VALUES (%s,%s,%s,%s,%s,%s)',
+                          (chat_id, uid, per, r2[0], 'decree', title))
+                king_delta -= per
+                players_delta += per
+
+        # --- relief aimed only at whoever is actually poor ---
+        if eff.get('relief'):
+            c.execute('SELECT user_id FROM users WHERE chat_id = %s AND user_id <> %s '
+                      'AND COALESCE(size,0) < %s', (chat_id, king_id, eff.get('relief_below', 60)))
+            for (uid,) in c.fetchall():
+                per = float(eff['relief'])
+                c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                          'WHERE user_id = %s AND chat_id = %s RETURNING size', (per, uid, chat_id))
+                r2 = c.fetchone()
+                if r2 is None:
+                    continue
+                c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                          'VALUES (%s,%s,%s,%s,%s,%s)',
+                          (chat_id, uid, per, r2[0], 'decree', title))
+                king_delta -= per
+                players_delta += per
+
+        # --- debasement: the only thing in the game that creates size ---
+        if eff.get('mint'):
+            minted = float(eff['mint'])
+            king_delta += minted
+            notes.append(f'{int(minted)} سانت چاپ شد')
+
+        # --- burning: size leaves the world entirely ---
+        if eff.get('burn_king'):
+            c.execute('SELECT COALESCE(size,0) FROM users WHERE user_id = %s AND chat_id = %s',
+                      (king_id, chat_id))
+            krow = c.fetchone()
+            k_size = float(krow[0]) if krow else 0.0
+            amount = round(max(0.0, k_size) * eff['burn_king'], 2)
+            if amount > 0:
+                king_delta -= amount
+                notes.append(f'{int(amount)} سانت سوزانده شد')
+
+        # --- settle the king's net movement in one ledger row ---
+        if abs(king_delta) > 0.009:
+            c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                      (king_delta, king_id, chat_id))
+            krow = c.fetchone()
+            if krow is not None:
+                c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                          'VALUES (%s,%s,%s,%s,%s,%s)',
+                          (chat_id, king_id, king_delta, krow[0], 'decree', title))
+
+        if abs(treasury_delta) > 0.009:
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = GREATEST(0, COALESCE(bank_treasury.balance,0) + %s) '
+                      'RETURNING balance', (chat_id, max(0.0, treasury_delta), treasury_delta))
+            _bank_log(c, chat_id, king_id, 'decree', treasury_delta, c.fetchone()[0], title)
+
+        # --- the dials ---
+        inflation = max(INFLATION_MIN, min(INFLATION_MAX,
+                        inflation + float(eff.get('inflation', 0.0))))
+        unrest = max(UNREST_MIN, min(UNREST_MAX, unrest + float(eff.get('unrest', 0.0))))
+        for key, cur in (('fee_mult', fee_m), ('interest_mult', int_m), ('growth_mult', grow_m)):
+            if eff.get(key):
+                val = max(MULT_MIN, min(MULT_MAX, cur * float(eff[key])))
+                if key == 'fee_mult': fee_m = val
+                elif key == 'interest_mult': int_m = val
+                else: grow_m = val
+
+        c.execute('UPDATE economy SET inflation = %s, unrest = %s, fee_mult = %s, '
+                  'interest_mult = %s, growth_mult = %s, '
+                  'decrees_good = COALESCE(decrees_good,0) + %s, '
+                  'decrees_bad = COALESCE(decrees_bad,0) + %s '
+                  'WHERE chat_id = %s',
+                  (round(inflation, 4), round(unrest, 2), round(fee_m, 3), round(int_m, 3),
+                   round(grow_m, 3), 1 if kind == 'good' else 0, 1 if kind == 'bad' else 0,
+                   chat_id))
+
+        c.execute('INSERT INTO decree_log (chat_id, king_id, king_name, decree_date, code, title, '
+                  'kind, inflation_before, inflation_after, king_delta, unrest_after) '
+                  'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                  (chat_id, king_id, king_name, today_str, code, title, kind,
+                   inflation_before, inflation, king_delta, unrest))
+
+        return {
+            'king_delta': round(king_delta, 2), 'treasury_delta': round(treasury_delta, 2),
+            'players_delta': round(players_delta, 2), 'minted': minted,
+            'inflation_before': round(inflation_before, 3), 'inflation': round(inflation, 3),
+            'unrest': round(unrest, 1), 'fee_mult': round(fee_m, 2),
+            'interest_mult': round(int_m, 2), 'growth_mult': round(grow_m, 2),
+            'notes': notes,
+        }
+
+
+def cool_unrest(chat_id, amount):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE economy SET unrest = GREATEST(%s, COALESCE(unrest,0) - %s) '
+                  'WHERE chat_id = %s RETURNING unrest', (UNREST_MIN, amount, chat_id))
+        row = c.fetchone()
+        return float(row[0]) if row else 0.0
+
+
+def get_decree_history(chat_id, limit=10):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT decree_date, king_name, title, kind, inflation_before, inflation_after, '
+                  'king_delta FROM decree_log WHERE chat_id = %s ORDER BY id DESC LIMIT %s',
+                  (chat_id, limit))
+        return c.fetchall()
