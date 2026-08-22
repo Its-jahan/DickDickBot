@@ -2323,7 +2323,11 @@ BANK_LOAN_MIN_SCORE = 60
 INFLATION_PRICE_FLOOR = 0.4   # never make things absurdly cheap
 UNREST_REVOLT_THRESHOLD = 75  # above this, the throne starts wobbling nightly
 UNREST_DAILY_COOLDOWN = 4     # anger fades a little on its own
-DECREE_CHOICES = 3            # how many the king is offered each night
+# Three of each, every night. Offering a mixed handful let a night happen to be all
+# corruption or all virtue; a fixed 3-and-3 means the king is always looking at the same
+# trade - six ways to get richer or get thanked - and can never blame the draw.
+DECREE_GOOD_CHOICES = 3
+DECREE_BAD_CHOICES = 3
 
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
@@ -3544,13 +3548,12 @@ pending_decrees = {}
 
 
 def _roll_decrees(chat_id, today_str, king_id):
-    """Deal tonight's hand: always a mix, so the king is always choosing between selling
-    the country and paying for it rather than being handed a single obvious move."""
-    bad = [d[0] for d in random.sample(decrees.BAD, 2)]
-    good = [d[0] for d in random.sample(decrees.GOOD, DECREE_CHOICES - 1)]
-    codes = bad[:1] + good + bad[1:2]
-    codes = codes[:DECREE_CHOICES]
-    random.shuffle(codes)
+    """Deal tonight's hand: three honest decrees and three corrupt ones, drawn fresh
+    from the two hundred. Kept in that order rather than shuffled so the message can
+    group them - the king should see the two columns and feel the choice."""
+    good = [d[0] for d in random.sample(decrees.GOOD, DECREE_GOOD_CHOICES)]
+    bad = [d[0] for d in random.sample(decrees.BAD, DECREE_BAD_CHOICES)]
+    codes = good + bad
     pending_decrees[chat_id] = (today_str, codes, king_id)
     return codes
 
@@ -3566,26 +3569,36 @@ def _decree_keyboard(chat_id, codes):
     return InlineKeyboardMarkup(rows)
 
 
+def _decree_block(codes, start_index):
+    """Renders one column of the offer, numbered to match the buttons."""
+    out = []
+    for i, code in enumerate(codes, start_index):
+        d = decrees.get(code)
+        if not d:
+            continue
+        _c, title, desc, eff, _kind = d
+        out.append(f"<b>{i}. {_esc(title)}</b>")
+        out.append(f"<i>{_esc(desc)}</i>")
+        for bit in decrees.summarize(eff):
+            out.append(f"   • {bit}")
+        out.append("")
+    return out
+
+
 def _render_decree_offer(king_name, codes, econ):
     inflation, unrest, fee_m, int_m, grow_m = econ
+    good = [c for c in codes if (decrees.get(c) or (None,)*5)[4] == 'good']
+    bad = [c for c in codes if (decrees.get(c) or (None,)*5)[4] == 'bad']
     lines = [
         f"👑 <b>فرمان امشب — {_esc(king_name)}</b>", "",
         f"📈 تورم: <b>{inflation:.2f}×</b>   😡 خشم مردم: <b>{unrest:.0f}</b>/100",
         f"🧾 کارمزد ×{fee_m:.2f}   🏦 سود ×{int_m:.2f}   🌱 رشد ×{grow_m:.2f}", "",
-        "یکی رو باید امضا کنی:", "",
+        "━━━━━━━━━━━━━━━", "😇 <b>سازنده</b> — به نفع مردم، به ضرر جیب تو", "",
     ]
-    for i, code in enumerate(codes, 1):
-        d = decrees.get(code)
-        if not d:
-            continue
-        _c, title, desc, eff, kind = d
-        mark = "😈 فاسد" if kind == 'bad' else "😇 سازنده"
-        lines.append(f"<b>{i}. {_esc(title)}</b> — {mark}")
-        lines.append(f"<i>{_esc(desc)}</i>")
-        for bit in decrees.summarize(eff):
-            lines.append(f"   • {bit}")
-        lines.append("")
-    lines.append("⚠️ تا فردا شب فقط یکی می‌تونی امضا کنی.")
+    lines += _decree_block(good, 1)
+    lines += ["━━━━━━━━━━━━━━━", "😈 <b>فاسد</b> — به نفع جیب تو، به ضرر مردم", ""]
+    lines += _decree_block(bad, len(good) + 1)
+    lines.append("⚠️ فقط <b>یکی</b> رو می‌تونی امضا کنی. تا فردا شب.")
     return "\n".join(lines)
 
 

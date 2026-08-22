@@ -234,7 +234,9 @@ anyone deciding that. Decrees push the same number deliberately.
 
 ### The decrees are asymmetric on purpose
 
-`decrees.py` holds 100 corrupt and 100 honest decrees. **Every** corrupt one pays the
+`decrees.py` holds 100 corrupt and 100 honest decrees, and the king is dealt three
+of each every night — a fixed 3-and-3 rather than a mixed handful, so a night can never
+happen to be all virtue or all corruption and the king can never blame the draw. **Every** corrupt one pays the
 king (`mint`, `treasury_to_king`, or `levy`) and raises `unrest`; **every** honest one
 costs him (`king_to_treasury`, `handout`, `relief`, or `burn_king`) and lowers it. There
 are regression tests asserting exactly that, 100/100 in both directions — if you add a
