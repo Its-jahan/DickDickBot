@@ -270,6 +270,31 @@ client-supplied, so `decree_callback` checks the code against `pending_decrees` 
 as checking the signer is the king — otherwise a king could pick his favourite out of
 all 200.
 
+## Martial law: the crown's veto over mob rule
+
+`/hokm` lets the sitting king dissolve one open `/ejma` and put whoever called it in the
+motley for `JESTER_HOURS`. Rationed to once per three days **per group** — the slot lives
+on `economy.last_martial_at`, not on the king, so abdicating and being re-crowned cannot
+refresh it.
+
+A cancelled vote is `status='cancelled'`, and deliberately does **not** call
+`set_consensus_protection` the way `fail_open_consensus` does. A vote that was dissolved
+by decree was never actually decided, so the group is free to open another one tomorrow:
+the king bought his favourite a night, not immunity. Getting this backwards would make a
+single `/hokm` worth three days of protection and turn the power from strong into
+unanswerable.
+
+The price is `MARTIAL_UNREST`, applied through `apply_decree` as a `bad` decree so it
+lands in `decree_log` alongside everything else the crown does. That wires the power
+straight into the revolt clock: a king who dissolves every vote against his friends is
+buying each one with a slice of his own reign.
+
+Being a jester is not cosmetic. It blocks starting `/ejma` **and** voting in one (the
+player who reached for mob rule loses access to it), skims `JESTER_TRIBUTE_RATIO` off
+each positive daily growth roll into the king's pocket, and shows as 🤡 on the
+leaderboard. The tribute is only ever taken from a positive roll — a bad day is
+punishment enough — and never when the jester is somehow the king himself.
+
 ## Credit gains are scaled; credit losses are not
 
 The obvious exploit is to borrow the minimum, repay it immediately, and repeat. Three

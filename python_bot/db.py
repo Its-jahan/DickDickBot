@@ -447,6 +447,11 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loans_late INTEGER DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_date TEXT DEFAULT ''")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_today INTEGER DEFAULT 0")
+        # Jester duty: whoever called a vote the king dissolved, and until when.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS jester_until TIMESTAMPTZ")
+        # Martial law is rationed per group, not per king, so abdicating and being
+        # re-crowned cannot refresh it.
+        c.execute("ALTER TABLE economy ADD COLUMN IF NOT EXISTS last_martial_at TIMESTAMPTZ")
 
         # One-time: charge the deposit fee on money that was banked before the fee
         # existed. Everyone who deposited in that window got in free, which is both
@@ -2929,4 +2934,90 @@ def get_decree_history(chat_id, limit=10):
         c.execute('SELECT decree_date, king_name, title, kind, inflation_before, inflation_after, '
                   'king_delta FROM decree_log WHERE chat_id = %s ORDER BY id DESC LIMIT %s',
                   (chat_id, limit))
+        return c.fetchall()
+
+
+# ---------------------------------------------------------------- martial law
+# The crown's answer to mob rule: dissolve an open /ejma and put whoever called it in
+# the motley for a day. Deliberately rationed and deliberately unpopular - it is real
+# power, so the price is paid in unrest, which is the thing that eventually gets a king
+# dragged out of his palace.
+
+def try_martial_law(chat_id, cooldown_seconds):
+    """Claims the group's martial-law slot atomically. (True, 0) or (False, seconds_left)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO economy (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute('UPDATE economy SET last_martial_at = NOW() WHERE chat_id = %s '
+                  '  AND (last_martial_at IS NULL '
+                  '       OR last_martial_at < NOW() - (%s || %s)::interval) '
+                  'RETURNING last_martial_at', (chat_id, cooldown_seconds, ' seconds'))
+        if c.fetchone() is not None:
+            return (True, 0)
+        c.execute('SELECT CEIL(EXTRACT(EPOCH FROM (last_martial_at + (%s || %s)::interval - NOW()))) '
+                  'FROM economy WHERE chat_id = %s', (cooldown_seconds, ' seconds', chat_id))
+        row = c.fetchone()
+        return (False, int(row[0]) if row and row[0] and row[0] > 0 else 0)
+
+
+def release_martial_law(chat_id):
+    """Hands the slot back if the decree could not actually be carried out."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE economy SET last_martial_at = NULL WHERE chat_id = %s', (chat_id,))
+
+
+def cancel_consensus(vote_id, chat_id):
+    """Dissolves one open vote. Returns (target_id, target_name, initiator_id, amount)
+    for the announcement, or None if it had already closed.
+
+    Note what this deliberately does NOT do: the target gets no protection window. A
+    dissolved vote was never decided, so the group is free to try again tomorrow - the
+    king bought his favourite a night, not immunity."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE consensus_votes SET status = 'cancelled', resolved_at = now() "
+                  "WHERE id = %s AND chat_id = %s AND status = 'open' "
+                  'RETURNING target_id, target_name, initiator_id, amount',
+                  (vote_id, chat_id))
+        return c.fetchone()
+
+
+def get_any_open_consensus(chat_id):
+    """Every open vote in a group, oldest first - what martial law is aimed at."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, target_id, target_name, initiator_id, amount, "
+                  '       EXTRACT(EPOCH FROM (now() - created_at)) '
+                  "FROM consensus_votes WHERE chat_id = %s AND status = 'open' "
+                  'ORDER BY created_at', (chat_id,))
+        return c.fetchall()
+
+
+def make_jester(user_id, chat_id, hours):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET jester_until = NOW() + make_interval(hours => %s) '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING jester_until',
+                  (hours, user_id, chat_id))
+        row = c.fetchone()
+        return row[0] if row else None
+
+
+def is_jester(user_id, chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM users WHERE user_id = %s AND chat_id = %s '
+                  'AND jester_until > now()', (user_id, chat_id))
+        return c.fetchone() is not None
+
+
+def get_jesters(chat_id):
+    """(user_id, name, seconds_left) for everyone still in the motley."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, COALESCE(first_name, %s), '
+                  '       CEIL(EXTRACT(EPOCH FROM (jester_until - now()))) '
+                  'FROM users WHERE chat_id = %s AND jester_until > now()', ('?', chat_id))
         return c.fetchall()

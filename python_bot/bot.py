@@ -143,6 +143,8 @@ BOT_COMMANDS = [
     ("farman", "👑 (پادشاه) فرمان امروز رو امضا کن"),
     ("eghtesad", "📊 وضعیت اقتصاد گروه"),
     ("farmanha", "📜 تاریخچهٔ فرمان‌های سلطنتی"),
+    ("hokm", "🪖 (پادشاه) حکومت نظامی — انحلال اجماع"),
+    ("dalghak", "🤡 دلقک‌های دربار"),
     ("ach", "🏅 نشان‌ها و استریک من"),
     ("wr", "📊 آمار برد و باخت"),
     ("help", "❓ راهنمای کامل بازی"),
@@ -238,6 +240,7 @@ def build_top_text(chat_id):
     rows = [r for r in rows if r[0] != BOT_USER_ID]
     if not rows:
         return None
+    jester_ids = {j[0] for j in db.get_jesters(chat_id)}
 
     msg = "🏆 برترین‌های این گروه:\n\n"
     for i, (user_id, first_name, size, streak) in enumerate(rows, 1):
@@ -256,6 +259,8 @@ def build_top_text(chat_id):
             marks += " 👑"
         if user_id == consort_id:
             marks += " 💍"
+        if user_id in jester_ids:
+            marks += " 🤡"
         if streak >= 3:
             marks += f" 🔥{streak}"
         if badge_counts.get(user_id):
@@ -601,7 +606,8 @@ HELP_TEXT = (
     "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
     "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (کارمزد سنگین)\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"    "👑 /farman — (پادشاه) فرمان روزانه\n"
     "📊 /eghtesad — تورم، خشم مردم و اهرم‌های تاج\n"
-    "📜 /farmanha — تاریخچهٔ فرمان‌ها\n"
+    "📜 /farmanha — تاریخچهٔ فرمان‌ها\n"    "🪖 /hokm — (پادشاه) حکومت نظامی، هر ۳ روز یک بار\n"
+    "🤡 /dalghak — دلقک‌های دربار\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
     "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
     "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
@@ -1016,6 +1022,13 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     player_count = db.get_active_today_count(chat_id, today_str)
+    if db.is_jester(user.id, chat_id):
+        await update.message.reply_text(
+            "🤡 تو دلقک درباری! پادشاه اجماع قبلیت رو منحل کرد.\n"
+            "تا وقتی دلقکی نمی‌تونی اجماع راه بندازی."
+        )
+        return
+
     if player_count < MIN_CONSENSUS_PLAYERS:
         await update.message.reply_text(f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} نفر که امروز دودولشونو مالیدن نیاز است!")
         return
@@ -1085,6 +1098,10 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if user.id == target_id:
         await query.answer("نمی‌توانید به اجماع علیه خودتان رای بدهید!", show_alert=True)
+        return
+
+    if db.is_jester(user.id, chat_id):
+        await query.answer("🤡 دلقک دربار حق رأی نداره!", show_alert=True)
         return
 
     _, voter_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -1889,6 +1906,20 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.update_size(user.id, chat_id, delta)
 
+    # A jester performs for his king: part of the day's growth is skimmed as tribute.
+    # Only ever taken from a positive roll - a bad day is punishment enough.
+    jester_note = ""
+    if delta > 0 and db.is_jester(user.id, chat_id):
+        kingdom_now = db.get_kingdom(chat_id)
+        if kingdom_now and kingdom_now[0] and kingdom_now[0] != user.id:
+            tribute = int(delta * JESTER_TRIBUTE_RATIO)
+            if tribute > 0:
+                db.update_size(user.id, chat_id, -tribute)
+                db.update_size(kingdom_now[0], chat_id, tribute)
+                delta -= tribute
+                jester_note = (f"\n🤡 دلقکِ درباری: {tribute} سانت از رشدت رفت "
+                               f"تو جیب {kingdom_now[1]}!")
+
     current_size = current_size + delta
     
     perk_pool = [
@@ -1939,7 +1970,7 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     verb = "بزرگ شد" if delta >= 0 else "کوچک شد"
     d_name = get_dick_name(current_size)
-    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.{streak_msg}\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
+    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.{jester_note}{streak_msg}\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
 
     await query.answer(f"{d_name} شما تغییر کرد!")
     try:
@@ -2329,6 +2360,18 @@ UNREST_DAILY_COOLDOWN = 4     # anger fades a little on its own
 DECREE_GOOD_CHOICES = 3
 DECREE_BAD_CHOICES = 3
 DECREE_OFFER_HOUR, DECREE_OFFER_MINUTE = 21, 30
+
+# ---------------------------------------------------------------- martial law
+# The crown's veto over mob rule. Rationed hard, because an unlimited version would make
+# /ejma unusable against the one player it exists to check. The price is unrest, which
+# ties it to the revolt clock - a king who dissolves every vote against his friends is
+# buying each one with a slice of his own reign.
+MARTIAL_COOLDOWN_SECONDS = 3 * 24 * 3600
+MARTIAL_UNREST = 14
+JESTER_HOURS = 24
+# The jester performs for the court: this share of each daily growth roll is skimmed off
+# and handed to the king while the motley is on.
+JESTER_TRIBUTE_RATIO = 0.30
 
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
@@ -3905,6 +3948,103 @@ async def _revolt(context, chat_id, kingdom):
                                     award(new_king[0], chat_id, 'king'))
 
 
+async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/hokm` - the king dissolves an open /ejma and makes its caller his jester.
+
+    Only the sitting king, only on a vote that is genuinely still open, and only once
+    every three days per group. Every use raises unrest: the group can see perfectly
+    well that a vote was cancelled by decree rather than lost."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("حکومت نظامی فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+
+    kingdom, _ = refresh_king(chat_id)
+    if not kingdom or not kingdom[0]:
+        await update.message.reply_text("این گروه پادشاه نداره!")
+        return
+    if user.id != kingdom[0]:
+        await update.message.reply_text(
+            f"فقط پادشاه ({_esc(kingdom[1] or '?')}) می‌تونه حکومت نظامی اعلام کنه! 👑",
+            parse_mode="HTML")
+        return
+
+    openv = [v for v in db.get_any_open_consensus(chat_id)
+             if v[5] < CONSENSUS_VOTE_WINDOW_SECONDS]
+    if not openv:
+        await update.message.reply_text(
+            "الان هیچ اجماع بازی وجود نداره که کنسلش کنی. 🤷\n"
+            "(حکومت نظامی فقط روی رأی‌گیری در جریان کار می‌کنه)")
+        return
+
+    # Aim at the oldest open vote - the one closest to actually passing.
+    vote_id, target_id, target_name, initiator_id, amount, _age = openv[0]
+    if initiator_id == user.id:
+        await update.message.reply_text("اجماع رو خودت راه انداختی! می‌خوای خودت رو دلقک کنی؟ 🤡")
+        return
+
+    ok, remaining = db.try_martial_law(chat_id, MARTIAL_COOLDOWN_SECONDS)
+    if not ok:
+        days, hours = remaining // 86400, (remaining % 86400) // 3600
+        await update.message.reply_text(
+            f"⏳ حکومت نظامی هر ۳ روز یک بار!\nتا {days} روز و {hours} ساعت دیگه نمی‌تونی."
+        )
+        return
+
+    cancelled = db.cancel_consensus(vote_id, chat_id)
+    if not cancelled:
+        db.release_martial_law(chat_id)
+        await update.message.reply_text("اون اجماع همین الان بسته شد!")
+        return
+    t_id, t_name, init_id, amt = cancelled
+
+    info = db.get_user_info(init_id, chat_id)
+    init_name = (info[0] if info else None) or "؟"
+    until = db.make_jester(init_id, chat_id, JESTER_HOURS)
+    # Cancelling a vote by decree is exactly the sort of thing a population notices.
+    econ_note = ""
+    try:
+        res = db.apply_decree(chat_id, user.id, kingdom[1] or '?', tehran_today_str(),
+                              'martial', 'حکومت نظامی', 'bad', {'unrest': MARTIAL_UNREST})
+        econ_note = f"\n😡 خشم مردم: <b>{res['unrest']:.0f}</b>/100"
+        if res['unrest'] >= UNREST_REVOLT_THRESHOLD:
+            econ_note += "\n🔥 مردم دارن شورش می‌کنن!"
+    except Exception:
+        logging.exception(f"martial law unrest bump failed for {chat_id}")
+
+    await update.message.reply_text(
+        f"🪖 <b>حکومت نظامی!</b>\n\n"
+        f"پادشاه {_esc(kingdom[1] or '?')} اجماع علیه {_esc(t_name or '?')} رو منحل کرد.\n"
+        f"💨 اون {int(amt or 0)} سانت جایی نرفت.\n\n"
+        f"🤡 <b>{_esc(init_name)}</b> که این اجماع رو راه انداخته بود، "
+        f"تا {JESTER_HOURS} ساعت <b>دلقک دربار</b>ه:\n"
+        f"   • نمی‌تونه اجماع راه بندازه یا رأی بده\n"
+        f"   • {int(JESTER_TRIBUTE_RATIO*100)}٪ از رشد روزانه‌ش می‌ره تو جیب پادشاه\n"
+        f"   • 🤡 کنار اسمش تو لیدربرد می‌مونه"
+        f"{econ_note}\n\n"
+        f"⏳ حکومت نظامی بعدی: ۳ روز دیگه.",
+        parse_mode="HTML")
+
+
+async def jesters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/dalghak` - who is currently wearing the motley, and for how much longer."""
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        return
+    rows = db.get_jesters(chat_id)
+    if not rows:
+        await update.message.reply_text("الان هیچ دلقکی تو دربار نیست. 🤷")
+        return
+    lines = ["🤡 <b>دلقک‌های دربار</b>", ""]
+    for _uid, name, secs in rows:
+        h, m = int(secs) // 3600, (int(secs) % 3600) // 60
+        lines.append(f"• {_esc(name)} — {h} ساعت و {m} دقیقه دیگه آزاد می‌شه")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/enteghal <amount>` - move your own size from this group to another one you play
     in, minus a heavy fee. Offers the destination as buttons because nobody knows their
@@ -4638,6 +4778,8 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(farman|decree)\b'), decree_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(farmanha|decrees)\b'), decree_history_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(eghtesad|economy)\b'), economy_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(hokm|nezami|martial)\b'), martial_law_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(dalghak|jester)\b'), jesters_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).
