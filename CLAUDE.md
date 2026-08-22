@@ -156,6 +156,43 @@ and the lender is made whole in every case, so a default is still zero-sum.
 stops a single default from burying a player past any hope of recovery, and it is the
 main lever if usury turns out to be too safe for lenders.
 
+## Fees are transfers, never sinks
+
+Every fee in the game moves size into `bank_treasury` via `db.treasury_add` (or, inside
+a bank/transfer transaction, an inline treasury upsert). None of them delete size. This
+matters because the treasury is the *only* thing funding deposit interest: a fee that
+deleted size would quietly lower everyone's yield instead of raising it.
+
+Current fees: theft loot (`THEFT_FEE_RATIO`), challenge winnings — never the returned
+stake (`CHALLENGE_FEE_RATIO`), deposits and withdrawals (`BANK_*_FEE_RATIO`), and the
+cross-group transfer (`XFER_FEE_RATIO`). The challenge settlement also sweeps the
+`spread` — anything a shielding perk stops the winner collecting while the loser still
+pays in full — which used to evaporate.
+
+When adding a new fee, take it in the same transaction as the thing it is charging on,
+and never charge it on money that is merely being returned from escrow.
+
+## Cross-group transfer is the one seam between leagues
+
+Groups are otherwise fully independent — the same player has a separate size in each.
+`/enteghal` is the single exception and is priced at `XFER_FEE_RATIO` (30%) with a 24h
+cooldown, because a player who is rich in one group could otherwise import that lead and
+skip the other group's game entirely. The fee stays in the **source** group's treasury:
+that is the group losing the wealth, so it keeps a cut.
+
+The destination `users` row must already exist — you can only send to a league you
+already play in, which stops this being a way to seed a fresh account somewhere. As with
+loans, the principal is logged as `xfer_principal` (ignored by the handicap, since it is
+the same player's money) while `xfer_fee` counts as a real cost.
+
+## One-time data migrations go in `init_db`, guarded by `bot_meta`
+
+`deposit_fee_backfilled` is the current example: it charges the deposit fee, once,
+against balances that were banked before that fee existed. The guard row is what makes
+it safe to leave in place — `init_db()` runs on every startup, so an unguarded data
+migration would re-charge on every restart. There is a regression test that runs
+`init_db()` three times and asserts the balances only move once.
+
 ## Admin panel
 
 `python_bot/admin_panel.py` is a separate Flask/gunicorn service (`dickbot-admin`,

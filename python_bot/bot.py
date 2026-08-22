@@ -137,6 +137,7 @@ BOT_COMMANDS = [
     ("vam", "🏛 وام از بانک — /vam 100"),
     ("bedehi", "📜 بدهی‌ها و طلب‌های من"),
     ("pardakht", "✅ تسویهٔ بدهی"),
+    ("enteghal", "🔁 انتقال سایز به گروه دیگه (کارمزد بالا)"),
     ("ach", "🏅 نشان‌ها و استریک من"),
     ("wr", "📊 آمار برد و باخت"),
     ("help", "❓ راهنمای کامل بازی"),
@@ -593,7 +594,7 @@ HELP_TEXT = (
     "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
     "🏛 /vam <مقدار> — وام رسمی از بانک\n"
     "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
-    "✅ /pardakht — تسویهٔ زودتر بدهی\n"
+    "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (کارمزد سنگین)\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
     "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
     "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
@@ -1463,9 +1464,21 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         # Both sides already had `bet` deducted at acceptance time (escrow). The winner gets
         # their own stake back plus their net winnings; the loser gets back whatever their
         # final loss (after perks/items) came out short of their already-staked bet.
+        # The house takes a cut of the winnings - never of the stake, which is the
+        # player's own size coming back out of escrow. Whatever a shielding perk stops
+        # the winner from collecting (جاکش pays them half while the loser still pays
+        # full) used to simply evaporate; it goes to the vault now too. Both are
+        # transfers, so the match stays zero-sum: loser_loss leaves the loser and
+        # exactly loser_loss arrives, split between the winner and the treasury.
+        house_cut = int(winner_gain * CHALLENGE_FEE_RATIO)
+        spread = int(max(0, loser_loss - winner_gain))
+        winner_take = winner_gain - house_cut
+
         settled = True
-        db.update_size(winner_id, chat_id, winner_gain + bet)
+        db.update_size(winner_id, chat_id, winner_take + bet)
         db.update_size(loser_id, chat_id, bet - loser_loss)
+        if house_cut + spread > 0:
+            db.treasury_add(chat_id, house_cut + spread, note="کارمزد چالش")
         db.record_match_result(winner_id, loser_id, chat_id)
 
         wins, _ = db.get_win_loss(winner_id, chat_id)
@@ -1477,6 +1490,8 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         loser_badges = award(loser_id, chat_id, 'rock_bottom') if l_size_now < 0 else []
 
         msg += f"\n💰 شرط اصلی: {bet} سانت"
+        if house_cut > 0:
+            msg += f"\n🧾 کارمزد چالش ({int(CHALLENGE_FEE_RATIO*100)}٪): {house_cut} سانت → خزانهٔ بانک"
         msg += msg_item_log
 
         if winner_perk in ["کص‌کش", "جاکش"] and winner_gain > 0:
@@ -2257,6 +2272,23 @@ NOZUL_MAX_RATE = 1.00
 BANK_LOAN_RATE = 0.20
 BANK_LOAN_MAX_TREASURY_SHARE = 0.30
 
+# ---------------------------------------------------------------- treasury fees
+# The treasury only pays out what it takes in, so the yield depositors actually see is
+# decided here. Every one of these is a *transfer* into the vault, never a deletion and
+# never a mint: whatever a fee takes off one player lands in the treasury and comes back
+# to the group as interest.
+THEFT_FEE_RATIO = 0.10       # cut of a successful theft's loot
+CHALLENGE_FEE_RATIO = 0.05   # cut of the winner's net winnings (never their own stake)
+BANK_DEPOSIT_FEE_RATIO = 0.02
+BANK_WITHDRAW_FEE_RATIO = 0.02
+
+# Every group is otherwise an independent league. This is the single seam between them
+# and it is priced to hurt: importing a lead you built somewhere else should cost you
+# most of it, or the other group's game stops mattering.
+XFER_FEE_RATIO = 0.30
+XFER_COOLDOWN_SECONDS = 24 * 3600
+XFER_MIN_AMOUNT = 50
+
 ACHIEVEMENTS = {
     'first_1000': ('🏆', 'هزارتایی', 'برای اولین بار به ۱۰۰۰ سانت رسید'),
     'streak_7': ('🔥', 'هفتهٔ کامل', '۷ روز پشت سر هم دودولش رو مالید'),
@@ -2651,9 +2683,17 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db.try_deduct_size(target_id, chat_id, loot):
             await update.message.reply_text(f"{target_name} همین الان سایزش کم شد؛ دزدی بی‌نتیجه موند!")
             return
-        db.update_size(user.id, chat_id, loot)
+        # The vault takes its cut. Stolen size stays inside the group either way, but a
+        # slice of it now funds everyone's deposit interest instead of all landing on
+        # the thief.
+        theft_fee = int(loot * THEFT_FEE_RATIO)
+        db.update_size(user.id, chat_id, loot - theft_fee)
+        if theft_fee > 0:
+            db.treasury_add(chat_id, theft_fee, note="کارمزد دزدی")
         await update.message.reply_text(
             f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!{item_note}"
+            + (f"\n🧾 کارمزد دزدی ({int(THEFT_FEE_RATIO*100)}٪): {theft_fee} سانت رفت تو خزانه."
+               if theft_fee > 0 else "")
         )
         earned = award(user.id, chat_id, 'thief')
         await announce_achievements(context, chat_id, user.first_name, earned)
@@ -2849,7 +2889,8 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    ok, res, used = db.bank_deposit(user.id, chat_id, amount, tehran_today_str(), cap)
+    ok, res, used, fee = db.bank_deposit(user.id, chat_id, amount, tehran_today_str(), cap,
+                                         BANK_DEPOSIT_FEE_RATIO)
     if not ok:
         if res == 'cap':
             await update.message.reply_text(f"سقف واریز امروزت پر شده! فردا دوباره تا {cap} سانت.")
@@ -2859,6 +2900,7 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet_now, _, _ = db.get_user(user.id, chat_id, None, None)
     await update.message.reply_text(
         f"🏦 {int(amount)} سانت ریختی تو بانک.\n\n"
+        f"🧾 کارمزد واریز ({int(BANK_DEPOSIT_FEE_RATIO*100)}٪): {int(fee)} سانت → خزانه\n"
         f"🔒 موجودی بانک: {int(res)} سانت\n💼 جیب: {int(wallet_now)} سانت\n"
         f"📥 سقف باقی‌مونده امروز: {max(0, cap - int(used))} سانت\n\n"
         f"از دزدی امنه، ولی تو لیدربرد حساب نمی‌شه."
@@ -2888,13 +2930,16 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if amount > balance:
         amount = int(balance)
 
-    ok, new_balance = db.bank_withdraw(user.id, chat_id, amount)
+    ok, new_balance, paid_out, fee = db.bank_withdraw(user.id, chat_id, amount,
+                                                      BANK_WITHDRAW_FEE_RATIO)
     if not ok:
         await update.message.reply_text("موجودی بانکت کافی نیست!")
         return
     wallet_now, _, _ = db.get_user(user.id, chat_id, None, None)
     await update.message.reply_text(
         f"🏧 {int(amount)} سانت از بانک برداشتی.\n\n"
+        f"🧾 کارمزد برداشت ({int(BANK_WITHDRAW_FEE_RATIO*100)}٪): {int(fee)} سانت → خزانه\n"
+        f"💵 به جیبت رسید: {int(paid_out)} سانت\n"
         f"🔒 بانک: {int(new_balance)} سانت\n💼 جیب: {int(wallet_now)} سانت\n\n"
         f"حالا دوباره تو لیدربرد حساب می‌شه — ولی قابل دزدیدن هم هست!"
     )
@@ -3335,6 +3380,136 @@ async def collect_loans_job(context: ContextTypes.DEFAULT_TYPE):
             pass
         except Exception:
             logging.exception(f"collecting loan {loan_id} failed")
+
+
+async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/enteghal <amount>` - move your own size from this group to another one you play
+    in, minus a heavy fee. Offers the destination as buttons because nobody knows their
+    groups by chat_id."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("انتقال بین‌گروهی فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    parts = update.message.text.split()
+    amount = None
+    if len(parts) > 1:
+        try:
+            amount = int(float(parts[1]))
+        except ValueError:
+            amount = None
+    if amount is None or amount <= 0:
+        await update.message.reply_text(
+            f"🔁 انتقال بین‌گروهی\n\n"
+            f"سایزت رو به یکی دیگه از گروه‌هایی که توش بازی می‌کنی بفرست.\n"
+            f"⚠️ کارمزدش سنگینه: {int(XFER_FEE_RATIO*100)}٪\n"
+            f"⏳ هر {XFER_COOLDOWN_SECONDS // 3600} ساعت یک بار\n"
+            f"💼 جیبت: {int(size)} سانت\n\n"
+            f"/enteghal <مقدار>"
+        )
+        return
+    if amount < XFER_MIN_AMOUNT:
+        await update.message.reply_text(f"حداقل مبلغ انتقال {XFER_MIN_AMOUNT} سانته.")
+        return
+    if size < amount:
+        await update.message.reply_text(f"این‌قدر سانت نداری! 💼 {int(size)} سانت داری.")
+        return
+
+    groups = db.get_user_groups(user.id, exclude_chat_id=chat_id)
+    if not groups:
+        await update.message.reply_text(
+            "تو هیچ گروه دیگه‌ای بازی نمی‌کنی!\nاول تو یه گروه دیگه /d بزن."
+        )
+        return
+
+    fee = int(amount * XFER_FEE_RATIO)
+    rows = []
+    for gid, _gsize in groups[:8]:
+        title = f"گروه {gid}"
+        try:
+            chat = await context.bot.get_chat(gid)
+            if chat.title:
+                title = chat.title[:40]
+        except Exception:
+            pass  # bot may have been removed from that group; the id still works
+        rows.append([InlineKeyboardButton(f"➡️ {title}", callback_data=f"xfer_{gid}_{amount}")])
+
+    await update.message.reply_text(
+        f"🔁 <b>انتقال بین‌گروهی</b>\n\n"
+        f"مبلغ: <b>{amount}</b> سانت\n"
+        f"🧾 کارمزد ({int(XFER_FEE_RATIO*100)}٪): {fee} سانت → خزانهٔ همین گروه\n"
+        f"📦 به مقصد می‌رسه: <b>{amount - fee}</b> سانت\n\n"
+        f"کدوم گروه؟",
+        reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML"
+    )
+
+
+async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن!", show_alert=True)
+        return
+    try:
+        _, dest_str, amount_str = query.data.split('_', 2)
+        dest_chat = int(dest_str); amount = int(amount_str)
+    except ValueError:
+        return
+    if amount < XFER_MIN_AMOUNT or dest_chat >= 0 or dest_chat == chat_id:
+        await query.answer("انتقال نامعتبره!", show_alert=True)
+        return
+    # callback_data is client-supplied, so re-check membership rather than trusting it.
+    if dest_chat not in [g[0] for g in db.get_user_groups(user.id, exclude_chat_id=chat_id)]:
+        await query.answer("تو اون گروه بازی نمی‌کنی!", show_alert=True)
+        return
+
+    ok, remaining = db.try_start_xfer(user.id, chat_id, XFER_COOLDOWN_SECONDS)
+    if not ok:
+        hours, minutes = remaining // 3600, (remaining % 3600) // 60
+        await query.answer(
+            f"تازه انتقال زدی! تا {hours} ساعت و {minutes} دقیقهٔ دیگه صبر کن.", show_alert=True
+        )
+        return
+
+    ok, delivered, fee = db.cross_group_transfer(user.id, chat_id, dest_chat, amount,
+                                                 XFER_FEE_RATIO)
+    if not ok:
+        await query.answer("سایزت کافی نیست!", show_alert=True)
+        return
+
+    dest_title = f"گروه {dest_chat}"
+    try:
+        chat = await context.bot.get_chat(dest_chat)
+        if chat.title:
+            dest_title = chat.title[:40]
+    except Exception:
+        pass
+
+    await query.answer(f"{int(delivered)} سانت رسید!")
+    try:
+        await query.edit_message_text(
+            f"🔁 <b>انتقال انجام شد</b>\n\n"
+            f"{_esc(user.first_name)} <b>{amount}</b> سانت از این گروه فرستاد به "
+            f"<b>{_esc(dest_title)}</b>.\n"
+            f"🧾 کارمزد: {int(fee)} سانت رفت تو خزانهٔ همین گروه\n"
+            f"📦 رسید: {int(delivered)} سانت",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(
+            chat_id=dest_chat,
+            text=(f"🔁 {_esc(user.first_name)} <b>{int(delivered)}</b> سانت از یه گروه دیگه "
+                  f"آورد اینجا!"),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3930,6 +4105,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(vam|loan)\b'), vam_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(bedehi|debts)\b'), debts_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(pardakht|repay)\b'), repay_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(enteghal|transfer)\b'), transfer_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).
@@ -3953,6 +4129,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(boss_hit_callback, pattern=r'^bosshit_'))
     app.add_handler(CallbackQueryHandler(lottery_buy_callback, pattern=r'^lot_'))
     app.add_handler(CallbackQueryHandler(loan_accept_callback, pattern=r'^loanok_'))
+    app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r'^xfer_'))
     
     app.add_handler(InlineQueryHandler(inline_query))
     

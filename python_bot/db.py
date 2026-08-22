@@ -24,6 +24,10 @@ def _tehran_today_str():
 #   postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres
 DB_URL = os.environ.get('SUPABASE_DB_URL') or os.environ.get('DATABASE_URL')
 
+# Rate applied once, retroactively, to deposits made before the deposit fee existed.
+# Kept here rather than imported from bot.py because init_db must not depend on bot.
+BACKFILL_DEPOSIT_FEE_RATIO = 0.02
+
 
 @contextmanager
 def get_connection():
@@ -371,6 +375,43 @@ def init_db():
         # How many times this player has been force-collected. Worn publicly as بدهکار
         # and used to price future loans.
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loan_defaults INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_xfer_at TIMESTAMPTZ")
+
+        # One-time: charge the deposit fee on money that was banked before the fee
+        # existed. Everyone who deposited in that window got in free, which is both
+        # unfair to whoever deposits next and the reason the treasury is empty while
+        # the vault is full. Guarded by bot_meta so it can only ever run once, and it
+        # moves the fee into the treasury rather than deleting it - the same
+        # conservation rule every other fee follows.
+        c.execute("SELECT value FROM bot_meta WHERE key = 'deposit_fee_backfilled'")
+        if not c.fetchone():
+            c.execute('INSERT INTO bank_treasury (chat_id) '
+                      'SELECT DISTINCT chat_id FROM bank_accounts WHERE COALESCE(balance,0) > 0 '
+                      'ON CONFLICT (chat_id) DO NOTHING')
+            c.execute("""
+                WITH fees AS (
+                    SELECT user_id, chat_id,
+                           round((balance * %s)::numeric, 2)::float8 AS fee
+                    FROM bank_accounts WHERE COALESCE(balance,0) > 0
+                ),
+                deb AS (
+                    UPDATE bank_accounts b SET balance = b.balance - f.fee
+                    FROM fees f
+                    WHERE b.user_id = f.user_id AND b.chat_id = f.chat_id AND f.fee > 0
+                    RETURNING b.user_id, b.chat_id, f.fee, b.balance AS new_bal
+                ),
+                lg AS (
+                    INSERT INTO bank_log (chat_id, user_id, kind, amount, balance_after, note)
+                    SELECT chat_id, user_id, 'fee_backfill', -fee, new_bal,
+                           'کارمزد واریزهای قبلی'
+                    FROM deb RETURNING 1
+                ),
+                agg AS (SELECT chat_id, SUM(fee) AS tot FROM deb GROUP BY chat_id)
+                UPDATE bank_treasury t SET balance = COALESCE(t.balance,0) + a.tot
+                FROM agg a WHERE t.chat_id = a.chat_id
+            """, (BACKFILL_DEPOSIT_FEE_RATIO,))
+            c.execute("INSERT INTO bot_meta (key, value) VALUES ('deposit_fee_backfilled', '1') "
+                      "ON CONFLICT (key) DO NOTHING")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_chat_user_idx ON size_log (chat_id, user_id, created_at DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_created_idx ON size_log (created_at DESC)")
 
@@ -1530,9 +1571,10 @@ def get_recent_net_by_user(chat_id, days):
             'FROM size_log l LEFT JOIN users u '
             '  ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
             'WHERE l.chat_id = %s AND l.created_at >= NOW() - (%s || %s)::interval '
-            '  AND COALESCE(l.source, %s) NOT IN (%s, %s, %s) '
+            '  AND COALESCE(l.source, %s) NOT IN (%s, %s, %s, %s) '
             'GROUP BY l.user_id',
-            ('', chat_id, days, ' days', '', 'bank_deposit', 'bank_withdraw', 'loan_principal')
+            ('', chat_id, days, ' days', '', 'bank_deposit', 'bank_withdraw',
+             'loan_principal', 'xfer_principal')
         )
         return c.fetchall()
 
@@ -1770,10 +1812,10 @@ def _bank_log(c, chat_id, user_id, kind, amount, balance_after, note=None):
               (chat_id, user_id, kind, amount, balance_after, note))
 
 
-def bank_deposit(user_id, chat_id, amount, today_str, daily_cap):
+def bank_deposit(user_id, chat_id, amount, today_str, daily_cap, fee_ratio=0.0):
     """Moves `amount` from wallet into the bank in ONE transaction.
 
-    Returns (True, new_balance, deposited_today) or (False, reason, remaining_cap).
+    Returns (True, new_balance, deposited_today, fee) or (False, reason, remaining_cap).
     The wallet deduction, the cap accounting and the bank credit all happen together:
     a crash between them would otherwise either eat the size or duplicate it. The
     daily cap counts *gross* deposits, so deposit->withdraw->deposit cannot be used to
@@ -1792,9 +1834,9 @@ def bank_deposit(user_id, chat_id, amount, today_str, daily_cap):
         used = float(row[0]) if row else 0.0
         remaining = daily_cap - used
         if remaining <= 0:
-            return (False, 'cap', 0.0)
+            return (False, 'cap', 0.0, 0.0)
         if amount > remaining:
-            return (False, 'cap', remaining)
+            return (False, 'cap', remaining, 0.0)
 
         # Atomic check-and-take on the wallet, same pattern as try_deduct_size.
         c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
@@ -1802,23 +1844,35 @@ def bank_deposit(user_id, chat_id, amount, today_str, daily_cap):
                   (amount, user_id, chat_id, amount))
         wrow = c.fetchone()
         if wrow is None:
-            return (False, 'funds', remaining)
+            return (False, 'funds', remaining, 0.0)
         c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
                   'VALUES (%s, %s, %s, %s, %s, %s)',
                   (chat_id, user_id, -amount, wrow[0], 'bank_deposit', None))
 
+        # The fee comes out of the amount, not on top of it: you send `amount`, the
+        # vault keeps `fee`, and the rest lands in your account. The daily cap counts
+        # the gross, so a fee can never be dodged by splitting a deposit up.
+        fee = round(amount * fee_ratio, 2)
+        credited = round(amount - fee, 2)
         c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) + %s, '
                   'deposited_today = COALESCE(deposited_today,0) + %s '
                   'WHERE user_id = %s AND chat_id = %s RETURNING balance, deposited_today',
-                  (amount, amount, user_id, chat_id))
+                  (credited, amount, user_id, chat_id))
         brow = c.fetchone()
-        _bank_log(c, chat_id, user_id, 'deposit', amount, brow[0])
-        return (True, float(brow[0]), float(brow[1]))
+        _bank_log(c, chat_id, user_id, 'deposit', credited, brow[0])
+        if fee > 0:
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                      (chat_id, fee, fee))
+            _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد واریز')
+        return (True, float(brow[0]), float(brow[1]), fee)
 
 
-def bank_withdraw(user_id, chat_id, amount):
-    """Moves `amount` from the bank back into the wallet, atomically. Returns
-    (True, new_bank_balance) or (False, None) if the account is short."""
+def bank_withdraw(user_id, chat_id, amount, fee_ratio=0.0):
+    """Moves `amount` out of the bank, atomically, minus the vault's cut. Returns
+    (True, new_bank_balance, paid_out, fee) or (False, None, 0, 0) if the account is
+    short. `amount` is what leaves the bank; `paid_out` is what reaches the wallet."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
@@ -1826,19 +1880,27 @@ def bank_withdraw(user_id, chat_id, amount):
                   'RETURNING balance', (amount, user_id, chat_id, amount))
         brow = c.fetchone()
         if brow is None:
-            return (False, None)
+            return (False, None, 0.0, 0.0)
+        fee = round(amount * fee_ratio, 2)
+        paid_out = round(amount - fee, 2)
         c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
                   'WHERE user_id = %s AND chat_id = %s RETURNING size',
-                  (amount, user_id, chat_id))
+                  (paid_out, user_id, chat_id))
         wrow = c.fetchone()
         if wrow is None:
             # No wallet row to receive it - undo rather than vanish the size.
             raise RuntimeError('no users row to withdraw into')
         c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
                   'VALUES (%s, %s, %s, %s, %s, %s)',
-                  (chat_id, user_id, amount, wrow[0], 'bank_withdraw', None))
+                  (chat_id, user_id, paid_out, wrow[0], 'bank_withdraw', None))
         _bank_log(c, chat_id, user_id, 'withdraw', -amount, brow[0])
-        return (True, float(brow[0]))
+        if fee > 0:
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                      (chat_id, fee, fee))
+            _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد برداشت')
+        return (True, float(brow[0]), paid_out, fee)
 
 
 def treasury_add(chat_id, amount, note=None):
@@ -2293,3 +2355,94 @@ def get_loan_defaults(chat_id, user_id):
                   (user_id, chat_id))
         row = c.fetchone()
         return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------- cross-group transfer
+# Every group is otherwise a completely separate league - the same player has an
+# independent size in each. This is the one seam between them, and it is priced steeply
+# on purpose: without a heavy fee, a player who is rich in one group could simply import
+# that lead into another and skip the game entirely.
+
+def get_user_groups(user_id, exclude_chat_id=None):
+    """Group chats where this player already has a row. Positive chat_ids are private
+    chats with the bot, not groups, so they are never transfer destinations."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT u.chat_id, COALESCE(u.size,0) FROM users u '
+                  'WHERE u.user_id = %s AND u.chat_id < 0 '
+                  '  AND (%s::bigint IS NULL OR u.chat_id <> %s) '
+                  'ORDER BY u.size DESC',
+                  (user_id, exclude_chat_id, exclude_chat_id))
+        return c.fetchall()
+
+
+def try_start_xfer(user_id, chat_id, cooldown_seconds):
+    """Per-player transfer cooldown, claimed atomically. (True, 0) or (False, seconds)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET last_xfer_at = NOW() '
+                  'WHERE user_id = %s AND chat_id = %s '
+                  '  AND (last_xfer_at IS NULL OR last_xfer_at < NOW() - (%s || %s)::interval) '
+                  'RETURNING last_xfer_at',
+                  (user_id, chat_id, cooldown_seconds, ' seconds'))
+        if c.fetchone() is not None:
+            return (True, 0)
+        c.execute('SELECT CEIL(EXTRACT(EPOCH FROM (last_xfer_at + (%s || %s)::interval - NOW()))) '
+                  'FROM users WHERE user_id = %s AND chat_id = %s',
+                  (cooldown_seconds, ' seconds', user_id, chat_id))
+        row = c.fetchone()
+        return (False, int(row[0]) if row and row[0] and row[0] > 0 else 0)
+
+
+def cross_group_transfer(user_id, from_chat, to_chat, amount, fee_ratio):
+    """Moves one player's own size from one group to another, minus a heavy fee.
+
+    One transaction across both groups, so the size can never exist in both at once or
+    in neither. The fee stays in the *source* group's treasury: that group is the one
+    losing the wealth, so it is the one that keeps a cut of it.
+
+    The principal is logged as 'xfer_principal' on both sides - it is the same player's
+    money moving between leagues, not winnings, so the nightly handicap ignores it the
+    way it ignores bank and loan transfers. The fee is a genuine cost and is logged as
+    'xfer_fee', which does count.
+
+    Returns (True, delivered, fee) or (False, reason, 0)."""
+    fee = round(amount * fee_ratio, 2)
+    delivered = round(amount - fee, 2)
+    with get_connection() as conn:
+        c = conn.cursor()
+        # Atomic check-and-take at the source.
+        c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(size,0) >= %s RETURNING size',
+                  (amount, user_id, from_chat, amount))
+        srow = c.fetchone()
+        if srow is None:
+            return (False, 'funds', 0.0)
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (from_chat, user_id, -delivered, srow[0], 'xfer_principal',
+                   f'انتقال به گروه {to_chat}'))
+        if fee > 0:
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s, %s, %s, %s, %s, %s)',
+                      (from_chat, user_id, -fee, srow[0], 'xfer_fee', 'کارمزد انتقال'))
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                      (from_chat, fee, fee))
+            _bank_log(c, from_chat, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد انتقال')
+
+        # The destination row must already exist - you can only send to a league you
+        # actually play in, which is what stops this being a way to seed a brand new
+        # account somewhere.
+        c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                  (delivered, user_id, to_chat))
+        drow = c.fetchone()
+        if drow is None:
+            raise RuntimeError('no destination users row')
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (to_chat, user_id, delivered, drow[0], 'xfer_principal',
+                   f'انتقال از گروه {from_chat}'))
+        return (True, delivered, fee)
