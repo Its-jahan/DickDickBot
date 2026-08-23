@@ -43,6 +43,24 @@ Key gotchas when writing this style of test:
 - Fake `Context` objects need `.bot` (with async `edit_message_text`/`send_message`) and, for anything PvP-challenge-related, `.job_queue` (with a `run_once(callback, when, data, name)` method) — `accept_challenge_callback` schedules a resolution job through it.
 - Run the full existing regression scripts before shipping any change to `bot.py`/`db.py`; there's no single entrypoint, run each script individually.
 
+### Run the handlers, not just the SQL
+
+The db-layer suites all passed while `/shop` was dead: `build_shop_keyboard` referenced
+a `chat_id` it was never passed, which is a `NameError` at call time and completely
+invisible to SQL-level tests. Anything that touches `bot.py` needs a test that actually
+*calls* the handler.
+
+`test_commands.py` drives every player-facing command against fake `Update`/`Context`
+objects and asserts it neither raises nor stays silent. It needs no Telegram and only a
+scratch Postgres, so it is cheap to extend — add a line to its `cases` list whenever you
+add a command. Note the shape of the fakes: `reply_text` records instead of sending, and
+`FakeUpdate` supplies `effective_user` / `effective_chat` / `message`, which is the
+minimum every handler here touches.
+
+There is also a static pass worth keeping in mind for this kind of bug: walking the AST
+for names a function loads but never binds (accounting for module globals, imports and
+closures) finds exactly this class of defect across the whole file in one go.
+
 ## Architecture
 
 Two modules, no package structure:

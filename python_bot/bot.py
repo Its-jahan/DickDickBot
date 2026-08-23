@@ -4208,7 +4208,9 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-def build_shop_keyboard(user_id):
+def build_shop_keyboard(user_id, chat_id):
+    # chat_id is required, not optional: prices are per-group now that inflation scales
+    # them, and there is no sensible group-agnostic price to fall back on.
     rows = []
     items = [(nm, priced(pr, chat_id)) for nm, pr in SHOP_PRICES.items()]
     for i in range(0, len(items), 2):
@@ -4228,7 +4230,7 @@ async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = priced(base_price, chat_id)
         lines.append(f"• {name} — {price} سانت\n  └ {ITEM_DESCRIPTIONS.get(name, '')}")
     lines.append("\nروی دکمه بزن تا بخری 👇")
-    await update.message.reply_text("\n".join(lines), reply_markup=build_shop_keyboard(user.id))
+    await update.message.reply_text("\n".join(lines), reply_markup=build_shop_keyboard(user.id, chat_id))
 
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
