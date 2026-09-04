@@ -2504,6 +2504,145 @@ def get_loan_defaults(chat_id, user_id):
         return int(row[0]) if row else 0
 
 
+# ---------------------------------------------------------------- cross-group transfer
+# Every group is otherwise a completely separate league - the same player has an
+# independent size in each. This is the one seam between them, and it is priced steeply
+# on purpose: without a heavy fee, a player who is rich in one group could simply import
+# that lead into another and skip the game entirely. It was closed once already after
+# players farmed size in a friction-free side group and imported most of it back; the
+# owner can now flip it back open from the admin panel (with the fee reset higher) via
+# XFER_ENABLED_KEY / XFER_FEE_RATIO_KEY in bot_meta, rather than a code change.
+XFER_ENABLED_KEY = 'xfer_enabled'
+XFER_FEE_RATIO_KEY = 'xfer_fee_ratio'
+XFER_DEFAULT_FEE_RATIO = 0.40
+
+
+def is_xfer_enabled():
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT value FROM bot_meta WHERE key = %s', (XFER_ENABLED_KEY,))
+        row = c.fetchone()
+        return row is not None and row[0] == '1'
+
+
+def set_xfer_enabled(enabled):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO bot_meta (key, value) VALUES (%s, %s) '
+            'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+            (XFER_ENABLED_KEY, '1' if enabled else '0')
+        )
+
+
+def get_xfer_fee_ratio():
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT value FROM bot_meta WHERE key = %s', (XFER_FEE_RATIO_KEY,))
+        row = c.fetchone()
+        if row is None:
+            return XFER_DEFAULT_FEE_RATIO
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return XFER_DEFAULT_FEE_RATIO
+
+
+def set_xfer_fee_ratio(ratio):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO bot_meta (key, value) VALUES (%s, %s) '
+            'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+            (XFER_FEE_RATIO_KEY, str(ratio))
+        )
+
+
+def get_user_groups(user_id, exclude_chat_id=None):
+    """Group chats where this player already has a row. Positive chat_ids are private
+    chats with the bot, not groups, so they are never transfer destinations."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT u.chat_id, COALESCE(u.size,0) FROM users u '
+                  'WHERE u.user_id = %s AND u.chat_id < 0 '
+                  '  AND (%s::bigint IS NULL OR u.chat_id <> %s) '
+                  'ORDER BY u.size DESC',
+                  (user_id, exclude_chat_id, exclude_chat_id))
+        return c.fetchall()
+
+
+def try_start_xfer(user_id, chat_id, cooldown_seconds):
+    """Per-player transfer cooldown, claimed atomically. (True, 0) or (False, seconds)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET last_xfer_at = NOW() '
+                  'WHERE user_id = %s AND chat_id = %s '
+                  '  AND (last_xfer_at IS NULL OR last_xfer_at < NOW() - (%s || %s)::interval) '
+                  'RETURNING last_xfer_at',
+                  (user_id, chat_id, cooldown_seconds, ' seconds'))
+        if c.fetchone() is not None:
+            return (True, 0)
+        c.execute('SELECT CEIL(EXTRACT(EPOCH FROM (last_xfer_at + (%s || %s)::interval - NOW()))) '
+                  'FROM users WHERE user_id = %s AND chat_id = %s',
+                  (cooldown_seconds, ' seconds', user_id, chat_id))
+        row = c.fetchone()
+        return (False, int(row[0]) if row and row[0] and row[0] > 0 else 0)
+
+
+def cross_group_transfer(user_id, from_chat, to_chat, amount, fee_ratio):
+    """Moves one player's own size from one group to another, minus a heavy fee.
+
+    One transaction across both groups, so the size can never exist in both at once or
+    in neither. The fee stays in the *source* group's treasury: that group is the one
+    losing the wealth, so it is the one that keeps a cut of it.
+
+    The principal is logged as 'xfer_principal' on both sides - it is the same player's
+    money moving between leagues, not winnings, so the nightly handicap ignores it the
+    way it ignores bank and loan transfers. The fee is a genuine cost and is logged as
+    'xfer_fee', which does count.
+
+    Returns (True, delivered, fee) or (False, reason, 0)."""
+    fee = round(amount * fee_ratio, 2)
+    delivered = round(amount - fee, 2)
+    with get_connection() as conn:
+        c = conn.cursor()
+        # Atomic check-and-take at the source.
+        c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(size,0) >= %s RETURNING size',
+                  (amount, user_id, from_chat, amount))
+        srow = c.fetchone()
+        if srow is None:
+            return (False, 'funds', 0.0)
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (from_chat, user_id, -delivered, srow[0], 'xfer_principal',
+                   f'انتقال به گروه {to_chat}'))
+        if fee > 0:
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s, %s, %s, %s, %s, %s)',
+                      (from_chat, user_id, -fee, srow[0], 'xfer_fee', 'کارمزد انتقال'))
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                      (from_chat, fee, fee))
+            _bank_log(c, from_chat, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد انتقال')
+
+        # The destination row must already exist - you can only send to a league you
+        # actually play in, which is what stops this being a way to seed a brand new
+        # account somewhere.
+        c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                  (delivered, user_id, to_chat))
+        drow = c.fetchone()
+        if drow is None:
+            raise RuntimeError('no destination users row')
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (to_chat, user_id, delivered, drow[0], 'xfer_principal',
+                   f'انتقال از گروه {from_chat}'))
+        return (True, delivered, fee)
+
+
 def get_credit(user_id, chat_id):
     """(score, repaid, late, defaults) - the whole credit file for one player."""
     with get_connection() as conn:

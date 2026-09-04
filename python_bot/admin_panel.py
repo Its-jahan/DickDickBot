@@ -270,6 +270,32 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.route("/settings/transfer", methods=["POST"])
+@login_required
+def save_transfer_settings():
+    """Owner on/off switch (+ fee) for cross-group transfer (/enteghal). Shut down once
+    already after players farmed size in a low-friction side group and imported most of
+    it back; reopening it here resets the fee rather than restoring the old, too-cheap
+    one, since the two submit buttons below always carry the fee field along with them."""
+    try:
+        fee_pct = validate('number', request.form.get("fee_pct"))
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    if not (0 <= fee_pct <= 90):
+        flash("کارمزد باید بین ۰ تا ۹۰ درصد باشد.", "error")
+        return redirect(url_for("index"))
+
+    enabled = request.form.get("enabled") == "1"
+    db.set_xfer_enabled(enabled)
+    db.set_xfer_fee_ratio(fee_pct / 100)
+    if enabled:
+        flash(f"انتقال بین‌گروهی باز شد، کارمزد {fee_pct:.0f}٪.")
+    else:
+        flash("انتقال بین‌گروهی بسته شد.")
+    return redirect(url_for("index"))
+
+
 @app.route("/")
 @login_required
 def index():
@@ -281,7 +307,31 @@ def index():
                        "king": kingdom[1] if kingdom else None,
                        "consort": kingdom[3] if kingdom else None})
     groups.sort(key=lambda g: -g["stats"]["players"])
+    xfer_enabled = db.is_xfer_enabled()
+    xfer_fee_pct = round(db.get_xfer_fee_ratio() * 100)
     return page("خانه", """
+<h1>تنظیمات</h1>
+<div class="card">
+  <div class="row" style="align-items:center">
+    <div style="flex:2">
+      <b>انتقال بین‌گروهی</b> (/enteghal)
+      <div class="dim">
+        وضعیت فعلی:
+        {% if xfer_enabled %}<span class="pos">باز</span> — کارمزد {{ xfer_fee_pct }}٪
+        {% else %}<span class="neg">بسته</span>{% endif %}
+      </div>
+    </div>
+  </div>
+  <form method="post" action="{{ url_for('save_transfer_settings') }}" class="row" style="margin-top:12px">
+    <div style="max-width:140px">
+      <label>کارمزد (٪)</label>
+      <input type="number" name="fee_pct" value="{{ xfer_fee_pct }}" min="0" max="90" step="1">
+    </div>
+    <div style="flex:0 0 auto"><button name="enabled" value="1">باز کن</button></div>
+    <div style="flex:0 0 auto"><button class="danger" name="enabled" value="0">ببند</button></div>
+  </form>
+</div>
+
 <h1>گروه‌ها</h1>
 {% for g in groups %}
 <div class="card">
@@ -305,7 +355,7 @@ def index():
 </div>
 {% endfor %}
 {% if not groups %}<div class="card">هنوز گروهی ثبت نشده.</div>{% endif %}
-""", groups=groups)
+""", groups=groups, xfer_enabled=xfer_enabled, xfer_fee_pct=xfer_fee_pct)
 
 
 # chat_id is signed: Telegram group ids are negative and the default int

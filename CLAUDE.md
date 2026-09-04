@@ -190,26 +190,28 @@ pays in full — which used to evaporate.
 When adding a new fee, take it in the same transaction as the thing it is charging on,
 and never charge it on money that is merely being returned from escrow.
 
-## Cross-group transfer was removed — groups are fully sealed leagues again
+## Cross-group transfer is an owner-controlled switch, not a fixed feature
 
-`/enteghal` used to let a player move their own size between groups they played in, for
-a 30% fee and a 24h cooldown (`get_user_groups`/`try_start_xfer`/`cross_group_transfer`
-in `db.py`). It was shut down because the fee wasn't enough friction: players were
+`/enteghal` lets a player move their own size between groups they played in, minus a fee.
+It was shut down once already: the 30% fee wasn't enough friction, and players were
 leaving to build a size in a low-friction side group they controlled (no real PvP, no
-theft, no consensus votes shrinking them) and importing 70% of it back, which let them
-skip this group's economy rather than just discount it. `transfer_cmd` is now a stub that
-tells anyone who still types `/enteghal` that it's permanently closed; there is no
-callback handler left (no code path generates `xfer_`-prefixed buttons anymore).
+theft, no consensus votes shrinking them) and importing most of it back, which let them
+skip this group's economy rather than just discount it.
 
-The `users.last_xfer_at` column and the `xfer_principal`/`xfer_fee` `size_log` source
-tags from before the shutdown are left in place — dropping a column needs a real
-migration this codebase doesn't have a pattern for, and old rows must keep reading back
-correctly (`xfer_principal` still needs to stay excluded from the nightly handicap's net
-calculation, since it really was the same player's money moving, not winnings).
+Rather than a code change, whether it's open at all and what it charges are now both
+runtime state in `bot_meta` (`db.is_xfer_enabled()` / `db.get_xfer_fee_ratio()`,
+default 40% when never configured), settable from the admin panel's home page. Both
+`transfer_cmd` and `transfer_callback` re-check `is_xfer_enabled()` independently -
+the callback re-checks separately because a button can still be sitting in an old
+message from before the owner flipped it off. Cooldown (24h) and the minimum amount
+(50) stay fixed constants in `bot.py`; only on/off and the fee are panel-controlled.
 
-If this is ever reopened, don't just restore the old fee — the abuse pattern was about
-side-group friction, not price; a real fix needs to account for how easy it is to farm
-size somewhere with no downside risk.
+The underlying `get_user_groups`/`try_start_xfer`/`cross_group_transfer` functions in
+`db.py`, and the `users.last_xfer_at` column and `xfer_principal`/`xfer_fee` `size_log`
+source tags, are unconditional - the toggle only gates the two `bot.py` handlers. If the
+fee is ever lowered again, remember the abuse pattern was about side-group friction, not
+price; a cheap fee alone doesn't stop someone farming size somewhere with no downside
+risk.
 
 ## One-time data migrations go in `init_db`, guarded by `bot_meta`
 
