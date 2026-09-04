@@ -190,18 +190,26 @@ pays in full — which used to evaporate.
 When adding a new fee, take it in the same transaction as the thing it is charging on,
 and never charge it on money that is merely being returned from escrow.
 
-## Cross-group transfer is the one seam between leagues
+## Cross-group transfer was removed — groups are fully sealed leagues again
 
-Groups are otherwise fully independent — the same player has a separate size in each.
-`/enteghal` is the single exception and is priced at `XFER_FEE_RATIO` (30%) with a 24h
-cooldown, because a player who is rich in one group could otherwise import that lead and
-skip the other group's game entirely. The fee stays in the **source** group's treasury:
-that is the group losing the wealth, so it keeps a cut.
+`/enteghal` used to let a player move their own size between groups they played in, for
+a 30% fee and a 24h cooldown (`get_user_groups`/`try_start_xfer`/`cross_group_transfer`
+in `db.py`). It was shut down because the fee wasn't enough friction: players were
+leaving to build a size in a low-friction side group they controlled (no real PvP, no
+theft, no consensus votes shrinking them) and importing 70% of it back, which let them
+skip this group's economy rather than just discount it. `transfer_cmd` is now a stub that
+tells anyone who still types `/enteghal` that it's permanently closed; there is no
+callback handler left (no code path generates `xfer_`-prefixed buttons anymore).
 
-The destination `users` row must already exist — you can only send to a league you
-already play in, which stops this being a way to seed a fresh account somewhere. As with
-loans, the principal is logged as `xfer_principal` (ignored by the handicap, since it is
-the same player's money) while `xfer_fee` counts as a real cost.
+The `users.last_xfer_at` column and the `xfer_principal`/`xfer_fee` `size_log` source
+tags from before the shutdown are left in place — dropping a column needs a real
+migration this codebase doesn't have a pattern for, and old rows must keep reading back
+correctly (`xfer_principal` still needs to stay excluded from the nightly handicap's net
+calculation, since it really was the same player's money moving, not winnings).
+
+If this is ever reopened, don't just restore the old fee — the abuse pattern was about
+side-group friction, not price; a real fix needs to account for how easy it is to farm
+size somewhere with no downside risk.
 
 ## One-time data migrations go in `init_db`, guarded by `bot_meta`
 

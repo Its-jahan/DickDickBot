@@ -138,7 +138,6 @@ BOT_COMMANDS = [
     ("vam", "🏛 وام از بانک — /vam 100"),
     ("bedehi", "📜 بدهی‌ها و طلب‌های من"),
     ("pardakht", "✅ تسویهٔ بدهی"),
-    ("enteghal", "🔁 انتقال سایز به گروه دیگه (کارمزد بالا)"),
     ("etebar", "📊 اعتبارسنجی — /etebar @user (۵ سانت)"),
     ("farman", "👑 (پادشاه) فرمان امروز رو امضا کن"),
     ("eghtesad", "📊 وضعیت اقتصاد گروه"),
@@ -604,7 +603,7 @@ HELP_TEXT = (
     "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
     "🏛 /vam <مقدار> — وام رسمی از بانک\n"
     "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
-    "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (کارمزد سنگین)\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"    "👑 /farman — (پادشاه) فرمان روزانه\n"
+    "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"    "👑 /farman — (پادشاه) فرمان روزانه\n"
     "📊 /eghtesad — تورم، خشم مردم و اهرم‌های تاج\n"
     "📜 /farmanha — تاریخچهٔ فرمان‌ها\n"    "🪖 /hokm — (پادشاه) حکومت نظامی، هر ۳ روز یک بار\n"
     "🤡 /dalghak — دلقک‌های دربار\n"
@@ -2324,13 +2323,6 @@ THEFT_FEE_RATIO = 0.10       # cut of a successful theft's loot
 CHALLENGE_FEE_RATIO = 0.05   # cut of the winner's net winnings (never their own stake)
 BANK_DEPOSIT_FEE_RATIO = 0.02
 BANK_WITHDRAW_FEE_RATIO = 0.02
-
-# Every group is otherwise an independent league. This is the single seam between them
-# and it is priced to hurt: importing a lead you built somewhere else should cost you
-# most of it, or the other group's game stops mattering.
-XFER_FEE_RATIO = 0.30
-XFER_COOLDOWN_SECONDS = 24 * 3600
-XFER_MIN_AMOUNT = 50
 
 # ---------------------------------------------------------------- credit scoring
 # A borrower's score IS their borrowing limit: the cap is their size multiplied by
@@ -4060,133 +4052,12 @@ async def jesters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/enteghal <amount>` - move your own size from this group to another one you play
-    in, minus a heavy fee. Offers the destination as buttons because nobody knows their
-    groups by chat_id."""
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    if chat_id >= 0:
-        await update.message.reply_text("انتقال بین‌گروهی فقط داخل گروه‌ها کار می‌کند!")
-        return
-    db.track_chat(chat_id)
-    size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-
-    parts = update.message.text.split()
-    amount = None
-    if len(parts) > 1:
-        try:
-            amount = int(float(parts[1]))
-        except ValueError:
-            amount = None
-    if amount is None or amount <= 0:
-        await update.message.reply_text(
-            f"🔁 انتقال بین‌گروهی\n\n"
-            f"سایزت رو به یکی دیگه از گروه‌هایی که توش بازی می‌کنی بفرست.\n"
-            f"⚠️ کارمزدش سنگینه: {int(XFER_FEE_RATIO*100)}٪\n"
-            f"⏳ هر {XFER_COOLDOWN_SECONDS // 3600} ساعت یک بار\n"
-            f"💼 جیبت: {int(size)} سانت\n\n"
-            f"/enteghal <مقدار>"
-        )
-        return
-    if amount < XFER_MIN_AMOUNT:
-        await update.message.reply_text(f"حداقل مبلغ انتقال {XFER_MIN_AMOUNT} سانته.")
-        return
-    if size < amount:
-        await update.message.reply_text(f"این‌قدر سانت نداری! 💼 {int(size)} سانت داری.")
-        return
-
-    groups = db.get_user_groups(user.id, exclude_chat_id=chat_id)
-    if not groups:
-        await update.message.reply_text(
-            "تو هیچ گروه دیگه‌ای بازی نمی‌کنی!\nاول تو یه گروه دیگه /d بزن."
-        )
-        return
-
-    fee = int(amount * XFER_FEE_RATIO)
-    rows = []
-    for gid, _gsize in groups[:8]:
-        title = f"گروه {gid}"
-        try:
-            chat = await context.bot.get_chat(gid)
-            if chat.title:
-                title = chat.title[:40]
-        except Exception:
-            pass  # bot may have been removed from that group; the id still works
-        rows.append([InlineKeyboardButton(f"➡️ {title}", callback_data=f"xfer_{gid}_{amount}")])
-
+    """`/enteghal` - permanently closed. Players were leaving to grow size in a
+    friction-free side group (no PvP, no theft, no consensus votes) and importing it
+    back at a 70% cut, which let them skip this group's economy entirely."""
     await update.message.reply_text(
-        f"🔁 <b>انتقال بین‌گروهی</b>\n\n"
-        f"مبلغ: <b>{amount}</b> سانت\n"
-        f"🧾 کارمزد ({int(XFER_FEE_RATIO*100)}٪): {fee} سانت → خزانهٔ همین گروه\n"
-        f"📦 به مقصد می‌رسه: <b>{amount - fee}</b> سانت\n\n"
-        f"کدوم گروه؟",
-        reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML"
+        "🔒 انتقال سایز بین گروه‌ها برای همیشه بسته شده."
     )
-
-
-async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    chat_id = resolve_chat_id(query)
-    if not chat_id:
-        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن!", show_alert=True)
-        return
-    try:
-        _, dest_str, amount_str = query.data.split('_', 2)
-        dest_chat = int(dest_str); amount = int(amount_str)
-    except ValueError:
-        return
-    if amount < XFER_MIN_AMOUNT or dest_chat >= 0 or dest_chat == chat_id:
-        await query.answer("انتقال نامعتبره!", show_alert=True)
-        return
-    # callback_data is client-supplied, so re-check membership rather than trusting it.
-    if dest_chat not in [g[0] for g in db.get_user_groups(user.id, exclude_chat_id=chat_id)]:
-        await query.answer("تو اون گروه بازی نمی‌کنی!", show_alert=True)
-        return
-
-    ok, remaining = db.try_start_xfer(user.id, chat_id, XFER_COOLDOWN_SECONDS)
-    if not ok:
-        hours, minutes = remaining // 3600, (remaining % 3600) // 60
-        await query.answer(
-            f"تازه انتقال زدی! تا {hours} ساعت و {minutes} دقیقهٔ دیگه صبر کن.", show_alert=True
-        )
-        return
-
-    ok, delivered, fee = db.cross_group_transfer(user.id, chat_id, dest_chat, amount,
-                                                 XFER_FEE_RATIO)
-    if not ok:
-        await query.answer("سایزت کافی نیست!", show_alert=True)
-        return
-
-    dest_title = f"گروه {dest_chat}"
-    try:
-        chat = await context.bot.get_chat(dest_chat)
-        if chat.title:
-            dest_title = chat.title[:40]
-    except Exception:
-        pass
-
-    await query.answer(f"{int(delivered)} سانت رسید!")
-    try:
-        await query.edit_message_text(
-            f"🔁 <b>انتقال انجام شد</b>\n\n"
-            f"{_esc(user.first_name)} <b>{amount}</b> سانت از این گروه فرستاد به "
-            f"<b>{_esc(dest_title)}</b>.\n"
-            f"🧾 کارمزد: {int(fee)} سانت رفت تو خزانهٔ همین گروه\n"
-            f"📦 رسید: {int(delivered)} سانت",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-    try:
-        await context.bot.send_message(
-            chat_id=dest_chat,
-            text=(f"🔁 {_esc(user.first_name)} <b>{int(delivered)}</b> سانت از یه گروه دیگه "
-                  f"آورد اینجا!"),
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
 
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4819,7 +4690,6 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(boss_hit_callback, pattern=r'^bosshit_'))
     app.add_handler(CallbackQueryHandler(lottery_buy_callback, pattern=r'^lot_'))
     app.add_handler(CallbackQueryHandler(loan_accept_callback, pattern=r'^loanok_'))
-    app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r'^xfer_'))
     app.add_handler(CallbackQueryHandler(decree_callback, pattern=r'^decree_'))
     
     app.add_handler(InlineQueryHandler(inline_query))
