@@ -33,3 +33,12 @@ jobs:
             systemctl is-active dickbot
             echo "--- last 200 lines of dickbot journal (for diagnostics) ---"
             journalctl -u dickbot -n 200 --no-pager || true
+            # The admin panel is a separate gunicorn service (admin_panel.py) that this
+            # checkout also updates on disk, but a running gunicorn worker keeps executing
+            # the old Python code until it's restarted - so a push that only touches
+            # admin_panel.py would silently not take effect without this.
+            if systemctl list-unit-files dickbot-admin.service >/dev/null 2>&1; then
+              systemctl restart dickbot-admin
+              sleep 2
+              systemctl is-active dickbot-admin
+            fi
