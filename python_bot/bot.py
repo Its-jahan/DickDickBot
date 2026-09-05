@@ -133,7 +133,8 @@ BOT_COMMANDS = [
     ("bank", "🏦 بانک — سود روزانه و حساب امن"),
     ("variz", "📥 واریز به بانک — /variz 50"),
     ("bardasht", "🏧 برداشت از بانک — /bardasht 50"),
-    ("sarghat", "🚨 سرقت از بانک گروه!"),
+    ("sarghat", "🚨 سرقت از بانک گروه (یه بازی سخته!)"),
+    ("vasighe", "🔓 وثیقه برای آزادی از زندان بانک"),
     ("nozul", "🤝 نزول دادن به یکی — /nozul @user 100 25"),
     ("vam", "🏛 وام از بانک — /vam 100"),
     ("bedehi", "📜 بدهی‌ها و طلب‌های من"),
@@ -601,7 +602,7 @@ HELP_TEXT = (
     "🏦 /bank — بانک: سود روزانه، امن از دزدی\n"
     "📥 /variz <مقدار> — واریز به بانک (سقف روزانه داره)\n"
     "🏧 /bardasht <مقدار> — برداشت از بانک\n"
-    "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه!\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
+    "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه! (باید یه بازی سخت رو ببری)\n"    "🔓 /vasighe — وثیقه برای آزادی از زندان بانک\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
     "🏛 /vam <مقدار> — وام رسمی از بانک\n"
     "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
     "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (در صورت باز بودن)\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"    "👑 /farman — (پادشاه) فرمان روزانه\n"
@@ -631,7 +632,11 @@ async def dick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last_grown == today_str:
         await update.message.reply_text("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.")
         return
-        
+
+    if db.is_in_heist_prison(user.id, chat_id):
+        await update.message.reply_text("⛓ تو زندان بانکی، نمی‌تونی دودولت رو بمالی! با /vasighe می‌تونی زودتر آزاد شی.")
+        return
+
     keyboard = [[InlineKeyboardButton("بمالش تا بزرگ شه 💦", callback_data=f"grow_self_{user.id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -1186,7 +1191,11 @@ async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_perk == "حرومزاده":
         await update.message.reply_text("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش ایجاد کنید.")
         return
-        
+
+    if db.is_in_heist_prison(user.id, chat_id):
+        await update.message.reply_text("⛓ تو زندان بانکی، نمی‌تونی چالش بدی!")
+        return
+
     # جقی deliberately does NOT touch the stake here. Its description promises a wild
     # swing on the *dice* during the challenge, and that is where it is now applied
     # (see resolve_pvp_match). Rewriting the bet instead meant the one perk players
@@ -1250,10 +1259,20 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         await query.answer("کیر شروع‌کننده امروز فیریز شده (پرک حرومزاده)! نمی‌تواند چالش انجام دهد.", show_alert=True)
         return
 
+    if db.is_in_heist_prison(challenger_id, chat_id):
+        _release()
+        await query.answer("شروع‌کننده تو زندان بانکه، نمی‌تونه چالش بده!", show_alert=True)
+        return
+
     user_size, _, user_perk = db.get_user(user.id, chat_id, None, None)
     if user_perk == "حرومزاده":
         _release()
         await query.answer("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش رو بپذیرید.", show_alert=True)
+        return
+
+    if db.is_in_heist_prison(user.id, chat_id):
+        _release()
+        await query.answer("⛓ تو زندان بانکی، نمی‌تونی چالش بپذیری!", show_alert=True)
         return
 
     # Stake both sides' bet immediately the moment the match actually starts, so nobody
@@ -1860,6 +1879,12 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.", show_alert=True)
         return
 
+    # Re-checked here too: the button can still be sitting in an old message from
+    # before a heist sentence started.
+    if db.is_in_heist_prison(user.id, chat_id):
+        await query.answer("⛓ تو زندان بانکی، نمی‌تونی دودولت رو بمالی!", show_alert=True)
+        return
+
     # Atomically stamp today's date first: a rapid double-tap (or the same button in
     # two clients) would otherwise pass the check above twice and grow twice. The same
     # statement rolls the daily streak forward (or resets it if yesterday was missed).
@@ -1920,6 +1945,22 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 jester_note = (f"\n🤡 دلقکِ درباری: {tribute} سانت از رشدت رفت "
                                f"تو جیب {kingdom_now[1]}!")
 
+    # Working off a busted heist: same shape as the jester tribute, just a separate
+    # status and (usually) a heavier cut. Only taken from a positive roll here too.
+    labor_note = ""
+    if delta > 0:
+        _, labor_until, _ = db.get_heist_status(user.id, chat_id)
+        if labor_until and labor_until > datetime.datetime.now(datetime.timezone.utc):
+            kingdom_now = db.get_kingdom(chat_id)
+            if kingdom_now and kingdom_now[0] and kingdom_now[0] != user.id:
+                tribute = int(delta * HEIST_LABOR_TRIBUTE_RATIO)
+                if tribute > 0:
+                    db.update_size(user.id, chat_id, -tribute)
+                    db.update_size(kingdom_now[0], chat_id, tribute)
+                    delta -= tribute
+                    labor_note = (f"\n🔨 کار برای پادشاه: {tribute} سانت از رشدت رفت "
+                                  f"تو جیب {kingdom_now[1]}!")
+
     current_size = current_size + delta
     
     perk_pool = [
@@ -1970,7 +2011,7 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     verb = "بزرگ شد" if delta >= 0 else "کوچک شد"
     d_name = get_dick_name(current_size)
-    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.{jester_note}{streak_msg}\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
+    msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.{jester_note}{labor_note}{streak_msg}\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
 
     await query.answer(f"{d_name} شما تغییر کرد!")
     try:
@@ -2283,14 +2324,29 @@ BANK_MIN_DEPOSIT = 5
 
 # A heist is the counterweight to all that safety. It is rare, it is group-wide, and it
 # can fail expensively - but it reaches the deposits themselves, so no vault is ever a
-# guaranteed hiding place.
+# guaranteed hiding place. Win/loss isn't a hidden dice roll: the thief has to actually
+# crack a vault-cracking memory game under a shared deadline (see heist_cmd below).
 HEIST_COOLDOWN_SECONDS = 20 * 3600
 HEIST_MIN_VAULT = 60               # not worth cracking an empty vault
-HEIST_BASE_CHANCE = 0.30
 HEIST_TREASURY_RATIO = 0.50        # of the treasury on success
 HEIST_DEPOSIT_RATIO = 0.15         # of every other depositor's balance on success
-HEIST_FINE_RATIO = 0.25            # of the would-be loot, paid by a caught thief
-HEIST_JAIL_HOURS = 12              # a caught thief also loses their next theft window
+
+# The vault-cracking mini-game: memorize a full shuffled order of every symbol, then tap
+# them back in that exact order once the keypad reshuffles. One wrong tap ends it
+# immediately - there is no partial credit, same as timing out.
+HEIST_SYMBOLS = ["🔵", "🟢", "🔴", "🟡", "🟣", "⚪"]
+HEIST_REVEAL_SECONDS = 6            # time to memorize the order before the keypad flips
+HEIST_TOTAL_SECONDS = 30            # whole game, memorizing included - matches the ask
+
+# What a busted attempt costs: prison first (locked out of grow/challenge/theft/heist
+# entirely), then a longer stretch just paying tribute to the king out of daily growth.
+HEIST_PRISON_DAYS = 3
+HEIST_LABOR_MIN_DAYS = 2
+HEIST_LABOR_MAX_DAYS = 7
+HEIST_LABOR_SCALE_VAULT = 2000      # an attempt at/above this size earns the full 7 days
+HEIST_LABOR_TRIBUTE_RATIO = 0.40    # cut of daily growth skimmed to the king during labor
+HEIST_BAIL_RATIO = 0.5              # of the would-be loot, inflation-priced - buys out
+                                     # the prison half only, never the labor debt
 
 # ---------------------------------------------------------------- loans (نزول)
 # Two lenders, one settlement path. /vam borrows from the group treasury at a flat
@@ -2652,6 +2708,11 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.track_chat(chat_id)
     thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    if db.is_in_heist_prison(user.id, chat_id):
+        await update.message.reply_text("⛓ تو زندان بانکی، نمی‌تونی دزدی کنی!")
+        return
+
     # Same gate /ejma uses: only people actually playing today can move other people's
     # size around, so a throwaway account can't be spun up purely to rob someone.
     if thief_last_grown != tehran_today_str():
@@ -3028,12 +3089,41 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/sarghat` - try to crack the group vault. Hits the treasury AND everyone's
-    deposits, which is what stops the bank being a risk-free hiding place.
+def _fmt_days_hours(delta):
+    """A timedelta rendered as '{days} روز و {hours} ساعت' - shared by the prison/labor
+    status messages."""
+    secs = max(0, int(delta.total_seconds()))
+    days, rem = divmod(secs, 86400)
+    hours = rem // 3600
+    return f"{days} روز و {hours} ساعت"
 
-    Deliberately hostile: one attempt per group per cooldown (not per player), a real
-    chance of failure, and a fine for getting caught. Strictly zero-sum either way."""
+
+def _heist_labor_days(would_be):
+    """Longer labor sentence for a bigger attempted heist, capped at HEIST_LABOR_MAX_DAYS
+    so it stays 'up to 7 days' rather than unbounded. Whole days only - make_interval on
+    the db side takes an integer day count."""
+    frac = min(1.0, would_be / HEIST_LABOR_SCALE_VAULT)
+    return int(round(HEIST_LABOR_MIN_DAYS + frac * (HEIST_LABOR_MAX_DAYS - HEIST_LABOR_MIN_DAYS)))
+
+
+def _heist_prison_reply(prison_until, labor_until, bail_amount, now):
+    lines = [f"⛓ تو الان تو زندان بانکی! تا {_fmt_days_hours(prison_until - now)} دیگه آزاد می‌شی."]
+    if bail_amount:
+        lines.append(f"💰 یا با /vasighe و پرداخت {int(bail_amount)} سانت وثیقه، همین الان آزاد شو.")
+    if labor_until and labor_until > prison_until:
+        lines.append(
+            f"(بعد از آزادی هم تا {_fmt_days_hours(labor_until - now)} دیگه "
+            f"{int(HEIST_LABOR_TRIBUTE_RATIO*100)}٪ از رشد روزانه‌ت می‌ره تو جیب پادشاه)"
+        )
+    return "\n".join(lines)
+
+
+async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/sarghat` - crack the group vault by actually playing a vault-cracking memory
+    game (memorize a shuffled symbol order, then tap it back before the clock runs out).
+    Hits the treasury AND everyone's deposits on a win, which is what stops the bank
+    being a risk-free hiding place; a loss lands the thief in heist prison and then
+    working off a debt to the king. One attempt per group per cooldown, not per player."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
@@ -3041,6 +3131,25 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.track_chat(chat_id)
     thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    prison_until, labor_until, bail_amount = db.get_heist_status(user.id, chat_id)
+    if prison_until and prison_until > now:
+        await update.message.reply_text(_heist_prison_reply(prison_until, labor_until, bail_amount, now))
+        return
+    if labor_until and labor_until > now:
+        await update.message.reply_text(
+            f"🔨 هنوز داری بدهیت به پادشاه رو کار می‌کنی (تا {_fmt_days_hours(labor_until - now)} دیگه) "
+            f"— تا اون‌موقع نمی‌تونی دوباره سرقت کنی."
+        )
+        return
+
+    # The king cannot rob his own kingdom's bank.
+    kingdom, _ = refresh_king(chat_id)
+    if kingdom and kingdom[0] == user.id:
+        await update.message.reply_text("👑 پادشاه که خودش صاحب کل مملکته، نمی‌تونه از بانک خودش بدزده!")
+        return
+
     # Same gate as /dozdi: you have to actually be playing today to move other people's size.
     if thief_last_grown != tehran_today_str():
         await update.message.reply_text("اول امروز /d بزن بعد برو سراغ بانک! 🥷")
@@ -3066,57 +3175,224 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Robbing a fat vault is harder - the more there is to protect, the better guarded
-    # it is. Luck dials and the lucky perk apply, same as ordinary theft.
-    chance = HEIST_BASE_CHANCE
-    if thief_perk == "کص‌شانس":
-        chance += THEFT_LUCKY_PERK_BONUS
-    theft_luck, _ = db.get_modifiers(user.id, chat_id)
-    if theft_luck != 1.0:
-        chance *= theft_luck
-    chance = min(max(chance, 0.05), 0.70)
-
     would_be = vault * (HEIST_TREASURY_RATIO if treasury else HEIST_DEPOSIT_RATIO)
 
-    if random.random() < chance:
+    order = list(range(len(HEIST_SYMBOLS)))
+    random.shuffle(order)
+    sequence_str = ",".join(str(i) for i in order)
+    attempt_id = str(uuid4())
+    expires_at = now + datetime.timedelta(seconds=HEIST_TOTAL_SECONDS)
+
+    reveal_text = (
+        f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
+        f"این ترتیب رو حفظ کن، چون الان دکمه‌ها قاطی می‌شن:\n\n"
+        f"{'  '.join(HEIST_SYMBOLS[i] for i in order)}\n\n"
+        f"⏳ {HEIST_REVEAL_SECONDS} ثانیه وقت داری."
+    )
+    sent = await update.message.reply_text(reveal_text, parse_mode="HTML")
+
+    db.create_heist_attempt(attempt_id, chat_id, user.id, user.first_name, sequence_str,
+                            would_be, chat_id, sent.message_id, expires_at)
+
+    context.job_queue.run_once(
+        heist_reveal_flip_job, when=HEIST_REVEAL_SECONDS,
+        data={"attempt_id": attempt_id}, name=f"heist_flip_{attempt_id}"
+    )
+    context.job_queue.run_once(
+        heist_timeout_job, when=HEIST_TOTAL_SECONDS,
+        data={"attempt_id": attempt_id}, name=f"heist_timeout_{attempt_id}"
+    )
+
+
+async def heist_reveal_flip_job(context: ContextTypes.DEFAULT_TYPE):
+    """Flips the memorize-phase message into the shuffled, tappable keypad. Button
+    positions are re-shuffled independently of the memorize order, so remembering the
+    symbols isn't enough - the player also has to find them."""
+    attempt_id = context.job.data["attempt_id"]
+    row = db.get_heist_attempt(attempt_id)
+    if not row:
+        return
+    (chat_id, thief_id, thief_name, sequence, progress, would_be,
+     message_chat_id, message_id, status, expires_at) = row
+    if status != 'pending':
+        return
+
+    display_order = list(range(len(HEIST_SYMBOLS)))
+    random.shuffle(display_order)
+    buttons = [
+        InlineKeyboardButton(HEIST_SYMBOLS[i], callback_data=f"heisttap_{attempt_id}_{i}")
+        for i in display_order
+    ]
+    keyboard = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+
+    remaining = max(0, int((expires_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
+    try:
+        await context.bot.edit_message_text(
+            chat_id=message_chat_id, message_id=message_id,
+            text=(f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
+                  f"همون ترتیبی که حفظ کردی رو بزن! هر اشتباه = باخت.\n"
+                  f"⏳ {remaining} ثانیه فرصت داری."),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logging.error(f"Failed to flip heist keypad for {attempt_id}: {e}")
+
+
+async def heist_tap_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data.split('_')
+    if len(data) != 3 or data[0] != 'heisttap':
+        return
+    attempt_id, tapped_index = data[1], int(data[2])
+
+    row = db.get_heist_attempt(attempt_id)
+    if not row:
+        await query.answer("این بازی دیگه معتبر نیست!", show_alert=True)
+        return
+    (chat_id, thief_id, thief_name, sequence, progress, would_be,
+     message_chat_id, message_id, status, expires_at) = row
+    if query.from_user.id != thief_id:
+        await query.answer("این بازی مال تو نیست!", show_alert=True)
+        return
+    if status != 'pending':
+        await query.answer("این بازی قبلاً تموم شده!", show_alert=True)
+        return
+
+    result = db.advance_heist_attempt(attempt_id, tapped_index)
+    if result is None:
+        await query.answer("این بازی دیگه معتبر نیست!", show_alert=True)
+        return
+    if result == 'wrong':
+        await query.answer("❌ اشتباه زدی!")
+        await resolve_heist_attempt(context, attempt_id, outcome='lost')
+        return
+    if result == 'done':
+        await query.answer("🎉 گاوصندوق باز شد!")
+        await resolve_heist_attempt(context, attempt_id, outcome='won')
+        return
+
+    # 'correct' but the sequence isn't finished - remove just the tapped button and
+    # keep everything else exactly where it was, no reshuffling mid-game.
+    total = len(sequence.split(','))
+    new_progress = progress + 1
+    old_markup = query.message.reply_markup
+    new_rows = [
+        [b for b in r if b.callback_data != query.data]
+        for r in (old_markup.inline_keyboard if old_markup else [])
+    ]
+    new_rows = [r for r in new_rows if r]
+    remaining = max(0, int((expires_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
+    await query.answer(f"✅ درسته! ({new_progress}/{total})")
+    try:
+        await query.edit_message_text(
+            text=(f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
+                  f"✅ {new_progress}/{total} درسته! ادامه بده...\n"
+                  f"⏳ {remaining} ثانیه مونده."),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(new_rows)
+        )
+    except Exception:
+        pass
+
+
+async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id, outcome=None):
+    """Single settlement point for a heist attempt - called by the winning/losing tap,
+    the scheduled timeout job, and the startup recovery sweep, mirroring the role
+    resolve_pvp_match plays for challenges.
+
+    `outcome` is 'won'/'lost' when called right after a tap already decided it (the DB
+    row is already updated by advance_heist_attempt in that case). It's None for the
+    timeout path, which has to claim the row itself first - db.claim_expired_heist_attempt
+    is what stops the timeout job and a last-second tap from ever both settling the same
+    attempt."""
+    if outcome is None:
+        if not db.claim_expired_heist_attempt(attempt_id):
+            return  # a tap already resolved this one
+        outcome = 'lost'
+
+    row = db.get_heist_attempt(attempt_id)
+    if not row:
+        return
+    (chat_id, thief_id, thief_name, sequence, progress, would_be,
+     message_chat_id, message_id, status, expires_at) = row
+
+    if outcome == 'won':
         total, treasury_part, victims = db.heist_take(
-            chat_id, user.id, HEIST_TREASURY_RATIO, HEIST_DEPOSIT_RATIO
+            chat_id, thief_id, HEIST_TREASURY_RATIO, HEIST_DEPOSIT_RATIO
         )
         if total <= 0:
-            await update.message.reply_text("🏦 صندوق خالی بود! دست خالی برگشتی.")
-            return
-        lines = [
-            f"🚨💰 <b>سرقت از بانک!</b>\n",
-            f"{_esc(user.first_name)} زد به صندوق گروه و <b>{int(total)} سانت</b> بالا کشید!\n",
-            f"🏛 از خزانه: {int(treasury_part)} سانت",
-        ]
-        if victims:
-            lines.append(f"🧾 از سپردهٔ {len(victims)} نفر:")
-            for _uid, name, amount in victims[:8]:
-                lines.append(f"   • {_esc(name)}: −{int(amount)} سانت")
-            if len(victims) > 8:
-                lines.append(f"   • و {len(victims) - 8} نفر دیگه")
-        lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 3600} ساعت دیگه بانک آماده‌باشه‌ست)")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-        await announce_achievements(context, chat_id, user.first_name,
-                                    award(user.id, chat_id, 'thief'))
-    else:
-        # Caught. The fine is a transfer into the treasury, not a deletion, so a failed
-        # heist actually makes the next payday slightly better for the depositors.
-        fine = max(1, int(would_be * HEIST_FINE_RATIO))
-        if db.try_deduct_size(user.id, chat_id, fine):
-            db.treasury_add(chat_id, fine, note="جریمهٔ سرقت ناموفق")
-            await update.message.reply_text(
-                f"🚔 <b>دزدگیر بانک زد!</b>\n\n"
-                f"{_esc(user.first_name)} سر بزنگاه گیر افتاد و <b>{int(fine)} سانت</b> جریمه شد.\n"
-                f"جریمه رفت تو خزانه — یعنی سود سپرده‌گذارها بیشتر شد. 😎",
-                parse_mode="HTML"
-            )
+            text = "🏦 گاوصندوق رو باز کردی ولی خالی بود! دست خالی برگشتی."
         else:
-            await update.message.reply_text(
-                f"🚔 دزدگیر بانک زد و {_esc(user.first_name)} گیر افتاد!\n"
-                f"(اون‌قدر فقیر بود که حتی جریمه هم نتونست بده 💀)"
-            )
+            lines = [
+                f"🚨💰 سرقت از بانک!\n",
+                f"{thief_name} گاوصندوق رو باز کرد و {int(total)} سانت بالا کشید!\n",
+                f"🏛 از خزانه: {int(treasury_part)} سانت",
+            ]
+            if victims:
+                lines.append(f"🧾 از سپردهٔ {len(victims)} نفر:")
+                for _uid, name, amount in victims[:8]:
+                    lines.append(f"   • {name}: −{int(amount)} سانت")
+                if len(victims) > 8:
+                    lines.append(f"   • و {len(victims) - 8} نفر دیگه")
+            lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 3600} ساعت دیگه بانک آماده‌باشه‌ست)")
+            text = "\n".join(lines)
+        # deliver_pvp_message sends plain text (no parse_mode), so the message is built
+        # without HTML tags and without _esc() - there's nothing to escape for.
+        await deliver_pvp_message(context, message_chat_id, message_id, text)
+        if total > 0:
+            await announce_achievements(context, chat_id, thief_name,
+                                        award(thief_id, chat_id, 'thief'))
+        return
+
+    # Lost - either a wrong tap or the clock ran out. Prison first, then labor; bail only
+    # ever buys out the prison half.
+    labor_days = _heist_labor_days(would_be)
+    bail_amount = priced(would_be * HEIST_BAIL_RATIO, chat_id)
+    prison_until, labor_until = db.send_to_heist_prison(
+        thief_id, chat_id, HEIST_PRISON_DAYS, labor_days, bail_amount
+    )
+    text = (
+        f"🚔 دزدگیر بانک زد!\n\n"
+        f"{thief_name} گیر افتاد و {HEIST_PRISON_DAYS} روز میره زندان بانک "
+        f"(بعدش هم تا {int(labor_days)} روز دیگه برای پادشاه کار می‌کنه).\n\n"
+        f"💰 وثیقه برای آزادی زودتر: {int(bail_amount)} سانت (/vasighe)"
+    )
+    await deliver_pvp_message(context, message_chat_id, message_id, text)
+
+
+async def heist_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    await resolve_heist_attempt(context, context.job.data["attempt_id"], outcome=None)
+
+
+async def recover_stuck_heist_attempts(context: ContextTypes.DEFAULT_TYPE):
+    """Runs once shortly after startup: settles any heist attempt whose window had
+    already closed before the process died mid-game, so a restart can never leave the
+    keypad stuck forever with the group's one heist slot on cooldown."""
+    for attempt_id in db.get_expired_heist_attempt_ids():
+        try:
+            await resolve_heist_attempt(context, attempt_id, outcome=None)
+        except Exception as e:
+            logging.error(f"Failed to recover stuck heist attempt {attempt_id}: {e}")
+
+
+async def heist_bail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/vasighe` - pay to leave heist prison early. Only ends the prison half; the
+    labor-for-king debt (if any remains) still has to be served."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    ok, result = db.pay_heist_bail(user.id, chat_id)
+    if not ok:
+        if result == 'funds':
+            await update.message.reply_text("این‌قدر سانت برای وثیقه نداری!")
+        else:
+            await update.message.reply_text("تو الان تو زندان بانک نیستی!")
+        return
+    await update.message.reply_text(
+        f"🔓 وثیقهٔ {int(result)} سانتی پرداخت شد و از زندان بانک آزاد شدی!\n"
+        f"(اگه بدهی کار برای پادشاه هنوز مونده باشه، اون هنوز سرجاشه)"
+    )
 
 
 async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
@@ -4768,6 +5044,7 @@ if __name__ == '__main__':
     app.job_queue.run_once(recover_expired_consensus, when=7)
     app.job_queue.run_once(recover_pending_lotteries, when=9)
     app.job_queue.run_once(recover_decree_offer, when=12)
+    app.job_queue.run_once(recover_stuck_heist_attempts, when=14)
 
     app.add_error_handler(on_error)
 
@@ -4796,6 +5073,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(variz|deposit)\b'), deposit_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(bardasht|withdraw)\b'), withdraw_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(sarghat|heist)\b'), heist_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(vasighe|bail)\b'), heist_bail_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(nozul|nozool)\b'), nozul_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(vam|loan)\b'), vam_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(bedehi|debts)\b'), debts_cmd))
@@ -4822,6 +5100,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(use_item_callback, pattern=r'^useitem_'))
     app.add_handler(CallbackQueryHandler(consensus_vote_callback, pattern=r'^ejmavote_'))
     app.add_handler(CallbackQueryHandler(place_bet_callback, pattern=r'^bet_'))
+    app.add_handler(CallbackQueryHandler(heist_tap_callback, pattern=r'^heisttap_'))
     app.add_handler(CallbackQueryHandler(use_direct_item_inline_callback, pattern=r'^udi_'))
     app.add_handler(CallbackQueryHandler(show_top_callback, pattern=r'^showtop_'))
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))

@@ -453,6 +453,38 @@ def init_db():
         # re-crowned cannot refresh it.
         c.execute("ALTER TABLE economy ADD COLUMN IF NOT EXISTS last_martial_at TIMESTAMPTZ")
 
+        # A busted heist sentences the thief: heist_prison_until is the hard lockout
+        # (can't grow, challenge, steal, or heist again), heist_labor_until runs longer
+        # and just skims a cut of daily growth to the king (see grow_callback). The bail
+        # price is frozen at sentencing time (priced off the vault they were going for),
+        # so it can't drift with inflation while they're stuck inside.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS heist_prison_until TIMESTAMPTZ")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS heist_labor_until TIMESTAMPTZ")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS heist_bail_amount DOUBLE PRECISION")
+
+        # A single in-progress vault-cracking attempt. Persisted (not held in memory) so
+        # a restart mid-game gets picked up by recover_stuck_heist_attempts instead of
+        # leaving the message stuck forever with the group's one heist slot on cooldown -
+        # the exact bug class pvp_matches was built to avoid.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS heist_attempts (
+                id UUID PRIMARY KEY,
+                chat_id BIGINT,
+                thief_id BIGINT,
+                thief_name TEXT,
+                sequence TEXT,
+                progress INTEGER DEFAULT 0,
+                would_be DOUBLE PRECISION,
+                message_chat_id BIGINT,
+                message_id BIGINT,
+                status TEXT DEFAULT 'pending',
+                expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+        c.execute("CREATE INDEX IF NOT EXISTS heist_attempts_pending_idx "
+                  "ON heist_attempts (status, expires_at)")
+
         # One-time: charge the deposit fee on money that was banked before the fee
         # existed. Everyone who deposited in that window got in free, which is both
         # unfair to whoever deposits next and the reason the treasury is empty while
@@ -2162,6 +2194,166 @@ def heist_take(chat_id, thief_id, treasury_ratio, deposit_ratio):
                       'VALUES (%s, %s, %s, %s, %s, %s)',
                       (chat_id, thief_id, total, wrow[0], 'bank_heist', 'سرقت از بانک'))
         return (total, treasury_part, victims)
+
+
+# ---------------------------------------------------------------- heist mini-game
+# /sarghat used to be a single hidden dice roll. It's now a real vault-cracking game
+# (memorize a sequence, then tap it back under a shared deadline) settled from a
+# persisted attempt row rather than in-process state, so the same restart-survives-a-
+# window lesson from pvp_matches applies here too.
+
+def create_heist_attempt(attempt_id, chat_id, thief_id, thief_name, sequence, would_be,
+                          message_chat_id, message_id, expires_at):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO heist_attempts (id, chat_id, thief_id, thief_name, sequence, '
+            'would_be, message_chat_id, message_id, expires_at) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)',
+            (attempt_id, chat_id, thief_id, thief_name, sequence, would_be,
+             message_chat_id, message_id, expires_at)
+        )
+
+
+def get_heist_attempt(attempt_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT chat_id, thief_id, thief_name, sequence, progress, would_be, '
+            'message_chat_id, message_id, status, expires_at '
+            'FROM heist_attempts WHERE id = %s', (attempt_id,)
+        )
+        return c.fetchone()
+
+
+def advance_heist_attempt(attempt_id, tapped_index):
+    """Checks one tap against the next expected symbol, atomically. Returns 'correct'
+    (more remain), 'done' (full sequence completed - the vault opens), 'wrong' (busted -
+    already flipped to 'lost' by this call), or None if the attempt is gone or was
+    already resolved (e.g. it timed out a moment before this tap landed)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT sequence, progress FROM heist_attempts "
+            "WHERE id = %s AND status = 'pending' FOR UPDATE", (attempt_id,)
+        )
+        row = c.fetchone()
+        if row is None:
+            return None
+        sequence = [int(x) for x in row[0].split(',')]
+        progress = row[1]
+        if tapped_index != sequence[progress]:
+            c.execute("UPDATE heist_attempts SET status = 'lost' WHERE id = %s", (attempt_id,))
+            return 'wrong'
+        progress += 1
+        if progress >= len(sequence):
+            c.execute("UPDATE heist_attempts SET status = 'won', progress = %s WHERE id = %s",
+                      (progress, attempt_id))
+            return 'done'
+        c.execute("UPDATE heist_attempts SET progress = %s WHERE id = %s", (progress, attempt_id))
+        return 'correct'
+
+
+def claim_expired_heist_attempt(attempt_id):
+    """Atomically flips a still-pending, timed-out attempt to 'lost'. The WHERE clause is
+    what stops the scheduled timeout job and the startup recovery sweep (or a last-second
+    tap landing at the same instant) from ever settling the same attempt twice."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE heist_attempts SET status = 'lost' WHERE id = %s AND status = 'pending' "
+            'RETURNING id', (attempt_id,)
+        )
+        return c.fetchone() is not None
+
+
+def get_expired_heist_attempt_ids():
+    """Still-'pending' attempts whose deadline has already passed - the startup recovery
+    sweep's input, same role get_stale_pending_pvp_matches plays for challenges."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM heist_attempts WHERE status = 'pending' AND expires_at <= now()")
+        return [r[0] for r in c.fetchall()]
+
+
+# ---------------------------------------------------------------- heist prison & labor
+# A busted heist doesn't just cost a fine anymore: heist_prison_until locks the thief out
+# of growing, challenging, stealing, and heisting again; heist_labor_until runs longer
+# and, once prison ends, just skims a cut of their daily growth to the king. Bail only
+# ever buys out the prison half - the labor debt still has to be served.
+
+def is_in_heist_prison(user_id, chat_id):
+    """Cheap boolean check for the grow/challenge/theft gates - same shape as is_jester."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM users WHERE user_id = %s AND chat_id = %s '
+                  'AND heist_prison_until > now()', (user_id, chat_id))
+        return c.fetchone() is not None
+
+
+def get_heist_status(user_id, chat_id):
+    """(prison_until, labor_until, bail_amount) - None for any field that was never set
+    or has already lapsed doesn't matter here, the caller compares against now() itself."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT heist_prison_until, heist_labor_until, heist_bail_amount '
+            'FROM users WHERE user_id = %s AND chat_id = %s', (user_id, chat_id)
+        )
+        return c.fetchone() or (None, None, None)
+
+
+def send_to_heist_prison(user_id, chat_id, prison_days, labor_days, bail_amount):
+    """Sentences a busted thief: prison_days locked out entirely, then labor_days more
+    of paying tribute to the king. Returns (prison_until, labor_until)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE users SET heist_prison_until = NOW() + make_interval(days => %s), "
+            "heist_labor_until = NOW() + make_interval(days => %s), "
+            'heist_bail_amount = %s '
+            'WHERE user_id = %s AND chat_id = %s '
+            'RETURNING heist_prison_until, heist_labor_until',
+            (prison_days, prison_days + labor_days, bail_amount, user_id, chat_id)
+        )
+        return c.fetchone()
+
+
+def pay_heist_bail(user_id, chat_id):
+    """One transaction: checks the bail is still owed and affordable, deducts it, and
+    frees the player from heist prison - so a crash mid-operation can never take the
+    money without releasing them, or release them without taking it. The labor-for-king
+    period (if any remains) is untouched; bail buys freedom of movement, not freedom
+    from the debt. Bail is a fee like any other, so it lands in the treasury rather than
+    being destroyed. Returns (True, bail_amount) or (False, reason)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT COALESCE(size,0), heist_bail_amount FROM users "
+            "WHERE user_id = %s AND chat_id = %s AND heist_prison_until > now() FOR UPDATE",
+            (user_id, chat_id)
+        )
+        row = c.fetchone()
+        if row is None or row[1] is None:
+            return (False, 'not_in_prison')
+        size, bail = float(row[0]), float(row[1])
+        if size < bail:
+            return (False, 'funds')
+        c.execute(
+            'UPDATE users SET size = size - %s, heist_prison_until = NULL '
+            'WHERE user_id = %s AND chat_id = %s RETURNING size',
+            (bail, user_id, chat_id)
+        )
+        new_size = float(c.fetchone()[0])
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s, %s, %s, %s, %s, %s)',
+                  (chat_id, user_id, -bail, new_size, 'heist_bail', 'وثیقهٔ سرقت بانک'))
+        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET '
+                  'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                  (chat_id, bail, bail))
+        _bank_log(c, chat_id, user_id, 'treasury_in', bail, c.fetchone()[0], 'وثیقهٔ سرقت بانک')
+        return (True, bail)
 
 
 def get_bank_log(chat_id, limit=20):

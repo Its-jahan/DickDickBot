@@ -145,6 +145,58 @@ The per-day deposit cap counts **gross** deposits (`deposited_today`), so
 deposit → withdraw → deposit cannot refill the allowance. This is what keeps size in
 circulation and keeps `/dozdi` worth typing.
 
+## The heist is a real game, not a hidden dice roll, and losing has consequences
+
+`/sarghat` used to be a single `random.random() < chance` check. It's now a genuine
+vault-cracking mini-game: `heist_cmd` shows the thief a shuffled order of all six
+`HEIST_SYMBOLS`, then `heist_reveal_flip_job` (fired `HEIST_REVEAL_SECONDS` later)
+re-shuffles the same symbols onto buttons and the thief has to tap them back in the
+memorized order before `HEIST_TOTAL_SECONDS` runs out. One wrong tap is an instant loss
+(`advance_heist_attempt` flips the row to `'lost'` right there) — there is no partial
+credit for getting most of the way through. `heist_take` itself (treasury + a slice of
+every depositor) is unchanged and still only runs on a win.
+
+### It's a persisted attempt, not in-memory state — same lesson as `pvp_matches`
+
+`heist_attempts` holds the in-progress game (the memorized `sequence`, `progress`,
+`expires_at`). `resolve_heist_attempt` is the single settlement function, called from
+three places: a winning/losing tap, the scheduled `heist_timeout_job`, and the startup
+sweep `recover_stuck_heist_attempts` (a `run_once(..., when=14)`, alongside the other
+recovery jobs). `db.claim_expired_heist_attempt` atomically flips `pending -> lost` only
+when nothing has already resolved it, which is what stops the timeout job and a
+last-instant winning tap from ever settling the same attempt twice — copy the
+`pvp_matches` pattern here, don't reinvent it, if this ever needs another mini-game.
+
+### Losing sentences the thief; winning doesn't touch prison at all
+
+A bust used to just cost a fine. Now `db.send_to_heist_prison` sets two separate
+timestamps: `heist_prison_until` (a hard `HEIST_PRISON_DAYS`-day lockout — `db.is_in_heist_prison`
+gates `/d`, `/c` on both the challenger and acceptor side, `/dozdi`, and `/sarghat`
+itself) and `heist_labor_until`, which runs `HEIST_PRISON_DAYS` + a scaled
+`_heist_labor_days(would_be)` (bigger attempted heist → longer labor, capped at
+`HEIST_LABOR_MAX_DAYS`) past prison. Once prison ends but labor hasn't, the player can
+act normally except that `grow_callback` skims `HEIST_LABOR_TRIBUTE_RATIO` of any
+*positive* growth roll to the current king — the exact same shape as the jester tribute,
+deliberately: two unrelated punishments that both dock a cut of growth to whoever holds
+the crown, so a future one should follow the same pattern rather than inventing a third
+mechanism. Neither tribute is excluded from the nightly handicap's ledger read, matching
+existing precedent for the jester.
+
+**The king can never be the thief.** `heist_cmd` checks `refresh_king(chat_id)[0] ==
+user.id` before anything else moves — a king who could rob his own treasury and then
+tax the resulting jester/laborer pool would be self-dealing in a way nothing else in the
+game allows.
+
+### Bail buys out prison, never the labor debt
+
+`heist_bail_amount` is frozen once, at sentencing (`priced(would_be * HEIST_BAIL_RATIO,
+chat_id)`), so it can't drift with inflation while the thief is stuck inside. `/vasighe`
+→ `db.pay_heist_bail` is one transaction: check the bail is still owed and affordable,
+deduct it, clear `heist_prison_until`, credit the treasury (bail is a fee like any
+other, never destroyed). It deliberately does **not** touch `heist_labor_until` — paying
+your way out buys freedom of movement, not freedom from the king's cut, which is what
+stops bail from being a strictly-dominant way to skip the whole punishment.
+
 ## Loans split principal from interest in the ledger
 
 `loans` covers both lenders: `lender_id IS NULL` is the treasury-funded `/vam`, anything
