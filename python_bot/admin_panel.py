@@ -121,17 +121,20 @@ def validate(kind, raw):
     what stops the panel putting the DB into states the game can't handle - notably
     NaN, which used to poison a balance permanently and break the leaderboard."""
     raw = (raw or "").strip()
-    if kind in ("number", "int", "mult"):
+    if kind in ("number", "int", "mult", "credit"):
         try:
             value = float(raw)
         except ValueError:
             raise ValueError("باید یک عدد باشد")
         if not math.isfinite(value):
             raise ValueError("عدد نامعتبر (nan/inf)")
-        if kind == "int":
+        if kind in ("int", "credit"):
             if value != int(value):
                 raise ValueError("باید عدد صحیح باشد")
-            return int(value)
+            value = int(value)
+            if kind == "credit" and not (db.CREDIT_MIN <= value <= db.CREDIT_MAX):
+                raise ValueError(f"باید بین {db.CREDIT_MIN} تا {db.CREDIT_MAX} باشد")
+            return value
         if kind == "mult":
             if not (0.0 <= value <= 5.0):
                 raise ValueError("ضریب باید بین ۰ و ۵ باشد")
@@ -379,6 +382,11 @@ def group(chat_id):
             "is_consort": bool(kingdom and kingdom[2] == uid),
         })
     lot_tickets, lot_prize, lot_entries = lottery.pending_pot(chat_id, _today())
+    loans = [{
+        "id": r[0], "lender_id": r[1], "lender_name": r[2], "borrower_id": r[3],
+        "borrower_name": r[4], "principal": r[5], "rate": r[6], "due_amount": r[7],
+        "accepted_at": r[8], "due_at": r[9],
+    } for r in db.admin_list_active_loans(chat_id)]
     return page(f"گروه {chat_id}", """
 <h1>گروه {{ chat_id }}</h1>
 <div class="card"><div class="tablewrap"><table>
@@ -400,6 +408,41 @@ def group(chat_id):
 </tr>
 {% endfor %}
 </table></div></div>
+
+<h2>💸 بدهی‌های فعال (وام و نزول)</h2>
+<div class="card">
+{% if loans %}
+<div class="tablewrap"><table>
+<tr><th>بدهکار</th><th>طلبکار</th><th>اصل مبلغ</th><th>مبلغ بدهی</th><th>سررسید</th>
+    <th>تغییر مبلغ</th><th></th></tr>
+{% for l in loans %}
+<tr>
+  <td>{{ l.borrower_name }}<div class="dim" style="font-size:12px">{{ l.borrower_id }}</div></td>
+  <td>{{ l.lender_name or '🏛 بانک' }}</td>
+  <td class="dim">{{ l.principal|int }}</td>
+  <td><b>{{ l.due_amount|int }}</b></td>
+  <td class="dim">{{ tehran(l.due_at, '%Y-%m-%d %H:%M') if l.due_at else '-' }}</td>
+  <td>
+    <form class="inline" method="post"
+          action="{{ url_for('adjust_loan', chat_id=chat_id, loan_id=l.id) }}">
+      <input name="due_amount" value="{{ l.due_amount|int }}" style="width:90px">
+      <button class="ghost">ذخیره</button>
+    </form>
+  </td>
+  <td>
+    <form class="inline" method="post"
+          action="{{ url_for('forgive_loan', chat_id=chat_id, loan_id=l.id) }}"
+          onsubmit="return confirm('این بدهی کاملاً و بدون اطلاع به کسی بخشیده شود؟')">
+      <button class="danger">بخشش</button>
+    </form>
+  </td>
+</tr>
+{% endfor %}
+</table></div>
+<div class="dim" style="margin-top:10px">
+  هر دو عمل کاملاً بی‌صدا هستند — نه در گروه اعلام می‌شود، نه به بدهکار یا طلبکار پیامی می‌رود.</div>
+{% else %}<span class="dim">هیچ بدهی فعالی در این گروه نیست.</span>{% endif %}
+</div>
 
 <h2>🎟️ لاتاری امروز</h2>
 <div class="card">
@@ -444,7 +487,7 @@ def group(chat_id):
 
 <p><a class="link" href="{{ url_for('ledger', chat_id=chat_id) }}">📜 لاگ تراکنش این گروه</a></p>
 """, chat_id=chat_id, players=players, protections=db.get_consensus_protections(chat_id),
-        lot_tickets=lot_tickets, lot_prize=lot_prize, lot_entries=lot_entries)
+        lot_tickets=lot_tickets, lot_prize=lot_prize, lot_entries=lot_entries, loans=loans)
 
 
 @app.route("/group/<int(signed=True):chat_id>/player/<int:user_id>")
@@ -529,6 +572,7 @@ def player(chat_id, user_id):
             'wins': detail[9], 'losses': detail[10], 'perk': detail[6] or 'عادی',
             'active_item': detail[7] or '', 'theft_luck': detail[16],
             'growth_mult': detail[17], 'last_grown': detail[5] or '',
+            'credit_score': detail[18],
         })
 
 
@@ -607,6 +651,40 @@ def save_items(chat_id, user_id):
 def clear_protection(chat_id, user_id):
     flash("سپر اجماع لغو شد." if db.clear_consensus_protection(chat_id, user_id)
           else "سپری برای این بازیکن نبود.")
+    return redirect(url_for("group", chat_id=chat_id))
+
+
+@app.route("/group/<int(signed=True):chat_id>/loan/<int:loan_id>/forgive", methods=["POST"])
+@login_required
+def forgive_loan(chat_id, loan_id):
+    """Closes a loan with no collection, no payout, and no credit_score change - and
+    deliberately never touches Telegram, since this is meant to stay invisible to the
+    borrower, the lender, and the group."""
+    if db.admin_forgive_loan(loan_id):
+        flash("بدهی بدون اطلاع به کسی بخشیده شد.")
+    else:
+        flash("این وام فعال نیست یا پیدا نشد.", "error")
+    return redirect(url_for("group", chat_id=chat_id))
+
+
+@app.route("/group/<int(signed=True):chat_id>/loan/<int:loan_id>/adjust", methods=["POST"])
+@login_required
+def adjust_loan(chat_id, loan_id):
+    """Silently overrides how much an active loan owes - no message to Telegram, same as
+    forgive_loan. The loan still settles normally later, so the borrower/lender still see
+    the usual repayment when it happens; only the amount differs from what was agreed."""
+    try:
+        new_amount = validate('number', request.form.get("due_amount"))
+    except ValueError as e:
+        flash(f"مقدار نامعتبر: {e}", "error")
+        return redirect(url_for("group", chat_id=chat_id))
+    if new_amount < 0:
+        flash("مبلغ بدهی نمی‌تواند منفی باشد.", "error")
+        return redirect(url_for("group", chat_id=chat_id))
+    if db.admin_set_loan_due_amount(loan_id, new_amount):
+        flash(f"مبلغ بدهی به {int(new_amount)} تغییر کرد.")
+    else:
+        flash("این وام فعال نیست یا پیدا نشد.", "error")
     return redirect(url_for("group", chat_id=chat_id))
 
 

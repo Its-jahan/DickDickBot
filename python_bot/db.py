@@ -1749,6 +1749,7 @@ EDITABLE_USER_FIELDS = {
     'theft_luck':  ('mult',   'ضریب دزدی'),
     'growth_mult': ('mult',   'ضریب رشد'),
     'last_grown':  ('text',   'آخرین رشد (YYYY-MM-DD)'),
+    'credit_score': ('credit', 'امتیاز اعتباری'),
 }
 
 
@@ -1799,7 +1800,8 @@ def get_player_detail(user_id, chat_id):
         c.execute(
             'SELECT user_id, chat_id, username, first_name, size, last_grown, perk, active_item, '
             'joined_at, wins, losses, COALESCE(streak,0), COALESCE(best_streak,0), last_theft_at, '
-            'traitor_until, last_dosed_at, COALESCE(theft_luck,1.0), COALESCE(growth_mult,1.0) '
+            'traitor_until, last_dosed_at, COALESCE(theft_luck,1.0), COALESCE(growth_mult,1.0), '
+            'COALESCE(credit_score,100) '
             'FROM users WHERE user_id = %s AND chat_id = %s',
             (user_id, chat_id)
         )
@@ -2502,6 +2504,55 @@ def get_loan_defaults(chat_id, user_id):
                   (user_id, chat_id))
         row = c.fetchone()
         return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------- admin debt management
+# The panel's own quiet override of the loan book, on top of the normal
+# accept_loan/settle_loan flow above. Both functions here touch nothing but the `loans`
+# row itself - no size moves, no credit_score change, no Telegram message from db.py or
+# admin_panel.py - because this is meant to be invisible to every player involved.
+
+def admin_list_active_loans(chat_id):
+    """Every currently-outstanding loan in a group, for the admin panel's debt view.
+    Soonest due first, same ordering as the collection sweep would process them in."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT id, lender_id, lender_name, borrower_id, borrower_name, '
+            'principal, rate, due_amount, accepted_at, due_at '
+            "FROM loans WHERE chat_id = %s AND status = 'active' ORDER BY due_at",
+            (chat_id,)
+        )
+        return c.fetchall()
+
+
+def admin_forgive_loan(loan_id):
+    """Silently closes an active loan: no collection from the borrower, no payout to the
+    lender (or treasury), no credit_score change. Marked 'forgiven' rather than
+    'repaid'/'defaulted' so it stays distinguishable in the raw loan history, and that
+    status change alone is what makes it vanish from every place that only reads
+    'active' loans - get_overdue_loans (the collection sweep), get_user_loans (/bedehi),
+    and count_active_loans (the per-player loan cap) - the instant this runs."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE loans SET status = 'forgiven', closed_at = NOW(), paid = 0 "
+                  "WHERE id = %s AND status = 'active' RETURNING id", (loan_id,))
+        return c.fetchone() is not None
+
+
+def admin_set_loan_due_amount(loan_id, new_due_amount):
+    """Overrides what an active loan will collect whenever it does eventually settle -
+    on time, late, or force-collected - without moving any size right now. Settlement
+    still runs through the normal settle_loan path later (so it still charges interest
+    as due_amount minus principal, still pays the lender, and still scores the borrower's
+    credit as usual) - only the amount owed is different from what was originally
+    agreed. Dropping it below principal is allowed and works out as a partial forgiveness
+    that the lender also absorbs a share of, same as the game's other zero-sum rules."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE loans SET due_amount = %s WHERE id = %s AND status = 'active' "
+                  'RETURNING id', (new_due_amount, loan_id))
+        return c.fetchone() is not None
 
 
 # ---------------------------------------------------------------- cross-group transfer

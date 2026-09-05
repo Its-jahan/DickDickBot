@@ -363,6 +363,35 @@ still hurt.
   a balance permanently). Size edits route through `db.admin_adjust_size` so they land
   in the ledger like gameplay does.
 
+### Debt management is the one corner of the panel that must stay silent
+
+The group page lists every active loan (`db.admin_list_active_loans`) with two actions:
+`forgive_loan` and `adjust_loan`. Both are deliberately built to never touch Telegram —
+no group announcement, no DM to the borrower or lender, nothing in `size_log` beyond
+the loan row's own state. That silence is the whole point of the feature, not an
+oversight: it exists for the owner to fix a dispute or a mistake without it looking like
+gameplay to anyone involved.
+
+`db.admin_forgive_loan` closes an active loan as `'forgiven'` — a status distinct from
+`'repaid'`/`'defaulted'` — without collecting anything from the borrower, paying the
+lender or treasury, or touching `credit_score`. That one status flip is also what makes
+it invisible everywhere else: `get_overdue_loans` (the collection sweep), `get_user_loans`
+(`/بدهی`), and `count_active_loans` (the per-player loan cap) all filter on
+`status = 'active'`, so a forgiven loan silently stops existing for every one of them.
+
+`db.admin_set_loan_due_amount` only overrides the number a loan will collect *later* —
+it doesn't move size now, and it doesn't bypass `settle_loan`. When the loan does
+eventually settle (on time, late, or forced), the normal flow still runs in full:
+interest is still `due_amount - principal`, the lender/treasury still gets paid, and
+`credit_score` still moves as usual — only the amount differs from what was originally
+agreed. So raising or lowering a debt from the panel is silent at the moment you do it,
+but not retroactively silent about the loan's eventual, very normal-looking outcome.
+
+`credit_score` is in `EDITABLE_USER_FIELDS` (kind `'credit'`, clamped to
+`[db.CREDIT_MIN, db.CREDIT_MAX]`) for the same reason — a direct, silent override of the
+one stat that gates borrowing, going through the same generic per-player fields form as
+`theft_luck`/`growth_mult`, with no code path that notifies anyone.
+
 ### The nightly auto-handicap (`auto_handicap_job`)
 
 Runs daily at 00:20 Tehran, after `midnight_tasks` has closed the day out. For each
