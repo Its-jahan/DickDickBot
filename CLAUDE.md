@@ -242,6 +242,41 @@ pays in full — which used to evaporate.
 When adding a new fee, take it in the same transaction as the thing it is charging on,
 and never charge it on money that is merely being returned from escrow.
 
+## The shop is real supply and demand, and its limits are global
+
+`/shop` used to sell every item at a fixed, inflation-scaled price with no cap. It now
+behaves like an actual market: every item shares one global daily cap
+(`SHOP_DAILY_LIMIT`, 5) and one global weekly cap (`SHOP_WEEKLY_LIMIT`, 40) across the
+*whole group*, not per player — if one player buys 4 of the day's 5, only 1 is left for
+everyone else combined, not 5 more each. `db.claim_shop_purchase` enforces this
+atomically with a `SELECT ... FOR UPDATE` on a per-(chat, item) row, so two players
+racing for the last unit can never both win it.
+
+Price climbs with each sale toward the cap (`shop_scarcity_mult` in `bot.py`): the first
+unit sold today/this week costs the plain inflation-scaled price, and the unit right
+before a cap is hit costs up to `SHOP_SCARCITY_MAX_BONUS` (100%) more. The price shown
+on the shop's button and the price actually charged always agree, because both are
+computed from the *same* pre-purchase counts `claim_shop_purchase` returns — the caller
+never re-reads the row a second time between quoting and charging.
+
+Selling an item's stock all the way out is itself real evidence of scarcity, so it
+nudges the group's `economy.inflation` up immediately via `db.bump_inflation`
+(`SHOP_SOLDOUT_INFLATION_BUMP` for the day, a larger `SHOP_WEEKLY_SOLDOUT_INFLATION_BUMP`
+for the week) — on top of, not instead of, whatever the nightly supply-driven
+`tick_inflation` would have done anyway. A refused purchase (the cap was already hit
+before this call) must never bump inflation again for the same sellout event; only the
+purchase that actually crosses the cap does.
+
+As before, every centimetre paid lands directly in `bank_treasury` via
+`db.treasury_add` — the shop was already one of the treasury's few real sinks, and that
+did not change.
+
+Day/week are lazily reset the same way perks expire at Tehran midnight — `day`/`week`
+key columns are compared against the current stamp on read, with no scheduled reset
+job. If the claimed slot then fails to be paid for (insufficient funds, or the inventory
+insert somehow throws), `db.release_shop_purchase` hands it back, mirroring the
+escrow-claim/release pattern already used for `DOSE_LIMITED_ITEMS`.
+
 ## Cross-group transfer is an owner-controlled switch, not a fixed feature
 
 `/enteghal` lets a player move their own size between groups they played in, minus a fee.

@@ -22,6 +22,11 @@ def tehran_today_str():
     """The current date (YYYY-MM-DD) in Iran time, used as the daily reset key for growth."""
     return datetime.datetime.now(IRAN_TZ).date().isoformat()
 
+def tehran_week_str():
+    """The current ISO (year, week) in Iran time, used as the weekly reset key for shop caps."""
+    year, week, _ = datetime.datetime.now(IRAN_TZ).date().isocalendar()
+    return f"{year}-W{week:02d}"
+
 import db
 import lottery
 import decrees
@@ -447,6 +452,36 @@ SHOP_PRICES = {
     "آژیر": 70,
     "بلیت طلایی": 90,
 }
+
+# The shop is real supply and demand, shared by the whole group rather than per player:
+# every item has a global daily and weekly sale cap, and its price climbs toward
+# SHOP_SCARCITY_MAX_BONUS as that cap gets closer, so the last unit of the day costs
+# far more than the first. If a cap sells all the way out, that scarcity also nudges
+# the group's inflation index up directly (see bump_inflation), on top of whatever the
+# nightly supply-driven tick would have done on its own.
+SHOP_DAILY_LIMIT = 5
+SHOP_WEEKLY_LIMIT = 40
+SHOP_SCARCITY_MAX_BONUS = 1.0            # price approaches +100% as a cap is exhausted
+SHOP_SOLDOUT_INFLATION_BUMP = 0.01       # the day's stock selling out entirely
+SHOP_WEEKLY_SOLDOUT_INFLATION_BUMP = 0.03  # the whole week's stock selling out entirely
+
+
+def shop_scarcity_mult(day_count, week_count, daily_limit, weekly_limit):
+    """How much an item's price has climbed from being bought down toward its day/week
+    cap - 0 sold so far is the base price, one sale before the cap hits is nearly the
+    full SHOP_SCARCITY_MAX_BONUS on top of it."""
+    day_frac = (day_count / daily_limit) if daily_limit else 0.0
+    week_frac = (week_count / weekly_limit) if weekly_limit else 0.0
+    frac = min(1.0, max(day_frac, week_frac))
+    return 1.0 + SHOP_SCARCITY_MAX_BONUS * frac
+
+
+def shop_item_price(chat_id, item_name, day_count, week_count):
+    """The price of THIS NEXT unit, given how many are already sold today/this week."""
+    base = SHOP_PRICES[item_name]
+    mult = shop_scarcity_mult(day_count, week_count, SHOP_DAILY_LIMIT, SHOP_WEEKLY_LIMIT)
+    return max(1, int(round(priced(base, chat_id) * mult)))
+
 
 # A player can only be dosed with one of these per 24h, counted on the receiving end.
 # زعفرون is deliberately not included - it's the rare, expensive one, and it isn't
@@ -4498,12 +4533,17 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_shop_keyboard(user_id, chat_id):
     # chat_id is required, not optional: prices are per-group now that inflation scales
     # them, and there is no sensible group-agnostic price to fall back on.
-    rows = []
-    items = [(nm, priced(pr, chat_id)) for nm, pr in SHOP_PRICES.items()]
-    for i in range(0, len(items), 2):
-        row = [InlineKeyboardButton(f"{name} — {price}", callback_data=f"buy_{user_id}_{name}")
-               for name, price in items[i:i + 2]]
-        rows.append(row)
+    today_str = tehran_today_str()
+    week_str = tehran_week_str()
+    buttons = []
+    for name in SHOP_PRICES:
+        day_count, week_count = db.get_shop_item_counts(chat_id, name, today_str, week_str)
+        if day_count >= SHOP_DAILY_LIMIT or week_count >= SHOP_WEEKLY_LIMIT:
+            buttons.append(InlineKeyboardButton(f"{name} — تموم شد ❌", callback_data=f"buy_{user_id}_{name}"))
+            continue
+        price = shop_item_price(chat_id, name, day_count, week_count)
+        buttons.append(InlineKeyboardButton(f"{name} — {price}", callback_data=f"buy_{user_id}_{name}"))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
 
@@ -4512,10 +4552,21 @@ async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db.track_chat(chat_id)
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    today_str = tehran_today_str()
+    week_str = tehran_week_str()
     lines = ["🏪 **فروشگاه دودول**\n", f"💰 موجودی شما: {int(size)} سانتی‌متر\n"]
-    for name, base_price in SHOP_PRICES.items():
-        price = priced(base_price, chat_id)
-        lines.append(f"• {name} — {price} سانت\n  └ {ITEM_DESCRIPTIONS.get(name, '')}")
+    for name in SHOP_PRICES:
+        day_count, week_count = db.get_shop_item_counts(chat_id, name, today_str, week_str)
+        remaining_day = max(0, SHOP_DAILY_LIMIT - day_count)
+        remaining_week = max(0, SHOP_WEEKLY_LIMIT - week_count)
+        if remaining_day == 0 or remaining_week == 0:
+            lines.append(f"• {name} — ❌ سهمیه‌ش تو کل گروه تموم شده\n  └ {ITEM_DESCRIPTIONS.get(name, '')}")
+            continue
+        price = shop_item_price(chat_id, name, day_count, week_count)
+        lines.append(
+            f"• {name} — {price} سانت (باقی‌مونده: {remaining_day} امروز / {remaining_week} این‌هفته، برای کل گروه)\n"
+            f"  └ {ITEM_DESCRIPTIONS.get(name, '')}"
+        )
     lines.append("\nروی دکمه بزن تا بخری 👇")
     await update.message.reply_text("\n".join(lines), reply_markup=build_shop_keyboard(user.id, chat_id))
 
@@ -4543,11 +4594,25 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if base_price is None:
         await query.answer("این آیتم تو فروشگاه نیست!", show_alert=True)
         return
-    price = priced(base_price, chat_id)
+
+    today_str = tehran_today_str()
+    week_str = tehran_week_str()
+    # Claims the global slot BEFORE charging, so two simultaneous buyers can never both
+    # take the group's last unit - the row lock in claim_shop_purchase serializes them.
+    claimed, a, b = db.claim_shop_purchase(chat_id, item_name, today_str, week_str,
+                                            SHOP_DAILY_LIMIT, SHOP_WEEKLY_LIMIT)
+    if not claimed:
+        reason_text = ("سهمیهٔ امروز این آیتم تو کل گروه تموم شده!" if a == 'day'
+                        else "سهمیهٔ این‌هفتهٔ این آیتم تو کل گروه تموم شده!")
+        await query.answer(f"❌ {reason_text}", show_alert=True)
+        return
+    day_count_before, week_count_before = a, b
+    price = shop_item_price(chat_id, item_name, day_count_before, week_count_before)
 
     db.get_user(user.id, chat_id, user.username, user.first_name)
     # Pay first, then hand over the goods; if the insert somehow fails the size goes back.
     if not db.try_deduct_size(user.id, chat_id, price):
+        db.release_shop_purchase(chat_id, item_name, today_str, week_str)
         size, _, _ = db.get_user(user.id, chat_id, None, None)
         await query.answer(f"پول کافی نداری! قیمت {price} سانته، تو {int(size)} داری.", show_alert=True)
         return
@@ -4555,10 +4620,18 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.add_inventory(user.id, chat_id, item_name)
     except Exception:
         db.update_size(user.id, chat_id, price)
+        db.release_shop_purchase(chat_id, item_name, today_str, week_str)
         raise
     # The price used to simply vanish. It funds the bank's interest now - that is what
     # lets the bank pay a yield without minting a single centimetre of new size.
     db.treasury_add(chat_id, price, note=f"خرید {item_name}")
+
+    # Selling all the way through a cap is itself evidence of real scarcity, so it
+    # nudges inflation directly rather than waiting for the nightly supply-driven tick.
+    if day_count_before + 1 >= SHOP_DAILY_LIMIT:
+        db.bump_inflation(chat_id, SHOP_SOLDOUT_INFLATION_BUMP)
+    if week_count_before + 1 >= SHOP_WEEKLY_LIMIT:
+        db.bump_inflation(chat_id, SHOP_WEEKLY_SOLDOUT_INFLATION_BUMP)
 
     size, _, _ = db.get_user(user.id, chat_id, None, None)
     await query.answer(f"{item_name} خریدی! 🛍️\nموجودی جدید: {int(size)} سانت", show_alert=True)

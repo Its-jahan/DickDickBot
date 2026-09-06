@@ -409,6 +409,23 @@ def init_db():
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS decree_log_chat_idx ON decree_log (chat_id, id DESC)')
 
+        # One row per (group, item): the shared purchase counters that make shop limits
+        # global rather than per-player - one player buying the day's last unit must
+        # actually leave nothing for anyone else, not five-per-player. day/week are reset
+        # lazily the moment a stale value is read, the same trick perks use for expiring
+        # at Tehran midnight, so no scheduled reset job is needed.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS shop_item_state (
+                chat_id BIGINT NOT NULL,
+                item_name TEXT NOT NULL,
+                day TEXT DEFAULT '',
+                day_count INTEGER DEFAULT 0,
+                week TEXT DEFAULT '',
+                week_count INTEGER DEFAULT 0,
+                PRIMARY KEY (chat_id, item_name)
+            )
+        ''')
+
         # ---------------------------------------------------------------- loans
         # lender_id IS NULL means the group's treasury is the lender (the official
         # /vam loan); any other value is a player-to-player نزول. Both settle through
@@ -3008,6 +3025,87 @@ def tick_inflation(chat_id, today_str):
         c.execute('UPDATE economy SET inflation = %s, supply_last = %s WHERE chat_id = %s',
                   (after, supply, chat_id))
         return (inflation, after, growth)
+
+
+def bump_inflation(chat_id, delta):
+    """Nudges the index directly and immediately, independent of the nightly tick.
+
+    Used when a shop item's stock sells all the way out - that is itself real evidence
+    of scarcity, not something worth waiting for tick_inflation to infer from the money
+    supply the next night."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO economy (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute('UPDATE economy SET inflation = GREATEST(%s, LEAST(%s, COALESCE(inflation,1.0) + %s)) '
+                  'WHERE chat_id = %s RETURNING inflation',
+                  (INFLATION_MIN, INFLATION_MAX, delta, chat_id))
+        return float(c.fetchone()[0])
+
+
+# ---------------------------------------------------------------- shop supply/demand
+# Every item's price and stock are shared by the whole group, not per player - buying
+# four of the day's five leaves exactly one for everyone else combined, not five each.
+
+def get_shop_item_counts(chat_id, item_name, today_str, week_str):
+    """(day_count, week_count) sold so far, lazily zeroed once the stamped day/week is
+    stale. Read-only - does not create a row, since /shop is rendered far more often
+    than anyone actually buys."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT day, day_count, week, week_count FROM shop_item_state '
+                  'WHERE chat_id = %s AND item_name = %s', (chat_id, item_name))
+        row = c.fetchone()
+        if row is None:
+            return 0, 0
+        day, day_count, week, week_count = row
+        return (day_count if day == today_str else 0,
+                week_count if week == week_str else 0)
+
+
+def claim_shop_purchase(chat_id, item_name, today_str, week_str, daily_limit, weekly_limit):
+    """Atomically claims one global purchase slot for an item.
+
+    Returns (True, day_count_before, week_count_before) - the counts BEFORE this sale,
+    which the caller prices the purchase from, so the price shown on the button and the
+    price actually charged can never disagree. Returns (False, 'day') or (False, 'week')
+    when that cap is already exhausted. Call release_shop_purchase if payment then
+    fails, or a declined purchase would still burn the group's one remaining slot."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO shop_item_state (chat_id, item_name, day, week) '
+                  'VALUES (%s, %s, %s, %s) ON CONFLICT (chat_id, item_name) DO NOTHING',
+                  (chat_id, item_name, today_str, week_str))
+        c.execute('SELECT day, day_count, week, week_count FROM shop_item_state '
+                  'WHERE chat_id = %s AND item_name = %s FOR UPDATE',
+                  (chat_id, item_name))
+        day, day_count, week, week_count = c.fetchone()
+        if day != today_str:
+            day_count = 0
+        if week != week_str:
+            week_count = 0
+        if day_count >= daily_limit:
+            return False, 'day', None
+        if week_count >= weekly_limit:
+            return False, 'week', None
+        c.execute('UPDATE shop_item_state SET day = %s, day_count = %s, week = %s, week_count = %s '
+                  'WHERE chat_id = %s AND item_name = %s',
+                  (today_str, day_count + 1, week_str, week_count + 1, chat_id, item_name))
+        return True, day_count, week_count
+
+
+def release_shop_purchase(chat_id, item_name, today_str, week_str):
+    """Hands back a slot claimed by claim_shop_purchase when payment then failed. A
+    no-op wherever the day/week has since rolled over - there is nothing stale to give
+    back, and the fresh period already started at zero."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE shop_item_state SET day_count = GREATEST(0, day_count - 1) '
+                  'WHERE chat_id = %s AND item_name = %s AND day = %s',
+                  (chat_id, item_name, today_str))
+        c.execute('UPDATE shop_item_state SET week_count = GREATEST(0, week_count - 1) '
+                  'WHERE chat_id = %s AND item_name = %s AND week = %s',
+                  (chat_id, item_name, week_str))
 
 
 def claim_decree_day(chat_id, today_str):
