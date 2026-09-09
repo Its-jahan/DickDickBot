@@ -246,6 +246,44 @@ walk himself out. `db.pardon_heist_prisoner` returns whether a live sentence act
 existed, so the command can tell "pardoned" apart from "this player wasn't serving
 anything" instead of silently claiming success.
 
+## Duelling the bot (`/cbot`) mints — and the burn on the other side is what makes it safe
+
+Players kept creating `/c` challenges nobody would accept, so `/cbot` lets them duel the
+bot itself. The bot holds no size, so there is no opponent stake to win: **a win is
+genuinely minted**, which makes this the only source in the game outside a corrupt
+decree.
+
+What stops that being a money printer is that it is **symmetric**. On a win the bot
+conjures the stake; on a loss the player's escrowed stake is **destroyed**, not moved to
+the treasury. A burn on one side and a mint on the other net to zero in expectation, so
+the money supply only drifts by the small edge a player's dice perk buys them — and
+`tick_inflation` chases that drift the same night. Route the loss to the treasury instead
+and the sum stops being zero: the supply would grow by half the stake on *every* duel.
+That single choice is the difference between a coin flip and a printer.
+
+The two bounds on the residual are `BOT_DUEL_DAILY_LIMIT` (claimed atomically by
+`db.try_claim_bot_duel` with `FOR UPDATE`, handed back by `release_bot_duel` if the stake
+then fails to escrow) and `BOT_DUEL_MAX_BET` (inflation-scaled through `priced`, so the
+cap keeps its meaning). The daily counter resets lazily off a stamped day, the same trick
+perks use to expire at Tehran midnight.
+
+**It deliberately does not go through `pvp_matches`/`resolve_pvp_match`**, for three
+reasons, the last of which is the one that actually bites:
+
+- The bot would need a `users` row, and `get_money_supply` sums every users row — so
+  `tick_inflation` would start chasing a balance that isn't real money.
+- It would collect wins/losses and achievements, making `win_10` farmable against a
+  counterparty that never gets tired.
+- **The cross-group transfer gate measures a group's "real competition" by counting
+  resolved `pvp_matches`.** Bot duels landing there would let someone manufacture exactly
+  the evidence that gate exists to demand, reopening the farm-group exploit through the
+  side door. There is a regression test asserting `/cbot` writes no `pvp_matches` row.
+
+The player's *dice* perk applies as it would against a human; the bot rolls clean with no
+perk of its own. Challenge items are deliberately not consumed — most of them
+(`کاندوم`, `شیر موز`, `سوزن`, `طلسم`) govern what happens between two players' payouts,
+and half-applying them would burn someone's item for a fraction of its advertised effect.
+
 ## Loans split principal from interest in the ledger
 
 `loans` covers both lenders: `lender_id IS NULL` is the treasury-funded `/vam`, anything
@@ -458,10 +496,10 @@ honest decree pushes the king toward losing it, and every corrupt one raises unr
 toward a revolt that seizes 40% of his size and hands it to everyone else. Ruling well
 is a slow way to lose power; ruling badly is a sudden one.
 
-`mint` is the only thing in the entire codebase that creates size from nothing. It is
-reserved for the worst decrees deliberately — that is what makes debasement genuinely
-corrosive rather than merely unfair, and it is why the bank's "cannot mint" rule is
-written the way it is.
+`mint` is one of only two things in the codebase that create size from nothing (the
+other is a `/cbot` win — see below). It is reserved for the worst decrees deliberately —
+that is what makes debasement genuinely corrosive rather than merely unfair, and it is
+why the bank's "cannot mint" rule is written the way it is.
 
 `recover_decree_offer` is a startup catch-up, following the same pattern as the other
 recovery sweeps. `run_daily` only fires at its appointed minute, so a bot deployed or
@@ -707,3 +745,7 @@ lottery burn (`LOTTERY_BURN_RATIO`) and the earthquake event *destroy* it. Every
 else (tax, theft, betrayal, challenges, donations) only moves it between players and
 must stay exactly zero-sum. When adding a feature, be explicit about which of the three
 it is — the economy inflated badly once because every mechanic was a source.
+
+`/cbot` is the one mechanic that is deliberately *both*: it creates size on a win and
+destroys it on a loss, which is precisely how it stays neutral. If you ever change one
+side of that pair, change the other with it.

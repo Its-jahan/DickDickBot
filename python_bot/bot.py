@@ -124,6 +124,7 @@ BOT_COMMANDS = [
     ("d", "🌱 رشد روزانهٔ دودول"),
     ("t", "🏆 لیدربرد گروه"),
     ("c", "⚔️ چالش با شرط دلخواه — /c 50"),
+    ("cbot", "🤖 چالش با خود ربات (وقتی کسی قبول نمی‌کنه)"),
     ("dd", "🎁 اهدای سایز — /dd @user 20"),
     ("i", "🎒 آیتم‌های من"),
     ("u", "💉 استفاده از آیتم — /u ویاگرا @user"),
@@ -625,7 +626,7 @@ HELP_TEXT = (
     "🎁 /dd @کاربر <مقدار> — اهدای سایز\n"
     "📊 /wr — آمار برد و باخت\n\n"
     "**رقابت**\n"
-    "⚔️ /c <مقدار> — ایجاد چالش\n"
+    "⚔️ /c <مقدار> — ایجاد چالش\n"    "🤖 /cbot <مقدار> — چالش با خود ربات، بدون نیاز به حریف\n"
     "⚖️ /ejma @کاربر — رای‌گیری برای کم‌کردن سایز یکی\n"
     "🥷 /dozdi @کاربر — دزدی از یکی (هر ۶ ساعت یک بار)\n\n"
     "**سلطنت**\n"
@@ -1248,6 +1249,134 @@ async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر در این گروه ایجاد کرد!\nاولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود.",
         reply_markup=reply_markup
     )
+
+async def bot_duel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/cbot <amount>` - duel the bot when nobody will accept your challenge.
+
+    The bot holds no size, so there is no opponent's stake to win: a player win is
+    genuinely minted. See BOT_DUEL_* for why that is safe - the loss burns the player's
+    stake instead of banking it, which makes the whole thing a coin flip against the
+    void rather than a source.
+
+    Deliberately NOT run through pvp_matches/resolve_pvp_match, for three reasons: the
+    bot would need a users row (which get_money_supply would then count, corrupting
+    tick_inflation), it would collect wins/losses and achievements, and - the one that
+    actually bites - the cross-group transfer gate measures a group's "real competition"
+    by counting resolved pvp_matches, so bot duels landing there would let someone
+    manufacture the evidence a farm group needs to pass it."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("چالش با ربات فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    size, _, perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    if perk == "حرومزاده":
+        await update.message.reply_text("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده!")
+        return
+    if db.is_in_heist_prison(user.id, chat_id):
+        await update.message.reply_text("⛓ تو زندان بانکی، نمی‌تونی چالش بدی!")
+        return
+
+    max_bet = priced(BOT_DUEL_MAX_BET, chat_id)
+    parts = update.message.text.split()
+    bet = 10
+    if len(parts) > 1:
+        try:
+            bet = int(float(parts[1]))
+        except ValueError:
+            bet = 10
+    if bet <= 0:
+        await update.message.reply_text("شرط باید بیشتر از صفر باشه!")
+        return
+    if bet > max_bet:
+        await update.message.reply_text(
+            f"🤖 سقف شرط با ربات {max_bet} سانته.\n"
+            f"(ربات از هوا پول درمیاره، پس نمی‌شه بی‌حساب باهاش بازی کرد)"
+        )
+        return
+    if size < bet:
+        await update.message.reply_text(
+            f"این‌قدر سانت نداری! 💼 {int(size)} سانت داری."
+        )
+        return
+
+    today_str = tehran_today_str()
+    claimed, used = db.try_claim_bot_duel(user.id, chat_id, today_str, BOT_DUEL_DAILY_LIMIT)
+    if not claimed:
+        await update.message.reply_text(
+            f"🤖 امروز {used} بار با ربات بازی کردی و سهمیه‌ت تموم شد "
+            f"(روزی {BOT_DUEL_DAILY_LIMIT} بار).\nفردا دوباره بیا — یا یه آدم واقعی پیدا کن با /c!"
+        )
+        return
+
+    # Escrow first, exactly like /c: the stake leaves the wallet before any dice are
+    # rolled, so a win can never be paid out of size the player didn't actually have.
+    if not db.try_deduct_size(user.id, chat_id, bet):
+        db.release_bot_duel(user.id, chat_id, today_str)
+        await update.message.reply_text("سایزت کافی نیست!")
+        return
+
+    player_roll = _dice_rng.randint(1, 6)
+    bot_roll = _dice_rng.randint(1, 6)
+
+    # The player's dice perk applies exactly as it would against a human; the bot rolls
+    # clean and holds no perk or item of its own. Challenge items are deliberately not
+    # consumed here - most of them (کاندوم، شیر موز، سوزن، طلسم) are about what happens
+    # between two players' payouts, and half-applying them would burn someone's item for
+    # a fraction of its advertised effect.
+    perk_note = ""
+    if perk == "کون‌گشاد":
+        player_roll = max(1, player_roll - 1)
+        perk_note = f"\n({perk}: یکی از تاست کم شد)"
+    elif perk == "زن جنده":
+        player_roll = min(6, player_roll + 1)
+        perk_note = f"\n({perk}: یکی به تاست اضافه شد)"
+    elif perk == "حروم‌دست":
+        player_roll = max(1, player_roll - 2)
+        perk_note = f"\n({perk}: دو تا از تاست کم شد)"
+    elif perk == "جقی":
+        player_roll = _jaghi_swing(player_roll)
+        perk_note = f"\n({perk}: تاست قشقرق کرد)"
+
+    left = BOT_DUEL_DAILY_LIMIT - used
+    header = (f"⚔️ {user.first_name} vs {BOT_DUEL_NAME}\n"
+              f"💰 شرط: {bet} سانت\n\n"
+              f"🎲 تاس تو: {player_roll}\n"
+              f"🎲 تاس ربات: {bot_roll}{perk_note}\n")
+
+    if player_roll > bot_roll:
+        # The only mint in the game outside a corrupt decree: stake back, plus winnings
+        # that existed nowhere a moment ago.
+        db.update_size(user.id, chat_id, bet * 2)
+        new_size, _, _ = db.get_user(user.id, chat_id, None, None)
+        await update.message.reply_text(
+            f"{header}\n🎉 بردی! ربات {bet} سانت از هوا برات ساخت.\n"
+            f"📈 سایزت شد {int(new_size)} سانت.\n"
+            f"🤖 امروز {left} بازی دیگه با ربات داری."
+        )
+        return
+
+    if player_roll == bot_roll:
+        db.update_size(user.id, chat_id, bet)
+        new_size, _, _ = db.get_user(user.id, chat_id, None, None)
+        await update.message.reply_text(
+            f"{header}\n🤝 مساوی! شرطت بهت برگشت.\n"
+            f"💼 سایزت: {int(new_size)} سانت\n"
+            f"🤖 امروز {left} بازی دیگه با ربات داری."
+        )
+        return
+
+    # Lost. The stake was already escrowed and is simply never returned - it is destroyed,
+    # NOT moved to the treasury. That burn is what pays for the mint on the winning side.
+    new_size, _, _ = db.get_user(user.id, chat_id, None, None)
+    await update.message.reply_text(
+        f"{header}\n💀 باختی! {bet} سانتت دود شد و رفت هوا.\n"
+        f"📉 سایزت شد {int(new_size)} سانت.\n"
+        f"🤖 امروز {left} بازی دیگه با ربات داری."
+    )
+
 
 async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2303,6 +2432,25 @@ def _jaghi_swing(val):
     """جقی: a wild swing on the die, in whichever direction the coin lands. This is
     what the perk's description has always promised players."""
     return max(1, val - 3) if random.random() < 0.5 else min(6, val + 3)
+
+
+# Duelling the bot itself, for when nobody will take your challenge. The bot has no size
+# of its own, so its stake really is conjured - and a player win is the only mint in the
+# game outside a corrupt decree.
+#
+# What keeps that from being a printer is that it is symmetric: the bot mints when it
+# loses and the player's stake is DESTROYED when it wins, rather than going to the
+# treasury. A burn on one side and a mint on the other nets to zero in expectation, so
+# the money supply only drifts by the small edge a player's dice perk buys them - and
+# tick_inflation chases that drift the same night anyway.
+#
+# Route the loss to the treasury instead and the sum stops being zero: the supply would
+# grow by half the stake on every single duel. That one line is the difference between
+# a coin flip and a money printer, so read the settlement in bot_duel_cmd before
+# changing it.
+BOT_DUEL_DAILY_LIMIT = 3      # per player per group - the bound on minting, see db.try_claim_bot_duel
+BOT_DUEL_MAX_BET = 50         # inflation-scaled, so the cap keeps its meaning
+BOT_DUEL_NAME = "🤖 ربات"
 
 # The crown taxes the group daily, which is what makes being #1 worth chasing - but it
 # also makes its wearer the only player consensus protection doesn't cover and doubles
@@ -5322,6 +5470,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(dick|grow|d)\b'), dick))
     app.add_handler(MessageHandler(cmd(r'^/(top|t)\b'), top))
     app.add_handler(MessageHandler(cmd(r'^/(donate|dd)\b'), donate))
+    app.add_handler(MessageHandler(cmd(r'^/(cbot|botchallenge)\b'), bot_duel_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(challenge|c)\b'), challenge))
     app.add_handler(MessageHandler(cmd(r'^/(inv|inventory|i)\b'), inventory_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(use|u)\b'), use_item_cmd))

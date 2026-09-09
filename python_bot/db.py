@@ -469,6 +469,12 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loans_late INTEGER DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_date TEXT DEFAULT ''")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_today INTEGER DEFAULT 0")
+        # Duels against the bot itself. The bot has no size of its own, so a win against
+        # it is genuinely minted - the daily counter is the only thing bounding how much
+        # new size a single player can pull out of the air. Reset lazily by comparing the
+        # stamped day, the same trick perks use to expire at Tehran midnight.
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_duel_day TEXT DEFAULT ''")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_duel_count INTEGER DEFAULT 0")
         # Jester duty: whoever called a vote the king dissolved, and until when.
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS jester_until TIMESTAMPTZ")
         # Martial law is rationed per group, not per king, so abdicating and being
@@ -736,6 +742,45 @@ def release_dose(target_id, chat_id):
         c = conn.cursor()
         c.execute('UPDATE users SET last_dosed_at = NULL WHERE user_id = %s AND chat_id = %s',
                   (target_id, chat_id))
+
+
+def try_claim_bot_duel(user_id, chat_id, today_str, daily_limit):
+    """Atomically claims one of today's duels against the bot.
+
+    This counter is load-bearing in a way the other daily limits are not: a duel win is
+    minted rather than taken off another player, so this is the only thing standing
+    between one bored player and an unbounded money printer. Claimed with FOR UPDATE
+    before any size moves, and handed back by release_bot_duel if the stake can't
+    actually be escrowed.
+
+    Returns (True, used_after) or (False, used_now)."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(bot_duel_day, ''), COALESCE(bot_duel_count, 0) "
+                  'FROM users WHERE user_id = %s AND chat_id = %s FOR UPDATE',
+                  (user_id, chat_id))
+        row = c.fetchone()
+        if row is None:
+            return (False, 0)
+        day, used = row[0], int(row[1])
+        if day != today_str:
+            used = 0
+        if used >= daily_limit:
+            return (False, used)
+        c.execute('UPDATE users SET bot_duel_day = %s, bot_duel_count = %s '
+                  'WHERE user_id = %s AND chat_id = %s',
+                  (today_str, used + 1, user_id, chat_id))
+        return (True, used + 1)
+
+
+def release_bot_duel(user_id, chat_id, today_str):
+    """Hands back a duel claimed a moment ago whose stake then failed to escrow. A no-op
+    once the day has rolled over - the fresh day already started at zero."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE users SET bot_duel_count = GREATEST(0, COALESCE(bot_duel_count,0) - 1) '
+                  'WHERE user_id = %s AND chat_id = %s AND bot_duel_day = %s',
+                  (user_id, chat_id, today_str))
 
 
 DONATION_MIN_DAYS = 7
