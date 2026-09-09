@@ -2387,8 +2387,47 @@ RANDOM_EVENT_CHANCE = 0.18
 # Interest is paid strictly out of the group's treasury, which is filled only by real
 # sinks (shop purchases, the lottery rake, /ejma, shrink items, earthquakes). An empty
 # treasury simply pays nothing. The bank can never invent size.
-BANK_INTEREST_RATE = 0.04          # 4% a day on your balance, if the vault can afford it
+# The rate is not a fixed number: it rises and falls with how well the treasury covers
+# what savers are holding. Coverage is treasury / total deposits, which is the honest
+# measure - a 1000-size vault is rich against 500 of deposits and broke against 50,000.
+#
+# This replaced a flat advertised rate that the treasury then quietly failed to honour,
+# scaling everyone down at payout time. A rate that moves openly is a signal players can
+# act on instead of a promise that silently breaks: a thin vault visibly pays less, and
+# the way to fix it is to spend (the shop, fees and the lottery rake are what fill the
+# treasury), which is a feedback loop the old cliff didn't have.
+BANK_RATE_MIN = 0.005              # 0.5% a day when the vault is nearly empty
+BANK_RATE_MAX = 0.06               # 6% a day when it is flush
+BANK_COVERAGE_POOR = 0.05          # treasury worth 5% of deposits or less -> the floor
+BANK_COVERAGE_RICH = 0.50          # treasury worth half the deposits or more -> the ceiling
 BANK_INTEREST_MAX_TREASURY_SHARE = 0.25  # never drain more than a quarter of the vault in one night
+
+
+def bank_coverage(treasury, deposits):
+    """How much of what savers hold the treasury could actually cover. With nothing
+    deposited there is nothing to throttle, so an empty bank reads as fully covered."""
+    if deposits <= 0:
+        return BANK_COVERAGE_RICH
+    return max(0.0, float(treasury)) / float(deposits)
+
+
+def bank_base_rate(treasury, deposits):
+    """Today's deposit rate before the crown's dial - interpolated across the coverage
+    band and clamped to [BANK_RATE_MIN, BANK_RATE_MAX] at either end."""
+    span = BANK_COVERAGE_RICH - BANK_COVERAGE_POOR
+    frac = 1.0 if span <= 0 else (bank_coverage(treasury, deposits) - BANK_COVERAGE_POOR) / span
+    frac = max(0.0, min(1.0, frac))
+    return BANK_RATE_MIN + frac * (BANK_RATE_MAX - BANK_RATE_MIN)
+
+
+def bank_effective_rate(chat_id, econ=None):
+    """(rate, base_rate, coverage) as they stand right now, so /bank and /economy quote
+    the number the nightly job will actually pay rather than an advertised constant."""
+    treasury, _, _ = db.get_treasury(chat_id)
+    deposits, _ = db.get_bank_totals(chat_id)
+    e = econ or db.get_economy(chat_id)
+    base = bank_base_rate(treasury, deposits)
+    return (max(0.0, min(0.50, base * e[3])), base, bank_coverage(treasury, deposits))
 # You cannot shovel a whole balance in at once: a day's deposits are capped at a share
 # of your wallet, with a floor so small players can still use the bank at all. This is
 # what keeps size in circulation - and keeps /dozdi worth typing.
@@ -3075,6 +3114,9 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_dep, holders = db.get_bank_totals(chat_id)
     cap = _bank_daily_cap(wallet)
     remaining = max(0, cap - int(dep_today))
+    # The live rate, not an advertised constant: what's quoted here is exactly what
+    # tonight's job will pay, so the two can't drift apart.
+    live_rate, _live_base, live_cov = bank_effective_rate(chat_id)
 
     msg = (
         f"🏦 <b>بانک دودول</b>\n\n"
@@ -3085,7 +3127,10 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏛 صندوق گروه\n"
         f"   💰 خزانه: {int(treasury)} سانت\n"
         f"   🧾 کل سپرده‌ها: {int(total_dep)} سانت از {holders} نفر\n\n"
-        f"📈 سود روزانه: {int(BANK_INTEREST_RATE*100)}٪ — ولی فقط تا جایی که خزانه بکشه.\n"
+        f"📈 سود روزانهٔ الان: {live_rate*100:.2f}٪ "
+        f"(خزانه {live_cov*100:.0f}٪ سپرده‌ها رو پوشش می‌ده)\n"
+        f"   └ نرخ ثابت نیست: خزانه پرتر = سود بیشتر، بین "
+        f"{BANK_RATE_MIN*100:.1f}٪ تا {BANK_RATE_MAX*100:.0f}٪.\n"
         f"⚠️ سایزِ بانک تو لیدربرد و تاج حساب نمی‌شه.\n"
         f"🥷 خزانه و سپرده‌ها با /sarghat قابل سرقتن!\n\n"
         f"دستورها: /variz &lt;مقدار&gt; • /bardasht &lt;مقدار&gt; • /sarghat"
@@ -3598,23 +3643,32 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
             if not db.claim_interest_run(chat_id, today_str):
                 continue
             econ = db.get_economy(chat_id)
-            # The nominal rate is the crown's to set. Note it is NOT inflation-adjusted:
-            # that is the point - depositors carry the inflation risk themselves, so a
-            # money-printing king really does rob the savers.
-            rate = max(0.0, min(0.50, BANK_INTEREST_RATE * econ[3]))
+            # The rate rises and falls with the treasury's coverage of the deposits, then
+            # takes the crown's dial on top. It is deliberately NOT inflation-adjusted:
+            # depositors carry the inflation risk themselves, so a money-printing king
+            # really does rob the savers.
+            rate, base, coverage = bank_effective_rate(chat_id, econ)
             rows, paid, left = db.pay_interest(
                 chat_id, rate, BANK_INTEREST_MAX_TREASURY_SHARE
             )
             if rows <= 0 or paid <= 0:
                 continue
             total_dep, _ = db.get_bank_totals(chat_id)
+            if base >= BANK_RATE_MAX - 1e-9:
+                mood = "خزانه پره — نرخ روی سقفه 🤑"
+            elif base <= BANK_RATE_MIN + 1e-9:
+                mood = "خزانه ته کشیده — نرخ افتاده کف 😬"
+            else:
+                mood = "نرخ با وضع خزانه بالا و پایین می‌ره"
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(f"🏦 <b>سود روزانهٔ بانک</b>\n\n"
+                      f"📈 نرخ امروز: <b>{rate*100:.2f}٪</b> — {mood}\n"
                       f"به {rows} سپرده‌گذار در مجموع {int(paid)} سانت سود داده شد.\n"
                       f"🧾 کل سپرده‌ها: {int(total_dep)} سانت\n"
-                      f"💰 باقی‌ماندهٔ خزانه: {int(left)} سانت\n\n"
-                      f"با /bank حسابت رو ببین."),
+                      f"💰 باقی‌ماندهٔ خزانه: {int(left)} سانت "
+                      f"(پوشش {coverage*100:.0f}٪ سپرده‌ها)\n\n"
+                      f"هرچی بیشتر از فروشگاه بخرید و کارمزد بدید، خزانه پرتر و سود همه بیشتر می‌شه."),
                 parse_mode="HTML"
             )
         except Forbidden:
@@ -4292,6 +4346,8 @@ async def economy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supply = db.get_money_supply(chat_id)
     treasury, _, _ = db.get_treasury(chat_id)
     deposits, holders = db.get_bank_totals(chat_id)
+    econ_cov = bank_coverage(treasury, deposits)
+    econ_rate = max(0.0, min(0.50, bank_base_rate(treasury, deposits) * int_m))
     kingdom = db.get_kingdom(chat_id)
     king = kingdom[1] if kingdom and kingdom[1] else "—"
 
@@ -4310,7 +4366,8 @@ async def economy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏦 سپرده‌ها: {int(deposits)} سانت ({holders} نفر)", "",
         f"<b>اهرم‌های تاج</b>",
         f"🧾 کارمزدها: ×{fee_m:.2f}",
-        f"🏦 سود سپرده: ×{int_m:.2f}  (نرخ مؤثر {BANK_INTEREST_RATE*int_m*100:.1f}٪)",
+        f"🏦 سود سپرده: ×{int_m:.2f}  (نرخ مؤثر امروز {econ_rate*100:.2f}٪ — "
+        f"پوشش خزانه {econ_cov*100:.0f}٪)",
         f"🌱 رشد روزانه: ×{grow_m:.2f}", "",
         f"📜 فرمان‌ها: {good} سازنده / {bad} فاسد", "",
         f"<b>قیمت‌ها با تورم امروز</b>",

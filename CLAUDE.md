@@ -122,7 +122,9 @@ Two invariants hold the economy together, and both have regression coverage:
 
 - **The bank cannot mint size.** Interest is paid *only* out of `bank_treasury`, and
   `pay_interest` scales every depositor down by the same factor when the treasury can't
-  cover what's owed. An empty treasury pays exactly zero. The treasury's only inflows
+  cover what's owed. An empty treasury pays exactly zero. **The rate itself now moves
+  with the treasury** (see below), so that proportional haircut is the backstop rather
+  than the normal case it used to be. The treasury's only inflows
   are real sinks — shop purchases, the lottery rake (`lottery.BURN_RATIO`), `/ejma`,
   shrink items (قرص/زعفرون), and earthquakes — each of which used to simply delete
   size. If you add a new sink, route it through `db.treasury_add` rather than dropping
@@ -130,6 +132,29 @@ Two invariants hold the economy together, and both have regression coverage:
 - **A heist is zero-sum.** `heist_take` moves treasury + a slice of every *other*
   depositor's balance into the thief's wallet in one transaction, and returns the
   per-victim amounts so the group message can name who paid.
+
+### The deposit rate floats on how well the treasury covers the deposits
+
+The rate is not a constant. `bank_base_rate` interpolates between `BANK_RATE_MIN` and
+`BANK_RATE_MAX` across a coverage band (`BANK_COVERAGE_POOR` → `BANK_COVERAGE_RICH`),
+where **coverage is `treasury / total_deposits`** — the honest measure, since a
+1000-size vault is rich against 500 of deposits and broke against 50,000. The crown's
+`interest_mult` still multiplies the result, so the king's lever keeps working.
+
+This replaced a flat advertised rate that the treasury then quietly failed to honour,
+scaling everyone down at payout time. Two reasons the floating rate is better, and both
+are the point of the feature:
+
+- **A moving rate is a signal; a broken promise is not.** A thin vault visibly pays less
+  instead of promising 4% and delivering a haircut.
+- **It closes a feedback loop.** The treasury is filled by real sinks — shop purchases,
+  fees, the lottery rake — so "spend more and everyone's interest goes up" is now a true
+  statement players can act on. The nightly announcement says so explicitly.
+
+`bank_effective_rate(chat_id)` is the single source of the quoted number: the nightly
+job, `/bank` and `/eghtesad` all call it, so what a player is shown is exactly what gets
+paid. Do not reintroduce a constant for display — a shown number drifting from the real
+one is a bug class this codebase has already been bitten by.
 
 ### Deposits must never count as ledger losses
 
