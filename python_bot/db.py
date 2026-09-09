@@ -469,6 +469,22 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS loans_late INTEGER DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_date TEXT DEFAULT ''")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_gain_today INTEGER DEFAULT 0")
+        # Every inter-group raid that has actually happened, for the announcement, the
+        # history, and so a repeat pairing is visible rather than looking like a bug.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS group_wars (
+                id BIGSERIAL PRIMARY KEY,
+                war_date TEXT,
+                attacker_chat BIGINT,
+                defender_chat BIGINT,
+                loot DOUBLE PRECISION,
+                attackers INTEGER,
+                defenders INTEGER,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS group_wars_date_idx ON group_wars (war_date DESC)')
+
         # Jester duty: whoever called a vote the king dissolved, and until when.
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS jester_until TIMESTAMPTZ")
         # Martial law is rationed per group, not per king, so abdicating and being
@@ -3133,6 +3149,145 @@ def charge_credit_check(user_id, chat_id, fee):
                   (chat_id, fee, fee))
         _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد اعتبارسنجی')
         return True
+
+
+# ---------------------------------------------------------------- inter-group war
+# The one mechanic that moves size ACROSS leagues rather than inside one. It is still
+# strictly zero-sum - every centimetre taken off a defender lands on an attacker in the
+# same transaction - but it is zero-sum *globally*, not per group: the raided group's
+# money supply genuinely shrinks and the raider's grows, so tick_inflation gives the
+# loser cheaper prices and the winner dearer ones the same night. That is the intended
+# consequence, not a leak.
+
+WAR_DAY_KEY = 'last_war_date'
+
+
+def claim_war_day(today_str):
+    """One war per day for the whole bot, claimed atomically so the scheduled job and
+    the startup catch-up can never both stage one. Returns True for the caller that
+    won the race."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO bot_meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING',
+                  (WAR_DAY_KEY, ''))
+        c.execute('UPDATE bot_meta SET value = %s WHERE key = %s AND COALESCE(value, %s) <> %s '
+                  'RETURNING key', (today_str, WAR_DAY_KEY, '', today_str))
+        return c.fetchone() is not None
+
+
+def release_war_day():
+    """Hands the day back when a claimed war couldn't actually be staged (no eligible
+    pair, an empty defender), so a later restart can try again instead of the whole day
+    being silently burned."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE bot_meta SET value = '' WHERE key = %s", (WAR_DAY_KEY,))
+
+
+def has_any_war_happened():
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM group_wars LIMIT 1')
+        return c.fetchone() is not None
+
+
+def count_war_roster(chat_id, active_days):
+    """How many people in a group could actually take part in a raid - played recently
+    and have size worth taking. Wallets only: deposits stay out of a war exactly as they
+    stay out of /dozdi, which is the whole trade the bank sells."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM users '
+                  'WHERE chat_id = %s AND COALESCE(size,0) > 0 '
+                  "  AND last_grown >= to_char(CURRENT_DATE - %s::int, 'YYYY-MM-DD') ",
+                  (chat_id, active_days))
+        return int(c.fetchone()[0] or 0)
+
+
+def execute_group_war(war_date, attacker_chat, defender_chat, loot_ratio, active_days,
+                      exclude_user_ids=()):
+    """Runs one raid in a single transaction.
+
+    Every centimetre is taken from a named defender and handed to a named attacker in
+    the same transaction, and the function refuses to commit unless the two sides
+    balance exactly - a war that moved size without conserving it would be the worst
+    kind of bug here, silently minting into one league and burning another.
+
+    Returns (True, detail) where detail carries the per-player lines the announcement
+    needs, or (False, reason) when there was nothing to raid."""
+    excluded = set(exclude_user_ids or ())
+    with get_connection() as conn:
+        c = conn.cursor()
+
+        def roster(chat_id):
+            c.execute("SELECT user_id, COALESCE(first_name, %s), COALESCE(size,0) FROM users "
+                      'WHERE chat_id = %s AND COALESCE(size,0) > 0 '
+                      "  AND last_grown >= to_char(CURRENT_DATE - %s::int, 'YYYY-MM-DD') "
+                      'ORDER BY size DESC, user_id ASC FOR UPDATE',
+                      ('?', chat_id, active_days))
+            return [r for r in c.fetchall() if r[0] not in excluded]
+
+        defenders = roster(defender_chat)
+        attackers = roster(attacker_chat)
+        if not defenders:
+            return (False, 'no_defenders')
+        if not attackers:
+            return (False, 'no_attackers')
+
+        # Proportional on the way out: the biggest wallets in the losing group pay the
+        # most, so a raid hits the people who can afford it rather than flattening the
+        # newcomers.
+        takes = []
+        for uid, name, size in defenders:
+            amount = int(float(size) * loot_ratio)
+            if amount > 0:
+                takes.append((uid, name, amount))
+        loot = sum(a for _u, _n, a in takes)
+        if loot <= 0:
+            return (False, 'nothing_to_take')
+
+        # Equal on the way in: the spoils are shared by everyone who was in the fight,
+        # not weighted toward whoever was already winning.
+        per_head = loot // len(attackers)
+        remainder = loot - per_head * len(attackers)
+        gains = []
+        for i, (uid, name, _size) in enumerate(attackers):
+            amount = per_head + (1 if i < remainder else 0)
+            if amount > 0:
+                gains.append((uid, name, amount))
+        if sum(a for _u, _n, a in gains) != loot:
+            raise AssertionError('group war would not conserve size - refusing to commit')
+
+        for uid, _name, amount in takes:
+            c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                      (amount, uid, defender_chat))
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s, %s, %s, %s, %s, %s)',
+                      (defender_chat, uid, -amount, c.fetchone()[0], 'war_loss',
+                       f'غارت توسط گروه {attacker_chat}'))
+        for uid, _name, amount in gains:
+            c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                      (amount, uid, attacker_chat))
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s, %s, %s, %s, %s, %s)',
+                      (attacker_chat, uid, amount, c.fetchone()[0], 'war_loot',
+                       f'غنیمت از گروه {defender_chat}'))
+
+        c.execute('INSERT INTO group_wars (war_date, attacker_chat, defender_chat, loot, '
+                  'attackers, defenders) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id',
+                  (war_date, attacker_chat, defender_chat, loot, len(gains), len(takes)))
+        war_id = c.fetchone()[0]
+        return (True, {'war_id': war_id, 'loot': loot, 'takes': takes, 'gains': gains})
+
+
+def get_recent_wars(limit=10):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT war_date, attacker_chat, defender_chat, loot, attackers, defenders '
+                  'FROM group_wars ORDER BY id DESC LIMIT %s', (limit,))
+        return c.fetchall()
 
 
 # ---------------------------------------------------------------- economy

@@ -2347,6 +2347,17 @@ THEFT_MIN_RATIO, THEFT_MAX_RATIO = 0.05, 0.15
 THEFT_LUCKY_PERK_BONUS = 0.10
 
 BOSS_SPAWN_HOUR = 20  # Tehran
+
+# Inter-group war: once a day, two eligible groups are drawn at random and one raids the
+# other. Strictly zero-sum globally - what leaves the defenders arrives on the attackers
+# in the same transaction - but deliberately NOT zero-sum per group, since the whole
+# point is that one league gets richer and the other poorer, and tick_inflation then
+# prices each of them accordingly.
+WAR_HOUR = 18                 # Tehran, well clear of the midnight settlement block
+WAR_LOOT_RATIO = 0.05         # of each active defender's wallet
+WAR_ACTIVE_DAYS = 3           # only people who actually played recently fight or pay
+WAR_MIN_PLAYERS = 3           # a group needs a real roster on both sides of a raid
+WAR_MIN_GROUP_AGE_DAYS = 7    # ...and to have existed long enough to be a real league
 # HP per active player has to sit well under the *average* damage one player deals
 # (randint(8,30) + streak up to 10, so 19-29), not near the maximum. At 40 the boss
 # needed every player to roll their theoretical best just to break even and was
@@ -4856,6 +4867,137 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"{item_name} خریدی! 🛍️\nموجودی جدید: {int(size)} سانت", show_alert=True)
 
 
+def war_eligible_groups():
+    """Groups that may take part in a raid, attacking or defending.
+
+    A raid is the only thing in the game that moves size between leagues, so a group has
+    to be a real one before its players can win or lose other people's size. The bar is
+    deliberately lower than the cross-group transfer gate's: nobody *chooses* the pairing
+    here, so the farm-group exploit that gate exists to stop doesn't apply - and the two
+    features guard each other anyway, since size raided into a fake group is stuck there,
+    the transfer gate refusing to let it out.
+
+    The owner's per-group verdict still wins in both directions, same flag the transfer
+    gate reads: 'blocked' opts a group out entirely, 'trusted' opts it in regardless."""
+    eligible = []
+    for chat_id in db.get_all_chats():
+        try:
+            stats = db.get_xfer_source_stats(chat_id, 0, db.XFER_SOURCE_WINDOW_DAYS)
+            if stats['policy'] == 'blocked':
+                continue
+            roster = db.count_war_roster(chat_id, WAR_ACTIVE_DAYS)
+            if roster < WAR_MIN_PLAYERS:
+                continue
+            if stats['policy'] != 'trusted':
+                if stats['age_days'] < WAR_MIN_GROUP_AGE_DAYS:
+                    continue
+            eligible.append(chat_id)
+        except Exception:
+            logging.exception(f"war eligibility check failed for {chat_id}")
+    return eligible
+
+
+async def stage_group_war(context: ContextTypes.DEFAULT_TYPE, today_str):
+    """Picks a random attacker/defender pair and runs the raid. Returns True if one
+    actually happened.
+
+    The day is claimed *before* anything moves and handed back if the raid can't be
+    staged, so a day is never silently burned by a pairing that turned out to be empty."""
+    if not db.claim_war_day(today_str):
+        return False
+    try:
+        eligible = war_eligible_groups()
+        if len(eligible) < 2:
+            logging.info(f"group war skipped: only {len(eligible)} eligible group(s)")
+            db.release_war_day()
+            return False
+
+        attacker, defender = random.sample(eligible, 2)
+        ok, detail = db.execute_group_war(
+            today_str, attacker, defender, WAR_LOOT_RATIO, WAR_ACTIVE_DAYS,
+            exclude_user_ids=(BOT_USER_ID,)
+        )
+        if not ok:
+            logging.info(f"group war {attacker} -> {defender} not staged: {detail}")
+            db.release_war_day()
+            return False
+    except Exception:
+        # Nothing was committed if execute_group_war raised, so the day has to go back
+        # or the bot silently skips wars until tomorrow.
+        db.release_war_day()
+        raise
+
+    async def _title(chat_id):
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            if chat.title:
+                return chat.title[:40]
+        except Exception:
+            pass
+        return f"گروه {chat_id}"
+
+    a_title, d_title = await _title(attacker), await _title(defender)
+    loot = int(detail['loot'])
+
+    win_lines = [f"⚔️🏴 <b>جنگ بین‌گروهی!</b>\n",
+                 f"گروه ما به <b>{_esc(d_title)}</b> شبیخون زد و <b>{loot}</b> سانت غارت کرد!\n",
+                 f"🎁 غنیمت بین {len(detail['gains'])} نفر از رزمنده‌های ما تقسیم شد:"]
+    for _uid, name, amount in detail['gains'][:10]:
+        win_lines.append(f"   • {_esc(name)}: +{int(amount)}")
+    if len(detail['gains']) > 10:
+        win_lines.append(f"   • و {len(detail['gains']) - 10} نفر دیگه")
+
+    lose_lines = [f"🚨🏴 <b>بهمون حمله شد!</b>\n",
+                  f"گروه <b>{_esc(a_title)}</b> بهمون شبیخون زد و <b>{loot}</b> سانت برد!\n",
+                  f"💔 از {len(detail['takes'])} نفرمون کم شد:"]
+    for _uid, name, amount in detail['takes'][:10]:
+        lose_lines.append(f"   • {_esc(name)}: −{int(amount)}")
+    if len(detail['takes']) > 10:
+        lose_lines.append(f"   • و {len(detail['takes']) - 10} نفر دیگه")
+    lose_lines.append("\n🏦 سپردهٔ بانکی کسی دست نخورد — پول تو بانک از جنگ هم در امانه.")
+
+    for chat_id, lines in ((attacker, win_lines), (defender, lose_lines)):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="\n".join(lines),
+                                           parse_mode="HTML")
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except Exception:
+            logging.exception(f"failed to announce the group war to {chat_id}")
+
+    # Both leagues just changed shape, so the crown may have moved in either of them.
+    for chat_id in (attacker, defender):
+        try:
+            _, new_king = refresh_king(chat_id)
+            if new_king:
+                await announce_coronation(context, chat_id, new_king, None)
+        except Exception:
+            logging.exception(f"post-war coronation check failed for {chat_id}")
+
+    logging.info(f"group war: {attacker} raided {defender} for {loot}")
+    return True
+
+
+async def group_war_job(context: ContextTypes.DEFAULT_TYPE):
+    await stage_group_war(context, tehran_today_str())
+
+
+async def recover_group_war(context: ContextTypes.DEFAULT_TYPE):
+    """Startup catch-up, same shape as recover_decree_offer: run_daily only fires at its
+    appointed minute, so a bot that was down or freshly deployed past it would skip the
+    day's war entirely.
+
+    It also fires regardless of the hour when no war has *ever* happened, so the very
+    first deploy holds the opening raid immediately instead of waiting for tomorrow."""
+    now = datetime.datetime.now(IRAN_TZ)
+    if now.hour < WAR_HOUR and db.has_any_war_happened():
+        return
+    try:
+        await stage_group_war(context, tehran_today_str())
+    except Exception:
+        logging.exception("group war recovery failed")
+
+
 async def spawn_daily_bosses(context: ContextTypes.DEFAULT_TYPE):
     """Drops one boss per active group each evening. Co-op, unlike everything else in
     this game: the whole group chips damage in and shares the reward if it dies."""
@@ -5324,6 +5466,7 @@ if __name__ == '__main__':
 
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
+    app.job_queue.run_daily(group_war_job, time=time(hour=WAR_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(decree_offer_job, time=time(hour=DECREE_OFFER_HOUR, minute=DECREE_OFFER_MINUTE, second=0, tzinfo=IRAN_TZ))
     # 00:20 Tehran: after midnight_tasks has settled the lottery, expired bosses and
     # collected the crown's tax, so the handicap reads a closed, complete day.
@@ -5337,6 +5480,7 @@ if __name__ == '__main__':
     app.job_queue.run_once(recover_pending_lotteries, when=9)
     app.job_queue.run_once(recover_decree_offer, when=12)
     app.job_queue.run_once(recover_stuck_heist_attempts, when=14)
+    app.job_queue.run_once(recover_group_war, when=16)
 
     app.add_error_handler(on_error)
 

@@ -277,6 +277,46 @@ is the dial — drop it below 2.0 to give the house a rake.
 
 A tie still voids the book and refunds every stake, unchanged: nothing was decided.
 
+## Inter-group war is the only thing that moves size between leagues
+
+Once a day (`WAR_HOUR`, with `recover_group_war` as the startup catch-up) two eligible
+groups are drawn at random and one raids the other: `WAR_LOOT_RATIO` of each recently
+active defender's **wallet**, shared equally among the raiding group's active players.
+
+**It is zero-sum globally, but deliberately not per group.** Every centimetre taken off
+a defender lands on an attacker inside the same `db.execute_group_war` transaction — the
+function recomputes both sides and refuses to commit if they don't balance, because a
+raid that silently minted into one league and burned another would be the worst bug this
+feature could have. But the raided group's money supply really does shrink and the
+raider's really does grow, so `tick_inflation` gives the loser cheaper prices and the
+winner dearer ones that same night. That is the intended consequence, not a leak.
+
+Taken proportionally, shared equally: the biggest wallets in the losing group pay the
+most, and the spoils are split per head rather than weighted toward whoever was already
+winning. **Deposits are untouched** — the bank stays safe from a raid exactly as it is
+from `/dozdi`, which is the trade that feature sells; only a heist ever reaches deposits.
+
+`war_eligible_groups()` keeps fake groups out of it: `WAR_MIN_PLAYERS` recently-active
+players and `WAR_MIN_GROUP_AGE_DAYS`, with `chats.xfer_policy` honoured in both
+directions ('blocked' opts a group out, 'trusted' opts it in). The bar is deliberately
+lower than the cross-group transfer gate's because nobody *chooses* the pairing here, so
+the farm-group exploit that gate exists to stop doesn't apply — and the two features
+guard each other anyway: size raided into a fake group is stuck there, because the
+transfer gate won't let it out.
+
+Two ordering details worth keeping:
+
+- The day is claimed (`db.claim_war_day`, one war per day for the whole bot, atomic via
+  `bot_meta`) **before** anything moves, and `db.release_war_day` hands it back when the
+  raid can't actually be staged — no eligible pair, an empty defender, or an exception.
+  Without that, one bad draw silently burns the whole day.
+- Both groups' crowns are re-checked afterwards, since a raid moves enough size to
+  change who is biggest on either side.
+
+War gains and losses are logged as `war_loot` / `war_loss` and are deliberately **not**
+excluded from `get_recent_net_by_user`: unlike a bank or loan transfer, they are real
+income and real loss, so the nightly handicap should see them.
+
 ## Loans split principal from interest in the ledger
 
 `loans` covers both lenders: `lender_id IS NULL` is the treasury-funded `/vam`, anything
@@ -738,8 +778,9 @@ the same target, or a fresh account being fed by an established one):
 
 Growth, boss rewards and the viagra-rain/treasure events *create* size; the shop, the
 lottery burn (`LOTTERY_BURN_RATIO`) and the earthquake event *destroy* it. Everything
-else (tax, theft, betrayal, challenges, donations) only moves it between players and
-must stay exactly zero-sum. When adding a feature, be explicit about which of the three
+else (tax, theft, betrayal, challenges, donations, inter-group war) only moves it between
+players and must stay exactly zero-sum — note that war is the one case where "between
+players" spans two groups, so it conserves globally rather than per group. When adding a feature, be explicit about which of the three
 it is — the economy inflated badly once because every mechanic was a source.
 
 The spectator book is the one mechanic that can be *either*, depending on how the round
