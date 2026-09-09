@@ -319,6 +319,24 @@ BOT_USER_ID = int(TOKEN.split(':')[0])
 
 BET_AMOUNTS = [5, 10, 50, 100]
 
+# A correct spectator guess ALWAYS pays this multiple of the stake, whether or not
+# anyone backed the other side. The book used to be parimutuel - winners split only what
+# the losers staked - which meant the normal case (everyone piling on the same player)
+# paid a correct guess nothing but their own stake back. Guessing right and winning
+# nothing is not a bet, so the group is now the counterparty of last resort.
+#
+# The payout is funded in this order: the losing side's forfeited stakes, then the
+# treasury, and only what is left over is minted. Any surplus (losers staked more than
+# the winners are owed) goes the other way, into the treasury - which is what keeps the
+# house bankroll topped up to pay the next one-sided book.
+#
+# Note this is NOT a printer in expectation: a one-sided book on a coin flip mints the
+# whole stake half the time and swallows the whole stake the other half. What it does
+# cost the house is the edge an informed bettor gets from backing a perk-advantaged
+# player, and BET_PAYOUT_MULT is the dial for that - drop it below 2.0 to give the house
+# a rake.
+BET_PAYOUT_MULT = 2.0
+
 
 def sign_payload(payload):
     """Short HMAC tag over a callback_data payload. Telegram's callback_data is
@@ -1718,46 +1736,54 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         msg += f"\n📉 {l_dname} {loser_name} شد {int(loser_size)} سانتی‌متر!"
 
         if bets:
-            # Bettors already had their stake deducted the moment they placed the bet (see
-            # place_bet_callback), so a correct guess pays back double the stake (stake + winnings)
-            # and a wrong guess pays back nothing - the staked amount is simply gone.
-            # Parimutuel, not a fixed 2x. The old flat double paid every correct
-            # guess out of nothing: with all the spectators on the same side - the
-            # normal case, since people back the obvious favourite - the book had no
-            # losing stakes to pay from and simply minted the difference. Winners now
-            # split exactly what the losers staked, pro rata, so the book always
-            # settles to zero no matter how one-sided it is.
+            # Bettors already had their stake deducted the moment they placed the bet
+            # (see place_bet_callback). A correct guess is paid BET_PAYOUT_MULT x their
+            # stake no matter what the rest of the book looks like - the group itself is
+            # the counterparty of last resort, so nobody ever "wins" and gets only their
+            # own size handed back. A wrong guess forfeits the stake.
             correct_side = "win" if winner_id == challenger_id else "lose"
             winning_bets = {uid: v for uid, v in bets.items() if v[0] == correct_side}
-            losing_pool = sum(a for s, a, _ in bets.values() if s != correct_side)
-            winning_stake = sum(a for _, a, _ in winning_bets.values())
+            losing_pool = int(sum(a for s, a, _ in bets.values() if s != correct_side))
 
             msg += "\n\n🎰 نتیجهٔ شرط‌بندی‌ها:"
             if not winning_bets:
-                # Nobody backed the winner, so there is no one to pay the pool to.
-                # Void the book and hand every stake back rather than quietly
-                # destroying it - the same rule the tie branch above already follows,
-                # and what a real parimutuel does when no ticket picks the winner.
-                for uid, (_side, amount, bettor_name) in bets.items():
-                    db.update_size(uid, chat_id, amount)
-                msg += "\n↩️ هیچ‌کس برنده رو درست حدس نزده بود، پس شرط‌ها باطل شد و سانت همه برگشت."
-            if winning_bets:
-                # Integer split with the rounding remainder handed to the largest
-                # stake, so the pool is distributed exactly and never over-paid.
-                shares = {}
-                for uid, (_side, amount, _n) in winning_bets.items():
-                    shares[uid] = int(losing_pool * amount / winning_stake) if winning_stake else 0
-                remainder = losing_pool - sum(shares.values())
-                if remainder > 0 and shares:
-                    top = max(shares, key=lambda u: winning_bets[u][1])
-                    shares[top] += remainder
+                # Nobody backed the winner: there is no one to pay, so the forfeited
+                # stakes go to the treasury. That is the house *winning* a round, and
+                # it is what funds the one-sided books it has to pay out on.
+                if losing_pool > 0:
+                    db.treasury_add(chat_id, losing_pool, note="شرط‌بندی چالش")
+                msg += (f"\n🏛 هیچ‌کس برنده رو درست حدس نزد — {losing_pool} سانت "
+                        f"شرط‌ها رفت تو خزانهٔ گروه.")
+            else:
+                # Everyone who called it right is owed the same flat multiple. Pay the
+                # winners first, then work out where the money came from.
+                owed = {uid: int(amount * BET_PAYOUT_MULT)
+                        for uid, (_side, amount, _n) in winning_bets.items()}
+                winnings_total = sum(owed[uid] - int(winning_bets[uid][1]) for uid in owed)
+
+                # Funded losers-first, then the treasury, and only the remainder is
+                # conjured. Booked before paying anyone so the treasury can't be
+                # double-spent by a concurrent settlement.
+                from_losers = min(winnings_total, losing_pool)
+                shortfall = winnings_total - from_losers
+                from_treasury = int(db.treasury_take_up_to(
+                    chat_id, shortfall, note="پرداخت شرط‌بندی چالش")) if shortfall > 0 else 0
+                minted = shortfall - from_treasury
+                surplus = losing_pool - from_losers
+                if surplus > 0:
+                    db.treasury_add(chat_id, surplus, note="شرط‌بندی چالش")
+
                 for uid, (_side, amount, bettor_name) in winning_bets.items():
-                    profit = shares.get(uid, 0)
-                    db.update_size(uid, chat_id, amount + profit)
-                    if profit > 0:
-                        msg += f"\n✅ {bettor_name}: {int(amount)} گذاشت و {int(amount + profit)} گرفت (سود {int(profit)})"
-                    else:
-                        msg += f"\n➖ {bettor_name}: درست حدس زد ولی کسی مقابلش شرط نبسته بود؛ {int(amount)} سانتش برگشت"
+                    payout = owed[uid]
+                    db.update_size(uid, chat_id, payout)
+                    msg += (f"\n✅ {bettor_name}: {int(amount)} گذاشت و {int(payout)} گرفت "
+                            f"(سود {int(payout - amount)})")
+                if minted > 0:
+                    msg += f"\n🪄 {int(minted)} سانت از این جایزه‌ها رو خود ربات از هوا ساخت."
+                elif from_treasury > 0:
+                    msg += f"\n🏛 {int(from_treasury)} سانتش از خزانهٔ گروه پرداخت شد."
+                if surplus > 0:
+                    msg += f"\n🏛 {int(surplus)} سانت اضافه از شرط بازنده‌ها رفت تو خزانه."
             for uid, (side, amount, bettor_name) in bets.items():
                 if side != correct_side:
                     msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"

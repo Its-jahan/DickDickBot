@@ -2107,6 +2107,32 @@ def treasury_add(chat_id, amount, note=None):
         _bank_log(c, chat_id, None, 'treasury_in', amount, row[0], note)
 
 
+def treasury_take_up_to(chat_id, amount, note=None):
+    """Draws up to `amount` out of the treasury, never past zero, and returns how much
+    it actually got. The caller decides what to do about the shortfall.
+
+    This is the house bankroll being spent, as opposed to pay_interest which scales
+    everyone down to fit what's there - a bet payout is owed to one named player in full,
+    so the choice is 'treasury pays what it can, the rest is minted' rather than
+    'everybody gets a haircut'."""
+    if amount <= 0:
+        return 0.0
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO bank_treasury (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
+                  (chat_id,))
+        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
+                  (chat_id,))
+        available = float(c.fetchone()[0] or 0.0)
+        take = min(float(amount), max(0.0, available))
+        if take <= 0:
+            return 0.0
+        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
+                  'WHERE chat_id = %s RETURNING balance', (take, chat_id))
+        _bank_log(c, chat_id, None, 'treasury_out', -take, c.fetchone()[0], note)
+        return take
+
+
 def get_treasury(chat_id):
     with get_connection() as conn:
         c = conn.cursor()

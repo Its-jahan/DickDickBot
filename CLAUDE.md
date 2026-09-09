@@ -246,6 +246,37 @@ walk himself out. `db.pardon_heist_prisoner` returns whether a live sentence act
 existed, so the command can tell "pardoned" apart from "this player wasn't serving
 anything" instead of silently claiming success.
 
+## The spectator book has a house, and the treasury is its bankroll
+
+A correct spectator guess pays `BET_PAYOUT_MULT` × the stake, **whether or not anybody
+backed the other side**. The parimutuel version that came before was arithmetically
+tidy and unplayable: since spectators overwhelmingly pile onto the same player, the
+usual outcome was "you called it right, here's your own size back".
+
+The payout is funded in a strict order, and the order is the whole design:
+
+1. **The losing side's forfeited stakes.** A balanced book never touches anything else.
+2. **The treasury** (`db.treasury_take_up_to`, which draws at most what's there and
+   reports how much it actually got).
+3. **A mint**, for whatever is still short.
+
+Money flows the other way too, which is what makes the house solvent rather than a
+permanent drain: surplus (losers staked more than the winners are owed) goes into the
+treasury, and when *nobody* picks the winner the entire losing pool does. So the house
+wins rounds as well as losing them.
+
+**What this does and doesn't cost.** While the treasury can cover the winnings, a
+one-sided book changes the money supply by exactly zero — it pays out of the house on a
+win and refills the house on a loss, and there is a regression test asserting precisely
+that (`test_spectator_book.py`). Minting only happens when the house is momentarily
+broke, so the drift is the "reflecting barrier at zero" of a roughly symmetric walk —
+sub-linear, not the `+stake/2` per bet a naive flat payout would cost. Two real costs
+remain, and both are deliberate: an informed bettor backing a perk-advantaged player has
+a genuine edge, and a long unlucky streak against an empty treasury mints. `BET_PAYOUT_MULT`
+is the dial — drop it below 2.0 to give the house a rake.
+
+A tie still voids the book and refunds every stake, unchanged: nothing was decided.
+
 ## Duelling the bot (`/cbot`) mints — and the burn on the other side is what makes it safe
 
 Players kept creating `/c` challenges nobody would accept, so `/cbot` lets them duel the
@@ -642,11 +673,12 @@ the recent ones with before/after values.
 
 Three separate leaks were fixed here, and all three are easy to reintroduce:
 
-- **The spectator book is parimutuel, not a fixed 2×.** Winners split exactly what the
-  losers staked, pro rata (remainder to the largest stake). A flat double payout mints
-  size whenever the book is one-sided, which is the normal case — everyone backs the
-  favourite. If *nobody* picks the winner the book is voided and every stake refunded,
-  the same rule the tie branch follows.
+- **The spectator book pays a flat `BET_PAYOUT_MULT`, with the house as counterparty.**
+  It used to be parimutuel — winners split only what the losers staked — which meant the
+  normal case (everyone piling onto the same player) paid a correct guess nothing but
+  their own stake back. Guessing right and winning nothing is not a bet, so the group is
+  now the counterparty of last resort. See "The spectator book has a house" below for
+  the funding order and what it does and doesn't cost.
 - **Perks that shield a loser must shrink the winner's take to match** (`لاشی`,
   `کاندوم`) *and* perks that shrink the winner's take must shrink the loser's loss to
   match (`جاکش`) — otherwise the difference is silently destroyed, which is just as
