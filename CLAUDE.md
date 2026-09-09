@@ -326,13 +326,57 @@ job. If the claimed slot then fails to be paid for (insufficient funds, or the i
 insert somehow throws), `db.release_shop_purchase` hands it back, mirroring the
 escrow-claim/release pattern already used for `DOSE_LIMITED_ITEMS`.
 
-## Cross-group transfer is an owner-controlled switch, not a fixed feature
+## Cross-group transfer: a fee can't stop farming, so the source group is gated
 
 `/enteghal` lets a player move their own size between groups they played in, minus a fee.
 It was shut down once already: the 30% fee wasn't enough friction, and players were
 leaving to build a size in a low-friction side group they controlled (no real PvP, no
 theft, no consensus votes shrinking them) and importing most of it back, which let them
 skip this group's economy rather than just discount it.
+
+**Raising the fee cannot fix this, and it is worth understanding why before touching any
+of it.** A farm group's cost of production is essentially zero — the farmer is
+automatically king there, nobody steals from them, nobody challenges them, no `/ejma`
+shrinks them — so it prints size at whatever rate they can be bothered to type `/d`. Any
+fee below 100% therefore still leaves farming profitable, and every increase falls
+hardest on the honest players who earned their size in a real league. Price was never the
+lever.
+
+So the gate is structural: **size may only leave a group that has proved it is a real
+league.** `bot.check_xfer_source` judges the SOURCE group against
+`db.get_xfer_source_stats`, and a farm fails several of the tests at once, deliberately —
+beating one is not enough:
+
+- **Age** (`XFER_MIN_SOURCE_AGE_DAYS`) — from the group's oldest `users.joined_at`.
+- **Active players** (`XFER_MIN_SOURCE_PLAYERS`) — distinct players who grew inside
+  `XFER_SOURCE_WINDOW_DAYS`.
+- **Real competition** (`XFER_MIN_SOURCE_MATCHES` resolved `pvp_matches` among at least
+  `XFER_MIN_SOURCE_MATCH_PLAYERS` distinct people) — five challenges between the same two
+  alt accounts is not a league, which is why the distinct-participant count is separate
+  from the match count.
+- **Not owned outright** (`XFER_MAX_SOURCE_SHARE`) — the exporter's share of every
+  centimetre in the group, **wallets plus bank deposits**. Counting only wallets would let
+  someone park the hoard in the bank and look like a modest member of a group they own.
+- **Tenure** (`XFER_MIN_TENURE_DAYS`) — so nobody parachutes into a real group to carry
+  money out of it.
+
+These thresholds live in `db.py`, not with the rest of the game balance in `bot.py`, for
+one specific reason: `admin_panel.py` shows the owner the same numbers the bot enforces
+and deliberately never imports `bot.py`. Two copies of a threshold is the drift bug this
+codebase has been bitten by before — keep exactly one.
+
+**The owner's verdict overrides the numbers in both directions.** `chats.xfer_policy` is
+`'auto'` (judge on the stats), `'trusted'` (always allowed) or `'blocked'` (never),
+settable per group from the panel's group page, which also displays the stats so the
+decision isn't taken on faith. This exists because the automatic test is a heuristic:
+someone patient enough, with enough alt accounts, could eventually dress a farm up to
+pass it, and a farm spotted by eye should be killable in one click rather than in a
+deploy.
+
+`check_xfer_source` is re-checked in `transfer_callback` as well as `transfer_cmd`, for
+the same reason `is_xfer_enabled` is: a button can be sitting in an old message from
+before the owner blocked the group, or from before the group's own numbers fell below the
+bar.
 
 Rather than a code change, whether it's open at all and what it charges are now both
 runtime state in `bot_meta` (`db.is_xfer_enabled()` / `db.get_xfer_fee_ratio()`,
@@ -344,10 +388,13 @@ message from before the owner flipped it off. Cooldown (24h) and the minimum amo
 
 The underlying `get_user_groups`/`try_start_xfer`/`cross_group_transfer` functions in
 `db.py`, and the `users.last_xfer_at` column and `xfer_principal`/`xfer_fee` `size_log`
-source tags, are unconditional - the toggle only gates the two `bot.py` handlers. If the
-fee is ever lowered again, remember the abuse pattern was about side-group friction, not
-price; a cheap fee alone doesn't stop someone farming size somewhere with no downside
-risk.
+source tags, are unconditional - the toggle only gates the two `bot.py` handlers.
+
+The feature was reopened by a one-shot `init_db` migration guarded by the `bot_meta` key
+`xfer_reopened_with_source_gate`, following the usual pattern. The guard is what matters:
+`init_db()` runs on every startup, so an unguarded write would reopen transfer behind the
+owner's back every time the bot restarted, no matter how many times they closed it from
+the panel.
 
 ## One-time data migrations go in `init_db`, guarded by `bot_meta`
 

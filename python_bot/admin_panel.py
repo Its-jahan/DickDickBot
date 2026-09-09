@@ -387,6 +387,10 @@ def group(chat_id):
         "borrower_name": r[4], "principal": r[5], "rate": r[6], "due_amount": r[7],
         "accepted_at": r[8], "due_at": r[9],
     } for r in db.admin_list_active_loans(chat_id)]
+    # Shown so the owner can see *why* a group does or doesn't pass the automatic test
+    # before overriding it, rather than having to take the verdict on faith. user_id=0
+    # asks for the group's own facts; the per-player fields aren't used here.
+    xfer = db.get_xfer_source_stats(chat_id, 0, db.XFER_SOURCE_WINDOW_DAYS)
     return page(f"گروه {chat_id}", """
 <h1>گروه {{ chat_id }}</h1>
 <div class="card"><div class="tablewrap"><table>
@@ -444,6 +448,32 @@ def group(chat_id):
 {% else %}<span class="dim">هیچ بدهی فعالی در این گروه نیست.</span>{% endif %}
 </div>
 
+<h2>🔁 انتقال سایز از این گروه</h2>
+<div class="card">
+  <div class="grid" style="margin-bottom:12px">
+    <div class="stat"><b>{{ xfer.age_days|int }}</b><span>روز عمر گروه (حداقل {{ xfer_min.age }})</span></div>
+    <div class="stat"><b>{{ xfer.active_players }}</b><span>بازیکن فعال (حداقل {{ xfer_min.players }})</span></div>
+    <div class="stat"><b>{{ xfer.matches }}</b><span>چالش اخیر (حداقل {{ xfer_min.matches }})</span></div>
+    <div class="stat"><b>{{ xfer.match_players }}</b><span>رقیب متمایز (حداقل {{ xfer_min.match_players }})</span></div>
+  </div>
+  <p class="dim">
+    وضعیت فعلی:
+    {% if xfer.policy == 'trusted' %}<b>✅ تأییدشده — انتقال همیشه باز</b>
+    {% elif xfer.policy == 'blocked' %}<b>🚫 مسدود — انتقال هرگز</b>
+    {% else %}<b>⚙️ خودکار</b> (بر اساس همین اعداد سنجیده می‌شود){% endif %}
+  </p>
+  <form class="inline" method="post" action="{{ url_for('save_xfer_policy', chat_id=chat_id) }}">
+    <button name="policy" value="auto" class="ghost">⚙️ خودکار</button>
+    <button name="policy" value="trusted">✅ تأیید گروه</button>
+    <button name="policy" value="blocked" class="danger">🚫 مسدود کردن</button>
+  </form>
+  <div class="dim" style="margin-top:10px">
+    این تنظیم فقط روی <b>خارج‌شدن</b> سایز از این گروه اثر دارد. هدفش جلوگیری از این است که
+    کسی یک گروه الکی بسازد، آنجا سایزش را پروار کند و بیاورد داخل گروه اصلی — چون آنجا نه
+    دزدی هست، نه چالش، نه اجماع، پس هیچ کارمزدی هم جلویش را نمی‌گیرد.
+  </div>
+</div>
+
 <h2>🎟️ لاتاری امروز</h2>
 <div class="card">
   <div class="grid" style="margin-bottom:12px">
@@ -487,7 +517,13 @@ def group(chat_id):
 
 <p><a class="link" href="{{ url_for('ledger', chat_id=chat_id) }}">📜 لاگ تراکنش این گروه</a></p>
 """, chat_id=chat_id, players=players, protections=db.get_consensus_protections(chat_id),
-        lot_tickets=lot_tickets, lot_prize=lot_prize, lot_entries=lot_entries, loans=loans)
+        lot_tickets=lot_tickets, lot_prize=lot_prize, lot_entries=lot_entries, loans=loans,
+        xfer=xfer, xfer_min={
+            "age": db.XFER_MIN_SOURCE_AGE_DAYS,
+            "players": db.XFER_MIN_SOURCE_PLAYERS,
+            "matches": db.XFER_MIN_SOURCE_MATCHES,
+            "match_players": db.XFER_MIN_SOURCE_MATCH_PLAYERS,
+        })
 
 
 @app.route("/group/<int(signed=True):chat_id>/player/<int:user_id>")
@@ -685,6 +721,28 @@ def adjust_loan(chat_id, loan_id):
         flash(f"مبلغ بدهی به {int(new_amount)} تغییر کرد.")
     else:
         flash("این وام فعال نیست یا پیدا نشد.", "error")
+    return redirect(url_for("group", chat_id=chat_id))
+
+
+@app.route("/group/<int(signed=True):chat_id>/xfer-policy", methods=["POST"])
+@login_required
+def save_xfer_policy(chat_id):
+    """The owner's manual verdict on whether size may leave this group.
+
+    The automatic test (bot.check_xfer_source) is what stops the farm-group exploit at
+    scale, but it is a heuristic, and someone patient enough with enough alt accounts
+    could dress a farm up to pass it. This is the override for both directions: kill a
+    farm the moment it's spotted, or vouch for a real group that happens to be small."""
+    policy = request.form.get("policy", "auto")
+    if policy not in db.XFER_POLICIES:
+        flash("وضعیت نامعتبر است.", "error")
+        return redirect(url_for("group", chat_id=chat_id))
+    db.set_chat_xfer_policy(chat_id, policy)
+    flash({
+        "auto": "انتقال از این گروه به حالت خودکار برگشت.",
+        "trusted": "این گروه به‌عنوان گروه معتبر تأیید شد — انتقال ازش همیشه بازه.",
+        "blocked": "انتقال سایز از این گروه کاملاً مسدود شد.",
+    }[policy])
     return redirect(url_for("group", chat_id=chat_id))
 
 

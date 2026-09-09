@@ -165,6 +165,11 @@ def init_db():
                 chat_id BIGINT PRIMARY KEY
             )
         ''')
+        # The owner's manual verdict on whether a group may be a transfer SOURCE:
+        # 'auto' (judge it by get_xfer_source_stats), 'trusted' (always allowed) or
+        # 'blocked' (never). Heuristics can be gamed by someone patient enough with
+        # enough alt accounts, so the last word has to be a human's.
+        c.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS xfer_policy TEXT DEFAULT 'auto'")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS inventory (
@@ -539,6 +544,19 @@ def init_db():
                       "ON CONFLICT (key) DO NOTHING")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_chat_user_idx ON size_log (chat_id, user_id, created_at DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS size_log_created_idx ON size_log (created_at DESC)")
+
+        # One-time: reopen /enteghal now that a source group has to prove it is a real
+        # league before size can leave it (see get_xfer_source_stats). Guarded, because
+        # init_db runs on every startup and the owner must stay free to close it again
+        # from the panel without the next restart reopening it behind their back.
+        c.execute("SELECT value FROM bot_meta WHERE key = 'xfer_reopened_with_source_gate'")
+        if not c.fetchone():
+            c.execute('INSERT INTO bot_meta (key, value) VALUES (%s, %s) '
+                      'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+                      (XFER_ENABLED_KEY, '1'))
+            c.execute("INSERT INTO bot_meta (key, value) "
+                      "VALUES ('xfer_reopened_with_source_gate', '1') "
+                      "ON CONFLICT (key) DO NOTHING")
 
         # Permanent badges. The PK is what makes each one award-once.
         c.execute('''
@@ -2852,6 +2870,138 @@ def get_user_groups(user_id, exclude_chat_id=None):
                   'ORDER BY u.size DESC',
                   (user_id, exclude_chat_id, exclude_chat_id))
         return c.fetchall()
+
+
+XFER_POLICIES = ('auto', 'trusted', 'blocked')
+
+# What a group has to prove before size is allowed to LEAVE it, judged against
+# get_xfer_source_stats by bot.check_xfer_source.
+#
+# These live here rather than with the other game-balance constants in bot.py for one
+# reason: admin_panel.py has to show the owner the same numbers the bot enforces, and
+# the panel deliberately never imports bot.py. Two copies of a threshold is exactly the
+# drift bug this codebase has been bitten by before, so there is one copy, here.
+XFER_SOURCE_WINDOW_DAYS = 30       # the window "recently" means in all of the below
+XFER_MIN_SOURCE_AGE_DAYS = 30      # a group spun up to farm is new
+XFER_MIN_SOURCE_PLAYERS = 10       # ...and thin: real leagues have real crowds
+XFER_MIN_SOURCE_MATCHES = 5        # ...and quiet: nobody there to challenge
+XFER_MIN_SOURCE_MATCH_PLAYERS = 4  # five matches between two alts is not competition
+XFER_MAX_SOURCE_SHARE = 0.60       # ...and owned outright by the farmer
+XFER_MIN_TENURE_DAYS = 14          # and you can't parachute in to carry money out
+
+
+def get_chat_xfer_policy(chat_id):
+    """'auto' | 'trusted' | 'blocked' - the owner's manual override for this group as a
+    transfer source. 'auto' (the default, including for groups with no row yet) means
+    judge it on the numbers instead."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(xfer_policy, 'auto') FROM chats WHERE chat_id = %s",
+                  (chat_id,))
+        row = c.fetchone()
+        policy = row[0] if row else 'auto'
+        return policy if policy in XFER_POLICIES else 'auto'
+
+
+def set_chat_xfer_policy(chat_id, policy):
+    """Sets the override. Creates the chats row if the group was never tracked, so the
+    owner can pre-block a group before anyone in it has played."""
+    if policy not in XFER_POLICIES:
+        raise ValueError(f'unknown xfer policy: {policy!r}')
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO chats (chat_id, xfer_policy) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET xfer_policy = EXCLUDED.xfer_policy',
+                  (chat_id, policy))
+
+
+def get_xfer_source_stats(chat_id, user_id, window_days):
+    """The evidence a group's fitness to be a transfer SOURCE is judged on.
+
+    This exists because the farm-group exploit cannot be priced away: a group the player
+    built themselves prints size with no theft, no challenges and no consensus votes to
+    lose it to, so *any* fee under 100% leaves farming profitable. The fix has to be
+    structural - refuse to let size leave a group that isn't a real league in the first
+    place - and that means measuring the group, not the transfer.
+
+    Returns a dict of facts only; the thresholds live in bot.check_xfer_source, next to
+    the other game-balance constants.
+
+      policy         owner override ('auto' | 'trusted' | 'blocked')
+      age_days       group age, from its oldest player row
+      active_players distinct players who grew inside the window
+      matches        resolved 1v1 challenges inside the window
+      match_players  distinct people who took part in those matches
+      user_share     this player's share of every centimetre in the group (wallet+bank)
+      tenure_days    how long this player has been in this group
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+
+        c.execute("SELECT COALESCE(xfer_policy, 'auto') FROM chats WHERE chat_id = %s",
+                  (chat_id,))
+        row = c.fetchone()
+        policy = row[0] if row and row[0] in XFER_POLICIES else 'auto'
+
+        # joined_at is the only per-group timestamp every player row carries, so the
+        # oldest one is the closest thing to "when did this group start playing".
+        c.execute('SELECT EXTRACT(EPOCH FROM (NOW() - MIN(joined_at))) / 86400.0 '
+                  'FROM users WHERE chat_id = %s', (chat_id,))
+        row = c.fetchone()
+        age_days = float(row[0]) if row and row[0] is not None else 0.0
+
+        # last_grown is a 'YYYY-MM-DD' text stamp, which sorts correctly as text - and
+        # the '' default of a player who never grew sorts below every real date.
+        c.execute("SELECT COUNT(*) FROM users WHERE chat_id = %s "
+                  "  AND last_grown >= to_char(CURRENT_DATE - %s::int, 'YYYY-MM-DD')",
+                  (chat_id, window_days))
+        active_players = int(c.fetchone()[0] or 0)
+
+        c.execute("SELECT COUNT(*) FROM pvp_matches WHERE chat_id = %s "
+                  "  AND status = 'resolved' AND created_at >= NOW() - (%s || %s)::interval",
+                  (chat_id, window_days, ' days'))
+        matches = int(c.fetchone()[0] or 0)
+
+        # Distinct people on either side of those matches: five challenges between the
+        # same two alt accounts is not a competitive league.
+        c.execute("SELECT COUNT(DISTINCT p) FROM ("
+                  "  SELECT challenger_id AS p FROM pvp_matches WHERE chat_id = %s "
+                  "    AND status = 'resolved' AND created_at >= NOW() - (%s || %s)::interval "
+                  "  UNION "
+                  "  SELECT acceptor_id AS p FROM pvp_matches WHERE chat_id = %s "
+                  "    AND status = 'resolved' AND created_at >= NOW() - (%s || %s)::interval"
+                  ") t",
+                  (chat_id, window_days, ' days', chat_id, window_days, ' days'))
+        match_players = int(c.fetchone()[0] or 0)
+
+        # Wallets + deposits, because hiding the hoard in the bank must not make someone
+        # look like a modest member of a group they in fact own outright.
+        c.execute('SELECT COALESCE((SELECT SUM(size) FROM users WHERE chat_id = %s), 0) '
+                  '     + COALESCE((SELECT SUM(balance) FROM bank_accounts WHERE chat_id = %s), 0)',
+                  (chat_id, chat_id))
+        total = float(c.fetchone()[0] or 0.0)
+        c.execute('SELECT COALESCE((SELECT size FROM users WHERE user_id = %s AND chat_id = %s), 0) '
+                  '     + COALESCE((SELECT balance FROM bank_accounts WHERE user_id = %s AND chat_id = %s), 0)',
+                  (user_id, chat_id, user_id, chat_id))
+        mine = float(c.fetchone()[0] or 0.0)
+        # An empty (or net-negative) group counts as fully owned by the asker: that is
+        # the safe direction to fail, since it's exactly the shape a fresh farm has.
+        user_share = 1.0 if total <= 0 else max(0.0, min(1.0, mine / total))
+
+        c.execute('SELECT EXTRACT(EPOCH FROM (NOW() - joined_at)) / 86400.0 '
+                  'FROM users WHERE user_id = %s AND chat_id = %s', (user_id, chat_id))
+        row = c.fetchone()
+        tenure_days = float(row[0]) if row and row[0] is not None else 0.0
+
+        return {
+            'policy': policy,
+            'age_days': age_days,
+            'active_players': active_players,
+            'matches': matches,
+            'match_players': match_players,
+            'user_share': user_share,
+            'tenure_days': tenure_days,
+        }
 
 
 def try_start_xfer(user_id, chat_id, cooldown_seconds):

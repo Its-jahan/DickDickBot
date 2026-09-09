@@ -2434,6 +2434,16 @@ BANK_WITHDRAW_FEE_RATIO = 0.02
 XFER_COOLDOWN_SECONDS = 24 * 3600
 XFER_MIN_AMOUNT = 50
 
+# What a group has to prove before size is allowed to LEAVE it lives in db.py as
+# db.XFER_MIN_SOURCE_* / db.XFER_MAX_SOURCE_SHARE, not here with the rest of the game
+# balance: the admin panel has to display the very same numbers the bot enforces, and
+# the panel never imports bot.py. check_xfer_source below is where they're applied.
+#
+# The short version of why the gate exists at all: a side group the player built
+# themselves has no theft, no challenges and no consensus votes to lose size to, so it
+# prints size at zero risk and *any* fee under 100% leaves farming profitable. Charging
+# more only taxes honest players. The gate has to be structural instead.
+
 # ---------------------------------------------------------------- credit scoring
 # A borrower's score IS their borrowing limit: the cap is their size multiplied by
 # score/100, so behaviour feeds straight back into how much money they can get hold of
@@ -4480,6 +4490,60 @@ async def jesters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+def check_xfer_source(chat_id, user_id):
+    """May size leave THIS group, carried by THIS player? Returns (ok, reason).
+
+    The whole point of the feature's second life. Players were building a private side
+    group, adding the bot, farming size there with nobody to steal it or challenge them
+    for it, and importing the result - which skipped the real group's economy rather
+    than merely discounting it. A fee can't stop that (a farm's cost of production is
+    ~zero, so it beats any fee below 100%), so instead the source group has to look like
+    an actual league before anything is allowed out of it.
+
+    The owner's manual verdict wins in both directions: heuristics are beatable by
+    someone patient enough with enough alt accounts, and a farm spotted by eye should be
+    killable instantly rather than by a code change."""
+    stats = db.get_xfer_source_stats(chat_id, user_id, db.XFER_SOURCE_WINDOW_DAYS)
+    window = db.XFER_SOURCE_WINDOW_DAYS
+
+    if stats['policy'] == 'blocked':
+        return False, "🚫 انتقال سایز از این گروه بسته شده."
+    if stats['policy'] == 'trusted':
+        return True, None
+
+    if stats['age_days'] < db.XFER_MIN_SOURCE_AGE_DAYS:
+        return False, (
+            f"🕰 این گروه هنوز خیلی تازه‌ست ({int(stats['age_days'])} روز).\n"
+            f"فقط از گروهی که حداقل {db.XFER_MIN_SOURCE_AGE_DAYS} روز عمر داره می‌شه سایز خارج کرد."
+        )
+    if stats['active_players'] < db.XFER_MIN_SOURCE_PLAYERS:
+        return False, (
+            f"👥 این گروه به‌اندازهٔ کافی بازیکن فعال نداره "
+            f"({stats['active_players']} نفر تو {window} روز اخیر).\n"
+            f"برای خارج‌کردن سایز حداقل {db.XFER_MIN_SOURCE_PLAYERS} بازیکن فعال لازمه."
+        )
+    if (stats['matches'] < db.XFER_MIN_SOURCE_MATCHES
+            or stats['match_players'] < db.XFER_MIN_SOURCE_MATCH_PLAYERS):
+        return False, (
+            f"⚔️ تو این گروه رقابت واقعی جریان نداره "
+            f"({stats['matches']} چالش بین {stats['match_players']} نفر تو {window} روز اخیر).\n"
+            f"حداقل {db.XFER_MIN_SOURCE_MATCHES} چالش بین {db.XFER_MIN_SOURCE_MATCH_PLAYERS} "
+            f"نفر لازمه — گروهی که کسی توش باهات رقابت نمی‌کنه، مزرعه‌ست نه لیگ."
+        )
+    if stats['user_share'] > db.XFER_MAX_SOURCE_SHARE:
+        return False, (
+            f"🏚 {int(stats['user_share']*100)}٪ کل سایز این گروه مال خودته.\n"
+            f"وقتی یه نفر تقریباً کل اقتصاد گروه باشه، اون گروه لیگ نیست. "
+            f"سقف مجاز {int(db.XFER_MAX_SOURCE_SHARE*100)}٪ه."
+        )
+    if stats['tenure_days'] < db.XFER_MIN_TENURE_DAYS:
+        return False, (
+            f"⏳ تو فقط {int(stats['tenure_days'])} روزه عضو این گروهی.\n"
+            f"برای خارج‌کردن سایز باید حداقل {db.XFER_MIN_TENURE_DAYS} روز اینجا بازی کرده باشی."
+        )
+    return True, None
+
+
 async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/enteghal <amount>` - move your own size from this group to another one you play
     in, minus a heavy fee. Offers the destination as buttons because nobody knows their
@@ -4498,6 +4562,15 @@ async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.track_chat(chat_id)
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     fee_ratio = db.get_xfer_fee_ratio()
+
+    source_ok, source_reason = check_xfer_source(chat_id, user.id)
+    if not source_ok:
+        await update.message.reply_text(
+            f"{source_reason}\n\n"
+            f"(سایز فقط از یه گروهِ واقعی و فعال می‌تونه خارج بشه — این جلوی "
+            f"ساختن گروه الکی و پروارکردن سایز توش رو می‌گیره.)"
+        )
+        return
 
     parts = update.message.text.split()
     amount = None
@@ -4575,6 +4648,14 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # callback_data is client-supplied, so re-check membership rather than trusting it.
     if dest_chat not in [g[0] for g in db.get_user_groups(user.id, exclude_chat_id=chat_id)]:
         await query.answer("تو اون گروه بازی نمی‌کنی!", show_alert=True)
+        return
+
+    # Re-checked here as well as in transfer_cmd: the button may have been sitting in an
+    # old message since before the owner blocked this group, or before the group's own
+    # numbers fell below the bar.
+    source_ok, source_reason = check_xfer_source(chat_id, user.id)
+    if not source_ok:
+        await query.answer(source_reason, show_alert=True)
         return
 
     ok, remaining = db.try_start_xfer(user.id, chat_id, XFER_COOLDOWN_SECONDS)
