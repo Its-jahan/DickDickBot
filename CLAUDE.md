@@ -148,13 +148,46 @@ circulation and keeps `/dozdi` worth typing.
 ## The heist is a real game, not a hidden dice roll, and losing has consequences
 
 `/sarghat` used to be a single `random.random() < chance` check. It's now a genuine
-vault-cracking mini-game: `heist_cmd` shows the thief a shuffled order of all six
-`HEIST_SYMBOLS`, then `heist_reveal_flip_job` (fired `HEIST_REVEAL_SECONDS` later)
-re-shuffles the same symbols onto buttons and the thief has to tap them back in the
-memorized order before `HEIST_TOTAL_SECONDS` runs out. One wrong tap is an instant loss
-(`advance_heist_attempt` flips the row to `'lost'` right there) — there is no partial
-credit for getting most of the way through. `heist_take` itself (treasury + a slice of
-every depositor) is unchanged and still only runs on a win.
+vault-cracking mini-game, and it is deliberately tuned to be *nearly impossible* — the
+bank is supposed to be safe, and a heist is the rare exception that proves it. One wrong
+tap is an instant loss (`advance_heist_attempt` flips the row to `'lost'` right there) —
+there is no partial credit for getting most of the way through. `heist_take` itself
+(treasury + a slice of every depositor) is unchanged and still only runs on a win.
+
+### The sequence is never shown all at once — that is the anti-cheat
+
+The first version printed the whole order as one line of text. Players simply copied the
+message (or screenshotted it) and read it back, which made the "memory game" a formality.
+
+So the sequence is now revealed **one symbol at a time**: `heist_reveal_step_job` edits
+the *same* message once per symbol, each frame overwriting the last, then a deliberate
+blank frame (`HEIST_BLANK_SECONDS`) wipes the final symbol before `heist_keypad_job`
+puts the keypad up. At no instant does any message, copy-paste, or single screenshot
+contain more than one symbol of the answer. There is a regression test asserting exactly
+that: no frame — the opening message included — may contain two symbols of the pool.
+
+Three more things make guessing or half-remembering useless, and all three matter:
+
+- The sequence is drawn **with replacement** from `HEIST_SYMBOLS` (9 of them), so
+  repeats are possible. This kills the old "each symbol appears exactly once, so cross
+  them off as you go" shortcut, which had made the last few taps free.
+- **Buttons are never removed as they're used.** They can't be — a removed button would
+  make a legitimate repeat untappable. The keypad is *reshuffled* after every tap
+  instead, so nobody can pre-record positions. `callback_data` carries the symbol index,
+  never the position, which is what makes a reshuffle purely cosmetic to correctness
+  (and why a failed reshuffle edit is safe to swallow).
+- `HEIST_RECALL_SECONDS` is tight enough that reassembling the answer from screenshots
+  on a second device loses to the clock.
+
+A pure guesser is at `(1/9)^8` ≈ 1 in 43 million. The dials to retune if it ever needs
+to be easier or harder, in order of effect: `HEIST_SEQUENCE_LENGTH`,
+`HEIST_REVEAL_STEP_SECONDS`, then `HEIST_RECALL_SECONDS`.
+
+One operational note: the reveal is a chain of ~10 edits to one message in ~13 seconds.
+`heist_reveal_step_job` therefore schedules the next step **whether or not its own edit
+succeeded** — a dropped frame (flood control, a deleted message) must never stall the
+chain and leave the keypad never appearing, which would strand the attempt until the
+timeout.
 
 ### It's a persisted attempt, not in-memory state — same lesson as `pvp_matches`
 
@@ -196,6 +229,22 @@ deduct it, clear `heist_prison_until`, credit the treasury (bail is a fee like a
 other, never destroyed). It deliberately does **not** touch `heist_labor_until` — paying
 your way out buys freedom of movement, not freedom from the king's cut, which is what
 stops bail from being a strictly-dominant way to skip the whole punishment.
+
+### The king's pardon is wider than bail, and that asymmetry is the point
+
+`/afv` → `db.pardon_heist_prisoner` clears `heist_prison_until`, `heist_labor_until`
+**and** `heist_bail_amount` in one statement. It goes further than bail on purpose: the
+labor tribute would have flowed into the king's own pocket, so he is the only one
+entitled to forgive it, and forgiving it costs him real size he'd otherwise collect.
+That price is also why the power needs no cooldown — it is self-limiting in a way
+`/hokm` (which spends unrest instead) is not.
+
+Two guards, both load-bearing: only the sitting king may call it (`refresh_king`), and
+**he may never pardon himself**. A jailed player can still hold the crown — prison stops
+them growing, not being biggest — so without the self-check a jailed king would simply
+walk himself out. `db.pardon_heist_prisoner` returns whether a live sentence actually
+existed, so the command can tell "pardoned" apart from "this player wasn't serving
+anything" instead of silently claiming success.
 
 ## Loans split principal from interest in the ledger
 

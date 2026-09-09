@@ -138,8 +138,9 @@ BOT_COMMANDS = [
     ("bank", "🏦 بانک — سود روزانه و حساب امن"),
     ("variz", "📥 واریز به بانک — /variz 50"),
     ("bardasht", "🏧 برداشت از بانک — /bardasht 50"),
-    ("sarghat", "🚨 سرقت از بانک گروه (یه بازی سخته!)"),
+    ("sarghat", "🚨 سرقت از بانک گروه (تقریباً غیرممکنه!)"),
     ("vasighe", "🔓 وثیقه برای آزادی از زندان بانک"),
+    ("afv", "👑 عفو زندانی بانک (فقط پادشاه)"),
     ("nozul", "🤝 نزول دادن به یکی — /nozul @user 100 25"),
     ("vam", "🏛 وام از بانک — /vam 100"),
     ("bedehi", "📜 بدهی‌ها و طلب‌های من"),
@@ -637,7 +638,7 @@ HELP_TEXT = (
     "🏦 /bank — بانک: سود روزانه، امن از دزدی\n"
     "📥 /variz <مقدار> — واریز به بانک (سقف روزانه داره)\n"
     "🏧 /bardasht <مقدار> — برداشت از بانک\n"
-    "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه! (باید یه بازی سخت رو ببری)\n"    "🔓 /vasighe — وثیقه برای آزادی از زندان بانک\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
+    "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه! (بازیش تقریباً غیرممکنه)\n"    "🔓 /vasighe — وثیقه برای آزادی از زندان بانک\n"    "👑 /afv @کاربر — عفو زندانی بانک (فقط پادشاه)\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
     "🏛 /vam <مقدار> — وام رسمی از بانک\n"
     "📜 /bedehi — بدهی‌ها و طلب‌های من\n"
     "✅ /pardakht — تسویهٔ زودتر بدهی\n"    "🔁 /enteghal <مقدار> — انتقال به گروه دیگه (در صورت باز بودن)\n"    "📊 /etebar @کاربر — اعتبارسنجی (۵ سانت)\n"    "👑 /farman — (پادشاه) فرمان روزانه\n"
@@ -2361,17 +2362,28 @@ BANK_MIN_DEPOSIT = 5
 # can fail expensively - but it reaches the deposits themselves, so no vault is ever a
 # guaranteed hiding place. Win/loss isn't a hidden dice roll: the thief has to actually
 # crack a vault-cracking memory game under a shared deadline (see heist_cmd below).
-HEIST_COOLDOWN_SECONDS = 20 * 3600
-HEIST_MIN_VAULT = 60               # not worth cracking an empty vault
+# Succeeding is meant to be close to impossible; the bank is supposed to be safe.
+HEIST_COOLDOWN_SECONDS = 72 * 3600  # one attempt per group per three days
+HEIST_MIN_VAULT = 400              # not worth cracking anything but a genuinely fat vault
 HEIST_TREASURY_RATIO = 0.50        # of the treasury on success
 HEIST_DEPOSIT_RATIO = 0.15         # of every other depositor's balance on success
 
-# The vault-cracking mini-game: memorize a full shuffled order of every symbol, then tap
-# them back in that exact order once the keypad reshuffles. One wrong tap ends it
-# immediately - there is no partial credit, same as timing out.
-HEIST_SYMBOLS = ["🔵", "🟢", "🔴", "🟡", "🟣", "⚪"]
-HEIST_REVEAL_SECONDS = 6            # time to memorize the order before the keypad flips
-HEIST_TOTAL_SECONDS = 30            # whole game, memorizing included - matches the ask
+# The vault-cracking mini-game. The sequence is NEVER shown all at once: it is revealed
+# one symbol at a time, each frame replacing the last by editing the same message, so at
+# no instant does any message, copy-paste or single screenshot contain more than one
+# symbol of the answer. That is the whole point - the old version printed the full order
+# as one line of text, which anyone could copy or screenshot and simply read back.
+#
+# Drawn WITH replacement from a 9-symbol pool, so repeats are possible: that kills the
+# old "each symbol appears exactly once, so eliminate as you go" shortcut and makes every
+# step a genuine 1-in-9 choice for anyone who didn't actually memorize it.
+HEIST_SYMBOLS = ["🔵", "🟢", "🔴", "🟡", "🟣", "⚪", "🟠", "🟤", "⚫"]
+HEIST_SEQUENCE_LENGTH = 8           # (1/9)^8 ≈ 1 in 43 million for a pure guesser
+HEIST_REVEAL_STEP_SECONDS = 1.5     # how long each single symbol stays on screen
+HEIST_BLANK_SECONDS = 1.2           # blank beat that wipes the last symbol off the screen
+HEIST_RECALL_SECONDS = 15           # to tap all HEIST_SEQUENCE_LENGTH back, reshuffling
+HEIST_TOTAL_SECONDS = (HEIST_SEQUENCE_LENGTH * HEIST_REVEAL_STEP_SECONDS
+                       + HEIST_BLANK_SECONDS + HEIST_RECALL_SECONDS)
 
 # What a busted attempt costs: prison first (locked out of grow/challenge/theft/heist
 # entirely), then a longer stretch just paying tribute to the king out of daily growth.
@@ -3150,6 +3162,7 @@ def _heist_prison_reply(prison_until, labor_until, bail_amount, now):
             f"(بعد از آزادی هم تا {_fmt_days_hours(labor_until - now)} دیگه "
             f"{int(HEIST_LABOR_TRIBUTE_RATIO*100)}٪ از رشد روزانه‌ت می‌ره تو جیب پادشاه)"
         )
+    lines.append("👑 یا پادشاه رو راضی کن با /afv ببخشدت — اون‌جوری بدهی کارت هم پاک می‌شه.")
     return "\n".join(lines)
 
 
@@ -3204,34 +3217,35 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok, remaining = db.try_start_heist(chat_id, HEIST_COOLDOWN_SECONDS)
     if not ok:
-        hours, minutes = remaining // 3600, (remaining % 3600) // 60
+        left = _fmt_days_hours(datetime.timedelta(seconds=remaining))
         await update.message.reply_text(
-            f"🚨 بانک هنوز تو حالت آماده‌باشه!\nتا {hours} ساعت و {minutes} دقیقهٔ دیگه کسی نمی‌تونه بزنه بهش."
+            f"🚨 بانک هنوز تو حالت آماده‌باشه!\nتا {left} دیگه کسی نمی‌تونه بزنه بهش."
         )
         return
 
     would_be = vault * (HEIST_TREASURY_RATIO if treasury else HEIST_DEPOSIT_RATIO)
 
-    order = list(range(len(HEIST_SYMBOLS)))
-    random.shuffle(order)
-    sequence_str = ",".join(str(i) for i in order)
+    # Drawn with replacement on purpose - see HEIST_SYMBOLS. Repeats mean a player can't
+    # narrow the answer down by crossing off symbols they've already used.
+    sequence = [random.randrange(len(HEIST_SYMBOLS)) for _ in range(HEIST_SEQUENCE_LENGTH)]
+    sequence_str = ",".join(str(i) for i in sequence)
     attempt_id = str(uuid4())
     expires_at = now + datetime.timedelta(seconds=HEIST_TOTAL_SECONDS)
 
-    reveal_text = (
+    sent = await update.message.reply_text(
         f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
-        f"این ترتیب رو حفظ کن، چون الان دکمه‌ها قاطی می‌شن:\n\n"
-        f"{'  '.join(HEIST_SYMBOLS[i] for i in order)}\n\n"
-        f"⏳ {HEIST_REVEAL_SECONDS} ثانیه وقت داری."
+        f"الان {HEIST_SEQUENCE_LENGTH} تا نماد، یکی‌یکی و هرکدوم فقط یک لحظه نشونت می‌دم.\n"
+        f"هیچ‌وقت همه‌شون با هم رو صفحه نیستن — پس چیزی برای کپی‌کردن وجود نداره.\n\n"
+        f"👀 حاضر شو...",
+        parse_mode="HTML"
     )
-    sent = await update.message.reply_text(reveal_text, parse_mode="HTML")
 
     db.create_heist_attempt(attempt_id, chat_id, user.id, user.first_name, sequence_str,
                             would_be, chat_id, sent.message_id, expires_at)
 
     context.job_queue.run_once(
-        heist_reveal_flip_job, when=HEIST_REVEAL_SECONDS,
-        data={"attempt_id": attempt_id}, name=f"heist_flip_{attempt_id}"
+        heist_reveal_step_job, when=HEIST_REVEAL_STEP_SECONDS,
+        data={"attempt_id": attempt_id, "step": 0}, name=f"heist_reveal_{attempt_id}_0"
     )
     context.job_queue.run_once(
         heist_timeout_job, when=HEIST_TOTAL_SECONDS,
@@ -3239,10 +3253,72 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def heist_reveal_flip_job(context: ContextTypes.DEFAULT_TYPE):
-    """Flips the memorize-phase message into the shuffled, tappable keypad. Button
-    positions are re-shuffled independently of the memorize order, so remembering the
-    symbols isn't enough - the player also has to find them."""
+async def heist_reveal_step_job(context: ContextTypes.DEFAULT_TYPE):
+    """Shows exactly one symbol of the sequence, then schedules the next step.
+
+    This is the anti-cheat: the sequence only ever exists on screen one symbol at a time,
+    each frame overwriting the last, so copying the message text or grabbing a single
+    screenshot yields one symbol out of HEIST_SEQUENCE_LENGTH and nothing more.
+
+    The next step is scheduled whether or not this frame's edit succeeded - a dropped
+    frame (flood control, a deleted message) must not stall the chain and leave the
+    keypad never appearing; the attempt would then only resolve via the timeout."""
+    attempt_id = context.job.data["attempt_id"]
+    step = context.job.data["step"]
+    row = db.get_heist_attempt(attempt_id)
+    if not row:
+        return
+    (chat_id, thief_id, thief_name, sequence, progress, would_be,
+     message_chat_id, message_id, status, expires_at) = row
+    if status != 'pending':
+        return
+    symbols = [int(x) for x in sequence.split(',')]
+
+    if step < len(symbols):
+        text = (f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
+                f"نماد {step + 1} از {len(symbols)}:\n\n"
+                f"{HEIST_SYMBOLS[symbols[step]]}")
+        next_job, next_when, next_data = (
+            heist_reveal_step_job, HEIST_REVEAL_STEP_SECONDS,
+            {"attempt_id": attempt_id, "step": step + 1}
+        )
+    else:
+        # The blank beat exists to wipe the LAST symbol off the screen before the keypad
+        # appears - without it the final symbol would still be readable while tapping.
+        text = (f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
+                f"🔒 تمام! حالا همون ترتیب رو بزن...")
+        next_job, next_when, next_data = (
+            heist_keypad_job, HEIST_BLANK_SECONDS, {"attempt_id": attempt_id}
+        )
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=message_chat_id, message_id=message_id, text=text, parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Failed to show heist reveal step {step} for {attempt_id}: {e}")
+
+    context.job_queue.run_once(
+        next_job, when=next_when, data=next_data,
+        name=f"heist_reveal_{attempt_id}_{step + 1}"
+    )
+
+
+def build_heist_keypad(attempt_id):
+    """All nine symbols, shuffled. Reshuffled again after every tap, so nobody can
+    pre-record button positions - callback_data carries the symbol index, never the
+    position, which is what keeps a reshuffle purely cosmetic to correctness."""
+    display_order = list(range(len(HEIST_SYMBOLS)))
+    random.shuffle(display_order)
+    buttons = [
+        InlineKeyboardButton(HEIST_SYMBOLS[i], callback_data=f"heisttap_{attempt_id}_{i}")
+        for i in display_order
+    ]
+    return InlineKeyboardMarkup([buttons[i:i + 3] for i in range(0, len(buttons), 3)])
+
+
+async def heist_keypad_job(context: ContextTypes.DEFAULT_TYPE):
+    """Flips the finished reveal into the tappable keypad and starts the recall clock."""
     attempt_id = context.job.data["attempt_id"]
     row = db.get_heist_attempt(attempt_id)
     if not row:
@@ -3252,22 +3328,16 @@ async def heist_reveal_flip_job(context: ContextTypes.DEFAULT_TYPE):
     if status != 'pending':
         return
 
-    display_order = list(range(len(HEIST_SYMBOLS)))
-    random.shuffle(display_order)
-    buttons = [
-        InlineKeyboardButton(HEIST_SYMBOLS[i], callback_data=f"heisttap_{attempt_id}_{i}")
-        for i in display_order
-    ]
-    keyboard = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-
-    remaining = max(0, int((expires_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
+    total = len(sequence.split(','))
     try:
         await context.bot.edit_message_text(
             chat_id=message_chat_id, message_id=message_id,
+            # Deliberately no countdown in the text: the keypad is reshuffled on every
+            # tap, and a live countdown would mean a second edit per tap on top of that.
             text=(f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
-                  f"همون ترتیبی که حفظ کردی رو بزن! هر اشتباه = باخت.\n"
-                  f"⏳ {remaining} ثانیه فرصت داری."),
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard)
+                  f"هر {total} تا نماد رو به همون ترتیب بزن. یه اشتباه = باخت.\n"
+                  f"⏳ {int(HEIST_RECALL_SECONDS)} ثانیه فرصت داری."),
+            parse_mode="HTML", reply_markup=build_heist_keypad(attempt_id)
         )
     except Exception as e:
         logging.error(f"Failed to flip heist keypad for {attempt_id}: {e}")
@@ -3306,25 +3376,16 @@ async def heist_tap_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await resolve_heist_attempt(context, attempt_id, outcome='won')
         return
 
-    # 'correct' but the sequence isn't finished - remove just the tapped button and
-    # keep everything else exactly where it was, no reshuffling mid-game.
+    # 'correct' but the sequence isn't finished. Every symbol stays on the keypad -
+    # removing the tapped one would be flatly wrong now that the sequence is drawn with
+    # replacement, and it used to hand the player a free elimination hint besides.
+    # Reshuffle instead, so position memory is worth nothing from one tap to the next.
     total = len(sequence.split(','))
-    new_progress = progress + 1
-    old_markup = query.message.reply_markup
-    new_rows = [
-        [b for b in r if b.callback_data != query.data]
-        for r in (old_markup.inline_keyboard if old_markup else [])
-    ]
-    new_rows = [r for r in new_rows if r]
-    remaining = max(0, int((expires_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
-    await query.answer(f"✅ درسته! ({new_progress}/{total})")
+    await query.answer(f"✅ درسته! ({progress + 1}/{total})")
     try:
-        await query.edit_message_text(
-            text=(f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
-                  f"✅ {new_progress}/{total} درسته! ادامه بده...\n"
-                  f"⏳ {remaining} ثانیه مونده."),
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(new_rows)
-        )
+        # Only the markup changes - progress is reported through the callback toast, so a
+        # fast player never triggers a text edit per tap on top of the reshuffle.
+        await query.edit_message_reply_markup(reply_markup=build_heist_keypad(attempt_id))
     except Exception:
         pass
 
@@ -3368,7 +3429,7 @@ async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id, 
                     lines.append(f"   • {name}: −{int(amount)} سانت")
                 if len(victims) > 8:
                     lines.append(f"   • و {len(victims) - 8} نفر دیگه")
-            lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 3600} ساعت دیگه بانک آماده‌باشه‌ست)")
+            lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 86400} روز دیگه بانک آماده‌باشه‌ست)")
             text = "\n".join(lines)
         # deliver_pvp_message sends plain text (no parse_mode), so the message is built
         # without HTML tags and without _esc() - there's nothing to escape for.
@@ -3389,7 +3450,8 @@ async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id, 
         f"🚔 دزدگیر بانک زد!\n\n"
         f"{thief_name} گیر افتاد و {HEIST_PRISON_DAYS} روز میره زندان بانک "
         f"(بعدش هم تا {int(labor_days)} روز دیگه برای پادشاه کار می‌کنه).\n\n"
-        f"💰 وثیقه برای آزادی زودتر: {int(bail_amount)} سانت (/vasighe)"
+        f"💰 وثیقه برای آزادی زودتر: {int(bail_amount)} سانت (/vasighe)\n"
+        f"👑 یا پادشاه می‌تونه با /afv کلاً ببخشدش."
     )
     await deliver_pvp_message(context, message_chat_id, message_id, text)
 
@@ -3427,6 +3489,55 @@ async def heist_bail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🔓 وثیقهٔ {int(result)} سانتی پرداخت شد و از زندان بانک آزاد شدی!\n"
         f"(اگه بدهی کار برای پادشاه هنوز مونده باشه، اون هنوز سرجاشه)"
+    )
+
+
+async def heist_pardon_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/afv @username` - the king pardons a busted thief, clearing both the prison and
+    the labor debt.
+
+    Unlike bail, this wipes the labor half too: that tribute would have flowed into the
+    king's own pocket, so he is the only one entitled to forgive it, and doing so costs
+    him real size. No cooldown is needed - the price is self-limiting."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+
+    kingdom, new_king = refresh_king(chat_id)
+    if new_king:
+        await announce_coronation(context, chat_id, new_king, None)
+    if not kingdom or kingdom[0] != user.id:
+        king_name = kingdom[1] if kingdom and kingdom[1] else "کسی"
+        await update.message.reply_text(
+            f"فقط پادشاه می‌تونه زندانی بانک رو ببخشه! الان {king_name} پادشاهه 👑"
+        )
+        return
+
+    target_id, target_name = get_target_user(update, update.message.text, chat_id)
+    if not target_id:
+        await update.message.reply_text(
+            "استفاده صحیح:\n/afv @username\nیا ریپلای روی پیام شخص و تایپ /afv"
+        )
+        return
+    # A jailed player can still hold the crown (prison stops them growing, not being
+    # biggest), so without this a king could simply pardon himself out of his own prison.
+    if target_id == user.id:
+        await update.message.reply_text("خودت رو که نمی‌تونی ببخشی! 😐")
+        return
+
+    if not db.pardon_heist_prisoner(target_id, chat_id):
+        await update.message.reply_text(f"{target_name} الان نه زندانه نه بدهی کاری داره.")
+        return
+
+    await update.message.reply_text(
+        f"👑 عفو ملوکانه!\n\n"
+        f"پادشاه {user.first_name} گناه {target_name} رو بخشید — هم از زندان بانک آزاده، "
+        f"هم دیگه لازم نیست برای پادشاه کار کنه.\n"
+        f"(یعنی پادشاه از سهم خودش از رشد روزانهٔ اون گذشت 🤝)"
     )
 
 
@@ -5147,6 +5258,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(bardasht|withdraw)\b'), withdraw_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(sarghat|heist)\b'), heist_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(vasighe|bail)\b'), heist_bail_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(afv|pardon)\b'), heist_pardon_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(nozul|nozool)\b'), nozul_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(vam|loan)\b'), vam_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(bedehi|debts)\b'), debts_cmd))

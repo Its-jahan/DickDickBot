@@ -2373,6 +2373,29 @@ def pay_heist_bail(user_id, chat_id):
         return (True, bail)
 
 
+def pardon_heist_prisoner(user_id, chat_id):
+    """The king's pardon: clears prison AND the labor debt, and drops the bail owed.
+
+    Deliberately wider than bail, which only ever buys out the prison half. The labor
+    tribute is the king's *own* claim on the thief's growth, so he is the only one who
+    can waive it - and waiving it costs him real size he would otherwise have collected.
+    That is what makes a pardon a political act rather than a free favour.
+
+    Returns True only if there was actually a live sentence to lift, so the caller can
+    tell 'pardoned' apart from 'this player wasn't serving anything'."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET heist_prison_until = NULL, heist_labor_until = NULL, '
+            'heist_bail_amount = NULL '
+            'WHERE user_id = %s AND chat_id = %s '
+            '  AND (heist_prison_until > now() OR heist_labor_until > now()) '
+            'RETURNING user_id',
+            (user_id, chat_id)
+        )
+        return c.fetchone() is not None
+
+
 def get_bank_log(chat_id, limit=20):
     with get_connection() as conn:
         c = conn.cursor()
