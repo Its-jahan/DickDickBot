@@ -133,6 +133,70 @@ Two invariants hold the economy together, and both have regression coverage:
   depositor's balance into the thief's wallet in one transaction, and returns the
   per-victim amounts so the group message can name who paid.
 
+### One central bank over every group
+
+Every group's `bank_treasury` row is now a **member account** of one central bank, not a
+vault of its own. The pooled reserve is deliberately **derived** — `SUM(bank_treasury.balance)`,
+never a second stored number — which is what made this merge safe to ship against live
+balances: the twenty-odd places that already credit or debit a group's treasury keep
+working untouched, "pool == sum of shares" is true by construction rather than an
+invariant something could break, and **no destructive migration was needed at all**.
+Only `central_bank.loans_out` is stored, because nothing else derives it.
+
+What actually merged is behaviour:
+
+- **One rate for the whole bot**, off pooled coverage (`reserve / deposits` across every
+  group). The crown's `interest_mult` is still per group, so two groups can see
+  different rates off the same coverage — the bank is shared, the politics are not.
+- **Interest is paid from the pool**, with the cost split across member accounts in
+  proportion (`_cb_spread_cost`). A group whose own share is empty still pays its savers,
+  funded by the richer groups. That is the whole point of a central bank.
+- **`/vam` lends out of pooled deposits** rather than the sink-fed reserve.
+
+Two things stay per group, and both are load-bearing:
+
+- **Deposits remember which group they were made in.** Withdrawals only work in the
+  group the deposit was made in. If they didn't, "deposit in the farm group, withdraw in
+  the main group" would be a free, frictionless cross-group transfer and would reopen
+  the exact farm-group exploit the `/enteghal` gate exists to stop. There is a
+  regression test asserting it.
+- **A heist reaches only the raided group's share and its own depositors.** A global
+  drain would mean one player winning an 8-symbol memory game wipes out every player in
+  every group.
+
+### Deposits fund loans, which is what makes it a bank and not a box
+
+`accept_loan`'s treasury branch takes `principal` out of the pooled deposits and books it
+as `loans_out`; `settle_loan` retires the principal and books **only the interest** as
+reserve. Booking the whole `due_amount` as reserve — which is what it used to do — would
+count the principal twice now that it came from deposits rather than from the vault.
+
+There is no default loss for the bank to absorb, and that is deliberate rather than an
+oversight: `_collect` drives the borrower's wallet negative for anything they can't
+cover, so the lender is made whole every time and the hole stays the borrower's problem.
+
+Two limits bound the loan book, and both are real:
+
+- `CB_RESERVE_RATIO` keeps that share of **deposits** permanently un-lent. The bank's own
+  equity (the reserve) *is* lendable on top of that — a real bank lends its capital as
+  well as its depositors' money, and without it `/vam` would be dead in a world where
+  nobody has banked anything yet.
+- The cash check: `reserve + deposits - loans_out` must cover the principal today.
+
+### The bank run is a real failure mode now
+
+`bank_withdraw` checks the bank's cash **before** touching the saver's account, and
+returns `(False, 'run', available, 0)` when the money is real but currently sitting
+inside somebody's `/vam` loan. The saver's balance is left exactly where it was, and
+`/bardasht` says so plainly instead of implying they're broke. `CB_RESERVE_RATIO` is
+sized to make this rare — ordinary withdrawals always clear — but it can and should
+happen when enough savers head for the door at once.
+
+`/markazi` prints the balance sheet publicly, laid out so that **deposits appear as a
+liability** and the loan book as the asset. Players kept assuming their deposit was the
+bank's money sitting in a box; the reserve requirement and the run risk only make sense
+once you can see that it isn't.
+
 ### The deposit rate floats on how well the treasury covers the deposits
 
 The rate is not a constant. `bank_base_rate` interpolates between `BANK_RATE_MIN` and

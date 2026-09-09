@@ -136,6 +136,7 @@ BOT_COMMANDS = [
     ("talagh", "💔 (پادشاه) طلاق همسر"),
     ("lottery", "🎟️ لاتاری روزانه"),
     ("bank", "🏦 بانک — سود روزانه و حساب امن"),
+    ("markazi", "🏛 ترازنامهٔ بانک مرکزی"),
     ("variz", "📥 واریز به بانک — /variz 50"),
     ("bardasht", "🏧 برداشت از بانک — /bardasht 50"),
     ("sarghat", "🚨 سرقت از بانک گروه (تقریباً غیرممکنه!)"),
@@ -653,7 +654,7 @@ HELP_TEXT = (
     "💔 /talagh — پادشاه همسرش رو طلاق می‌ده\n\n"
     "**اقتصاد و سرگرمی**\n"
     "🏪 /shop — خرید آیتم با سانت\n"
-    "🏦 /bank — بانک: سود روزانه، امن از دزدی\n"
+    "🏦 /bank — بانک: سود روزانه، امن از دزدی\n"    "🏛 /markazi — ترازنامهٔ بانک مرکزی\n"
     "📥 /variz <مقدار> — واریز به بانک (سقف روزانه داره)\n"
     "🏧 /bardasht <مقدار> — برداشت از بانک\n"
     "🚨 /sarghat — سرقت از خزانه و سپرده‌های گروه! (بازیش تقریباً غیرممکنه)\n"    "🔓 /vasighe — وثیقه برای آزادی از زندان بانک\n"    "👑 /afv @کاربر — عفو زندانی بانک (فقط پادشاه)\n"    "🤝 /nozul @کاربر <مقدار> <درصد> — نزول دادن\n"
@@ -2422,12 +2423,16 @@ def bank_base_rate(treasury, deposits):
 
 def bank_effective_rate(chat_id, econ=None):
     """(rate, base_rate, coverage) as they stand right now, so /bank and /economy quote
-    the number the nightly job will actually pay rather than an advertised constant."""
-    treasury, _, _ = db.get_treasury(chat_id)
-    deposits, _ = db.get_bank_totals(chat_id)
+    the number the nightly job will actually pay rather than an advertised constant.
+
+    Coverage is the CENTRAL bank's - pooled reserve against pooled deposits - because
+    the reserve that pays your interest is everyone's now. The crown's interest_mult is
+    still per group, so two groups can see different rates off the same coverage: the
+    bank is shared, the politics aren't."""
+    cb = db.get_central_bank()
     e = econ or db.get_economy(chat_id)
-    base = bank_base_rate(treasury, deposits)
-    return (max(0.0, min(0.50, base * e[3])), base, bank_coverage(treasury, deposits))
+    base = bank_base_rate(cb['reserve'], cb['deposits'])
+    return (max(0.0, min(0.50, base * e[3])), base, bank_coverage(cb['reserve'], cb['deposits']))
 # You cannot shovel a whole balance in at once: a day's deposits are capped at a share
 # of your wallet, with a floor so small players can still use the bank at all. This is
 # what keeps size in circulation - and keeps /dozdi worth typing.
@@ -3217,6 +3222,18 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, new_balance, paid_out, fee = db.bank_withdraw(user.id, chat_id, amount,
                                                       fee_of(chat_id, BANK_WITHDRAW_FEE_RATIO))
     if not ok:
+        if new_balance == 'run':
+            # The saver has the balance; the BANK doesn't have the cash, because it is
+            # sitting inside somebody's /vam loan. Say so plainly rather than implying
+            # they're broke.
+            await update.message.reply_text(
+                f"🚨 <b>بانک نقدینگی کافی نداره!</b>\n\n"
+                f"پولت سرجاشه، ولی الان بخش زیادی از سپرده‌ها دست وام‌گیرنده‌هاست.\n"
+                f"💵 حداکثری که همین الان می‌شه برداشت: <b>{int(paid_out)}</b> سانت\n\n"
+                f"وقتی وام‌ها تسویه بشن دوباره باز می‌شه. با /markazi ترازنامهٔ بانک مرکزی رو ببین.",
+                parse_mode="HTML"
+            )
+            return
         await update.message.reply_text("موجودی بانکت کافی نیست!")
         return
     wallet_now, _, _ = db.get_user(user.id, chat_id, None, None)
@@ -3227,6 +3244,55 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔒 بانک: {int(new_balance)} سانت\n💼 جیب: {int(wallet_now)} سانت\n\n"
         f"حالا دوباره تو لیدربرد حساب می‌شه — ولی قابل دزدیدن هم هست!"
     )
+
+
+async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/markazi` - the central bank's balance sheet, readable by anyone.
+
+    Deliberately public and deliberately laid out as a real balance sheet: deposits are
+    a LIABILITY (the bank owes them to savers) and the loan book is the ASSET. Players
+    kept assuming their deposit was the bank's money sitting in a box, and the whole
+    point of the reserve requirement and the bank-run risk only makes sense once you can
+    see that it isn't."""
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    cb = db.get_central_bank()
+    my_share, _, _ = db.get_treasury(chat_id)
+    my_dep, my_holders = db.get_bank_totals(chat_id)
+    rate, _base, cov = bank_effective_rate(chat_id)
+
+    lent_pct = (cb['loans_out'] / cb['deposits'] * 100) if cb['deposits'] > 0 else 0.0
+    if cb['cash'] <= 0:
+        liquidity = "❌ نقدینگی تمومه — برداشت فعلاً ممکن نیست"
+    elif cb['deposits'] > 0 and cb['cash'] < cb['deposits'] * 0.15:
+        liquidity = "⚠️ نقدینگی کمه — برداشت‌های بزرگ ممکنه رد بشن"
+    else:
+        liquidity = "✅ نقدینگی سالمه"
+
+    lines = [
+        "🏛 <b>بانک مرکزی</b> — همهٔ گروه‌ها زیر یک بانک", "",
+        "<b>دارایی‌ها</b>",
+        f"   💰 ذخیره (سهم همهٔ گروه‌ها): {int(cb['reserve'])} سانت",
+        f"   📄 وام‌های پرداخت‌شده: {int(cb['loans_out'])} سانت", "",
+        "<b>بدهی‌ها</b>",
+        f"   🔒 سپردهٔ مردم: {int(cb['deposits'])} سانت",
+        "   └ این بدهیِ بانک به شماست، نه دارایی‌اش", "",
+        f"💵 نقدِ قابل‌برداشت: <b>{int(cb['cash'])}</b> سانت — {liquidity}",
+        f"📊 {lent_pct:.0f}٪ از سپرده‌ها وام داده شده "
+        f"(سقف {int((1-db.CB_RESERVE_RATIO)*100)}٪)",
+        f"🪙 ظرفیت وام باقی‌مونده: {int(cb['lendable'])} سانت",
+        f"📈 نرخ سود امروزِ این گروه: <b>{rate*100:.2f}٪</b> (پوشش {cov*100:.0f}٪)"
+        if cov is not None else f"📈 نرخ سود امروزِ این گروه: <b>{rate*100:.2f}٪</b>",
+        "",
+        "<b>سهم این گروه</b>",
+        f"   🏛 تو ذخیره: {int(my_share)} سانت",
+        f"   🔒 سپردهٔ اعضا: {int(my_dep)} سانت از {my_holders} نفر",
+    ]
+    lines.append("\nسود سپرده‌ها رو بهرهٔ وام‌گیرنده‌ها می‌ده — نه یه صندوق جادویی.")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 def _fmt_days_hours(delta):
@@ -5567,6 +5633,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(bardasht|withdraw)\b'), withdraw_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(sarghat|heist)\b'), heist_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(vasighe|bail)\b'), heist_bail_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(markazi|centralbank)\b'), central_bank_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(afv|pardon)\b'), heist_pardon_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(nozul|nozool)\b'), nozul_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(vam|loan)\b'), vam_cmd))

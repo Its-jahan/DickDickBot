@@ -374,6 +374,18 @@ def init_db():
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS bank_log_chat_idx ON bank_log (chat_id, created_at DESC)')
 
+        # The central bank. Only `loans_out` is stored here - the reserve itself is the
+        # SUM of the per-group member accounts in bank_treasury, never a second copy, so
+        # the two can't drift apart. See get_central_bank().
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS central_bank (
+                id INTEGER PRIMARY KEY,
+                loans_out DOUBLE PRECISION DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+        c.execute('INSERT INTO central_bank (id) VALUES (1) ON CONFLICT (id) DO NOTHING')
+
         # ---------------------------------------------------------------- economy
         # One row per group. `inflation` is a price index: everything the game charges
         # or pays out is multiplied by it, so a group that prints money finds its shop
@@ -2032,10 +2044,31 @@ def bank_deposit(user_id, chat_id, amount, today_str, daily_cap, fee_ratio=0.0):
 
 def bank_withdraw(user_id, chat_id, amount, fee_ratio=0.0):
     """Moves `amount` out of the bank, atomically, minus the vault's cut. Returns
-    (True, new_bank_balance, paid_out, fee) or (False, None, 0, 0) if the account is
-    short. `amount` is what leaves the bank; `paid_out` is what reaches the wallet."""
+    (True, new_bank_balance, paid_out, fee), (False, None, 0, 0) if the account is
+    short, or (False, 'run', available, 0) when the BANK is short. `amount` is what
+    leaves the bank; `paid_out` is what reaches the wallet.
+
+    That second failure is the bank run, and it is the honest cost of lending deposits
+    out: the money is real but it is currently inside somebody's /vam loan, so it isn't
+    there to hand back today. CB_RESERVE_RATIO is sized to make this rare - ordinary
+    withdrawals always clear - but it can and should happen if enough savers head for
+    the door at once."""
     with get_connection() as conn:
         c = conn.cursor()
+        # Check the bank's own liquidity before touching the account, so a refused
+        # withdrawal leaves the saver's balance exactly where it was.
+        c.execute('SELECT COALESCE(loans_out,0) FROM central_bank WHERE id = %s FOR UPDATE',
+                  (CB_SINGLETON,))
+        crow = c.fetchone()
+        loans_out = float(crow[0]) if crow else 0.0
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE COALESCE(balance,0) > 0')
+        deposits = float(c.fetchone()[0] or 0.0)
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
+        reserve = float(c.fetchone()[0] or 0.0)
+        cash = reserve + deposits - loans_out
+        if amount > cash:
+            return (False, 'run', max(0.0, round(cash, 2)), 0.0)
+
         c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
                   'WHERE user_id = %s AND chat_id = %s AND COALESCE(balance,0) >= %s '
                   'RETURNING balance', (amount, user_id, chat_id, amount))
@@ -2062,6 +2095,95 @@ def bank_withdraw(user_id, chat_id, amount, fee_ratio=0.0):
                       (chat_id, fee, fee))
             _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد برداشت')
         return (True, float(brow[0]), paid_out, fee)
+
+
+# ---------------------------------------------------------------- the central bank
+# Every group's treasury row is now a MEMBER ACCOUNT of one central bank rather than a
+# vault of its own. The pooled reserve is deliberately *derived* - it is the SUM of
+# those member accounts, never a second stored number - which is what makes this merge
+# safe: the twenty-odd places that already credit or debit a group's treasury keep
+# working untouched, and "pool == sum of shares" is true by construction instead of
+# being an invariant something could silently break.
+#
+# What actually merged is the behaviour, not the storage:
+#   - the deposit rate is one global number, off the pooled coverage
+#   - interest is paid out of the POOL, so a group whose own share is thin still pays
+#     its savers, funded by the richer groups
+#   - /vam lends out of pooled DEPOSITS under a reserve requirement, which is what
+#     makes this a bank rather than a safety deposit box
+# What stays per group, on purpose: deposits remember which group they were made in
+# (so the bank can never be used as a free cross-group transfer, which would reopen
+# the farm-group exploit the /enteghal gate exists to stop), and a heist reaches only
+# the raided group's own share and depositors.
+
+CB_RESERVE_RATIO = 0.35      # share of deposits that must stay liquid, never lent out
+CB_SINGLETON = 1
+
+
+def get_central_bank():
+    """The whole balance sheet in one read.
+
+    reserve   - pooled member accounts: the bank's own equity, fed by every sink
+    deposits  - what savers are owed (a LIABILITY, not an asset - see the docs)
+    loans_out - principal currently lent out of those deposits (the bank's asset)
+    cash      - what could actually be paid out right now
+    lendable  - headroom left under the reserve requirement
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO central_bank (id) VALUES (%s) ON CONFLICT (id) DO NOTHING',
+                  (CB_SINGLETON,))
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
+        reserve = float(c.fetchone()[0] or 0.0)
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE COALESCE(balance,0) > 0')
+        deposits = float(c.fetchone()[0] or 0.0)
+        c.execute('SELECT COALESCE(loans_out,0) FROM central_bank WHERE id = %s',
+                  (CB_SINGLETON,))
+        loans_out = float((c.fetchone() or (0.0,))[0] or 0.0)
+        return {
+            'reserve': reserve,
+            'deposits': deposits,
+            'loans_out': loans_out,
+            # Cash is the only number that decides whether a withdrawal can be honoured.
+            'cash': reserve + deposits - loans_out,
+            # Deposits are the primary funding source, but the bank's own equity counts
+            # too - a real bank lends its capital as well as its depositors' money, and
+            # without this /vam would be dead in a world where nobody has banked
+            # anything yet. CB_RESERVE_RATIO still keeps a slice of DEPOSITS
+            # permanently un-lent so ordinary withdrawals clear.
+            'lendable': max(0.0, deposits * (1.0 - CB_RESERVE_RATIO) + reserve - loans_out),
+            'coverage': (reserve / deposits) if deposits > 0 else None,
+        }
+
+
+def _cb_spread_cost(c, amount):
+    """Charges `amount` against the pooled reserve, split across the member accounts in
+    proportion to what each holds. This is the merge in one function: the cost of paying
+    one group's savers is carried by every group's share, not just their own."""
+    if amount <= 0:
+        return 0.0
+    c.execute('SELECT chat_id, COALESCE(balance,0) FROM bank_treasury '
+              'WHERE COALESCE(balance,0) > 0 ORDER BY chat_id FOR UPDATE')
+    rows = c.fetchall()
+    total = sum(float(b) for _cid, b in rows)
+    if total <= 0:
+        return 0.0
+    take = min(float(amount), total)
+    # Largest share absorbs the rounding remainder, so the debits sum to `take` exactly
+    # and the pool can never drift from what was actually paid out.
+    debits, running = [], 0.0
+    for cid, bal in rows:
+        part = round(take * (float(bal) / total), 2)
+        debits.append([cid, part])
+        running += part
+    if debits:
+        debits[max(range(len(debits)), key=lambda i: float(rows[i][1]))][1] += round(take - running, 2)
+    for cid, part in debits:
+        if part <= 0:
+            continue
+        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
+                  'WHERE chat_id = %s', (part, cid))
+    return take
 
 
 def treasury_add(chat_id, amount, note=None):
@@ -2146,18 +2268,23 @@ def claim_interest_run(chat_id, today_str):
 
 
 def pay_interest(chat_id, rate, max_share):
-    """Pays one day's interest out of the treasury and returns
-    (rows_paid, total_paid, treasury_left).
+    """Pays one day's interest to ONE group's depositors, out of the CENTRAL reserve.
 
-    The treasury is the hard ceiling. If what everyone is owed exceeds what the
-    treasury can afford (capped further by `max_share` of it, so one day never drains
-    the whole thing), every depositor is scaled down by the same factor rather than
-    the early rows being paid in full and the late ones getting nothing."""
+    Returns (rows_paid, total_paid, reserve_left) - `reserve_left` is the pool's, not
+    this group's share, because the pool is what the rate and the next payout are
+    judged against now.
+
+    This is the merge doing its work: the money comes from every group's member account
+    in proportion (see _cb_spread_cost), so a group whose own share is empty still pays
+    its savers as long as the bank as a whole is solvent. The pooled reserve is still a
+    hard ceiling - the bank cannot mint - and if what everyone is owed exceeds what it
+    can afford (capped further by `max_share`, so one day never drains the whole thing)
+    every depositor is scaled down by the same factor rather than the early rows being
+    paid in full and the late ones getting nothing."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE', (chat_id,))
-        row = c.fetchone()
-        treasury = float(row[0]) if row else 0.0
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
+        treasury = float(c.fetchone()[0] or 0.0)
         if treasury <= 0:
             return (0, 0.0, treasury)
 
@@ -2190,11 +2317,11 @@ def pay_interest(chat_id, rate, max_share):
             paid_rows += 1
 
         if paid_total > 0:
-            c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
-                      'WHERE chat_id = %s RETURNING balance', (paid_total, chat_id))
-            trow = c.fetchone()
-            _bank_log(c, chat_id, None, 'interest_out', -paid_total, trow[0])
-            treasury = float(trow[0])
+            _cb_spread_cost(c, paid_total)
+            c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
+            treasury = float(c.fetchone()[0] or 0.0)
+            _bank_log(c, chat_id, None, 'interest_out', -paid_total, treasury,
+                      'از ذخیرهٔ بانک مرکزی')
         return (paid_rows, paid_total, treasury)
 
 
@@ -2545,18 +2672,35 @@ def accept_loan(loan_id, borrower_id, term_days):
         chat_id, lender_id, principal, due_amount = row
 
         if lender_id is None:
-            # Treasury loan: the vault funds it, and must actually have the money.
-            c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
-                      (chat_id,))
-            trow = c.fetchone()
-            if not trow or float(trow[0]) < principal:
+            # /vam is funded by the central bank out of everyone's DEPOSITS, not out of
+            # the sink-fed reserve. That is the whole point of the modern model: savers'
+            # money works instead of sitting in a box, and the interest borrowers pay is
+            # what funds the interest savers earn.
+            #
+            # Two limits, and both are real. The reserve requirement keeps
+            # CB_RESERVE_RATIO of deposits permanently un-lent so ordinary withdrawals
+            # always clear, and the cash check makes sure the bank can actually hand the
+            # principal over today.
+            c.execute('SELECT COALESCE(loans_out,0) FROM central_bank WHERE id = %s FOR UPDATE',
+                      (CB_SINGLETON,))
+            crow = c.fetchone()
+            loans_out = float(crow[0]) if crow else 0.0
+            c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts '
+                      'WHERE COALESCE(balance,0) > 0')
+            deposits = float(c.fetchone()[0] or 0.0)
+            c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
+            reserve = float(c.fetchone()[0] or 0.0)
+
+            lendable = deposits * (1.0 - CB_RESERVE_RATIO) + reserve - loans_out
+            cash = reserve + deposits - loans_out
+            if principal > lendable or principal > cash:
                 c.execute("UPDATE loans SET status = 'offered', accepted_at = NULL, due_at = NULL "
                           'WHERE id = %s', (loan_id,))
                 return (False, 'treasury', 0)
-            c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
-                      'WHERE chat_id = %s RETURNING balance', (principal, chat_id))
+            c.execute('UPDATE central_bank SET loans_out = COALESCE(loans_out,0) + %s '
+                      'WHERE id = %s RETURNING loans_out', (principal, CB_SINGLETON))
             _bank_log(c, chat_id, borrower_id, 'loan_out', -principal, c.fetchone()[0],
-                      f'وام #{loan_id}')
+                      f'وام #{loan_id} از بانک مرکزی')
         else:
             # Player lender: atomic check-and-take, so they cannot lend size they no
             # longer have by the time the borrower gets around to tapping accept.
@@ -2667,12 +2811,29 @@ def settle_loan(loan_id, forced, today_str=''):
                                                      principal, interest, loan_id)
 
         if lender_id is None:
-            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                      'ON CONFLICT (chat_id) DO UPDATE SET '
-                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                      (chat_id, due_amount, due_amount))
-            _bank_log(c, chat_id, borrower_id, 'loan_repaid', due_amount, c.fetchone()[0],
-                      f'وام #{loan_id}')
+            # The principal was lent out of deposits, so retiring the debt is what puts
+            # it back - loans_out comes down and the bank's cash rises by the same
+            # amount. Only the INTEREST is earnings, and that is what lands in the
+            # reserve to pay savers with. Booking the whole due_amount as reserve (which
+            # is what this used to do) would have counted the principal twice.
+            # Note there is no default loss to absorb here: _collect drives the
+            # borrower's wallet negative for anything they can't cover, so the bank is
+            # made whole every time and the hole stays the borrower's problem. That is a
+            # deliberate pre-existing choice, and it is why this branch books the full
+            # due_amount rather than only what was recoverable.
+            interest_earned = round(due_amount - principal, 2)
+            c.execute('UPDATE central_bank SET loans_out = GREATEST(0, COALESCE(loans_out,0) - %s) '
+                      'WHERE id = %s RETURNING loans_out', (principal, CB_SINGLETON))
+            loans_left = c.fetchone()[0]
+            if interest_earned > 0:
+                c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                          'ON CONFLICT (chat_id) DO UPDATE SET '
+                          'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                          (chat_id, interest_earned, interest_earned))
+                _bank_log(c, chat_id, borrower_id, 'loan_interest', interest_earned,
+                          c.fetchone()[0], f'سود وام #{loan_id}')
+            _bank_log(c, chat_id, borrower_id, 'loan_repaid', principal, loans_left,
+                      f'اصل وام #{loan_id} برگشت به سپرده‌ها')
         else:
             _size_move(c, chat_id, lender_id, principal, 'loan_principal', f'اصل نزول #{loan_id}')
             if interest > 0:
