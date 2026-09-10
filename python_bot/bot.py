@@ -2667,6 +2667,7 @@ BANK_LOAN_MIN_SCORE = 60
 # everyone, and it is why savers and debtors want opposite kings.
 INFLATION_PRICE_FLOOR = 0.4   # never make things absurdly cheap
 UNREST_REVOLT_THRESHOLD = 75  # above this, the throne starts wobbling nightly
+REVOLT_SEIZE_RATIO = 0.40     # of the king's hoard, handed to everyone else
 UNREST_DAILY_COOLDOWN = 4     # anger fades a little on its own
 # Three of each, every night. Offering a mixed handful let a night happen to be all
 # corruption or all virtue; a fixed 3-and-3 means the king is always looking at the same
@@ -5448,20 +5449,45 @@ async def economy_tick_job(context: ContextTypes.DEFAULT_TYPE):
             logging.exception(f"economy tick failed for {chat_id}")
 
 
+def revolt_preview(chat_id):
+    """What a revolt in this group would cost, right now: (king_id, king_name, seized,
+    players, share) or None if there is nothing to seize.
+
+    Shares REVOLT_SEIZE_RATIO with _revolt rather than recomputing, so the number
+    /enghelab shows the owner before they confirm is exactly the number that gets taken.
+    A displayed figure drifting from the charged one is a bug class this repo has
+    already been bitten by."""
+    kingdom = db.get_kingdom(chat_id)
+    if not kingdom or not kingdom[0]:
+        return None
+    king_id, king_name = kingdom[0], kingdom[1]
+    size, _, _ = db.get_user(king_id, chat_id, None, None)
+    seized = max(0.0, size) * REVOLT_SEIZE_RATIO
+    players = [p for p in db.get_all_players(chat_id)
+               if p[0] != king_id and p[0] != BOT_USER_ID]
+    if seized < 1 or not players:
+        return None
+    return (king_id, king_name, seized, len(players), seized / len(players))
+
+
 async def _revolt(context, chat_id, kingdom):
     """The bill for a corrupt reign. The king's hoard is seized and handed straight back
     to the people he took it from, which is what makes looting a loan against your own
-    future rather than free money."""
+    future rather than free money.
+
+    Returns (True, seized, share, n_players) or (False, reason, 0, 0). The nightly job
+    ignores the result; /enghelab reports it, because an owner who forced this deserves
+    to be told when it did nothing rather than left guessing."""
     king_id, king_name = kingdom[0], kingdom[1]
     size, _, _ = db.get_user(king_id, chat_id, None, None)
-    seized = max(0.0, size) * 0.40
+    seized = max(0.0, size) * REVOLT_SEIZE_RATIO
     if seized < 1:
-        return
+        return (False, 'empty', 0, 0)
     players = [p for p in db.get_all_players(chat_id) if p[0] != king_id and p[0] != BOT_USER_ID]
     if not players:
-        return
+        return (False, 'alone', 0, 0)
     if not db.try_deduct_size(king_id, chat_id, seized):
-        return
+        return (False, 'funds', 0, 0)
     share = seized / len(players)
     for uid, _n, _s in players:
         db.update_size(uid, chat_id, share)
@@ -5483,6 +5509,7 @@ async def _revolt(context, chat_id, kingdom):
     if new_king:
         await announce_achievements(context, chat_id, new_king[1],
                                     award(new_king[0], chat_id, 'king'))
+    return (True, seized, share, len(players))
 
 
 async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6409,6 +6436,111 @@ def _owner_only(update):
     return bool(user and chat and user.id == OWNER_ID and chat.id > 0)
 
 
+async def revolt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/enghelab <chat_id>` - force a revolt in a group, right now, ignoring unrest.
+
+    The nightly economy tick only rolls for one above UNREST_REVOLT_THRESHOLD and even
+    then only at a chance, which is correct for the game but useless when the owner
+    wants one to happen. This is the override.
+
+    It shows what it is about to do and asks for one tap first. That is not timidity: it
+    seizes REVOLT_SEIZE_RATIO of a named player's size irreversibly, and a mistyped
+    chat_id would loot the wrong group with nothing to undo it. The preview is computed
+    by revolt_preview, which shares its ratio with _revolt, so the number shown is the
+    number taken."""
+    if not _owner_only(update):
+        return
+    parts = update.message.text.split()
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "استفاده: <code>/enghelab &lt;chat_id&gt;</code>\n"
+            "برای دیدن لیست گروه‌ها: /groups",
+            parse_mode="HTML")
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("chat_id باید عدد باشه. /groups رو بزن.")
+        return
+
+    preview = revolt_preview(chat_id)
+    if preview is None:
+        await update.message.reply_text(
+            "تو این گروه شورشی نمی‌شه کرد — یا پادشاه نداره، یا دارایی پادشاه "
+            "تقریباً صفره، یا هیچ بازیکن دیگه‌ای نیست که سهم ببره."
+        )
+        return
+    _king_id, king_name, seized, n_players, share = preview
+
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        title = chat.title or str(chat_id)
+    except Exception:
+        title = str(chat_id)
+
+    econ = db.get_economy(chat_id)
+    # Single-use token, claimed from the same table challenge buttons use. A stale
+    # button in a DM that stays scrollable forever must not be tappable twice - and
+    # claiming it in the DATABASE rather than in memory is what makes that survive a
+    # restart, which is the whole lesson pvp_matches taught this codebase.
+    token = str(uuid4())
+    await update.message.reply_text(
+        f"🔥 <b>انقلاب دستی</b>\n\n"
+        f"گروه: <b>{_esc(title)}</b>\n<code>{chat_id}</code>\n\n"
+        f"👑 پادشاه: <b>{_esc(king_name or '?')}</b>\n"
+        f"💰 مصادره ({int(REVOLT_SEIZE_RATIO*100)}٪): <b>{int(seized)}</b> سانت\n"
+        f"👥 تقسیم بین {n_players} نفر → هر نفر <b>{int(share)}</b> سانت\n"
+        f"😡 خشم فعلی: {econ[1]:.0f}/100 (بعدش ۶۰ واحد میاد پایین)\n\n"
+        f"⚠️ برگشت‌پذیر نیست.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔥 انقلاب کن", callback_data=f"forcerev_{chat_id}_{token}"),
+            InlineKeyboardButton("لغو", callback_data=f"forcerev_{chat_id}_cancel"),
+        ]])
+    )
+
+
+async def revolt_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data.split('_')
+    if len(data) != 3 or data[0] != 'forcerev':
+        return
+    if query.from_user.id != OWNER_ID:
+        await query.answer("این دکمه مال تو نیست!", show_alert=True)
+        return
+    chat_id, token = int(data[1]), data[2]
+
+    if token == 'cancel':
+        await query.answer("لغو شد.")
+        await query.edit_message_text("لغو شد — هیچ اتفاقی نیفتاد.")
+        return
+    if not db.claim_challenge(token):
+        await query.answer("این دکمه قبلاً استفاده شده!", show_alert=True)
+        return
+
+    kingdom = db.get_kingdom(chat_id)
+    if not kingdom or not kingdom[0]:
+        await query.answer("این گروه پادشاه نداره!", show_alert=True)
+        return
+
+    ok, seized, share, n_players = await _revolt(context, chat_id, kingdom)
+    if not ok:
+        reason = {'empty': 'دارایی پادشاه تقریباً صفره',
+                  'alone': 'هیچ بازیکن دیگه‌ای تو گروه نیست',
+                  'funds': 'کسر سایز از پادشاه انجام نشد'}.get(seized, 'نشد')
+        await query.answer("انجام نشد.")
+        await query.edit_message_text(f"❌ انقلاب انجام نشد: {reason}")
+        return
+
+    await query.answer("🔥 انقلاب شد!")
+    await query.edit_message_text(
+        f"🔥 انقلاب انجام شد.\n\n"
+        f"{int(seized)} سانت مصادره و بین {n_players} نفر تقسیم شد "
+        f"(هر نفر {int(share)} سانت).\n"
+        f"اعلانش تو گروه پست شد."
+    )
+
+
 async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/groups` - list the chat_ids the other admin commands take."""
     if not _owner_only(update):
@@ -6613,6 +6745,8 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(ach|achievements|neshan)\b'), achievements_cmd))
 
     # Owner-only, private-chat-only; intentionally not in BOT_COMMANDS (see there).
+    app.add_handler(MessageHandler(cmd(r'^/enghelab\b'), revolt_cmd))
+    app.add_handler(CallbackQueryHandler(revolt_confirm_callback, pattern=r'^forcerev_'))
     app.add_handler(MessageHandler(cmd(r'^/groups\b'), groups_cmd))
     app.add_handler(MessageHandler(cmd(r'^/luck\b'), luck_cmd))
     app.add_handler(MessageHandler(cmd(r'^/setluck\b'), setluck_cmd))

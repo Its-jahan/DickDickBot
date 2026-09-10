@@ -915,6 +915,29 @@ It is reserved for the worst decrees deliberately — that is what makes debasem
 genuinely corrosive rather than merely unfair, and it is why the bank's "cannot mint"
 rule is written the way it is.
 
+### Forcing a revolt: `/enghelab <chat_id>`
+
+The nightly tick only rolls for a revolt above `UNREST_REVOLT_THRESHOLD` and even then
+only at a chance, which is right for the game and useless when the owner wants one to
+happen. `/enghelab` is the override, and it is **owner-only in the bot's DM**
+(`_owner_only`: `user.id == OWNER_ID` *and* `chat.id > 0`). It is deliberately absent
+from `BOT_COMMANDS`, so it never appears in anyone's `/` menu, and in a group it returns
+without replying at all — even for the owner. There is a suite asserting each of those
+negatives before it asserts the command works.
+
+Two details worth keeping:
+
+- **It previews before it acts.** `revolt_preview` shares `REVOLT_SEIZE_RATIO` with
+  `_revolt` rather than recomputing, so the figure the owner is shown is the figure
+  taken — the shown-vs-charged drift this repo keeps getting bitten by. The confirm
+  button carries a uuid claimed through `db.claim_challenge`, the same one-shot nonce
+  table challenge buttons use: a DM stays scrollable forever, and claiming in the
+  database rather than in memory is what makes single-use survive a restart.
+- **The group message is identical either way.** Players cannot tell a forced revolt
+  from a nightly one, which is the point — `_revolt` is still the single settlement
+  path, it just returns its outcome now so the command can report a no-op instead of
+  leaving the owner guessing.
+
 `recover_decree_offer` is a startup catch-up, following the same pattern as the other
 recovery sweeps. `run_daily` only fires at its appointed minute, so a bot deployed or
 restarted past 21:30 would silently skip that night's decree entirely. The sweep posts
