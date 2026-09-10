@@ -456,12 +456,18 @@ def init_db():
                 PRIMARY KEY (user_id, chat_id)
             )
         ''')
-        # One treasury per group. Interest is paid strictly out of this, so the bank can
-        # never mint size: what the sinks put in is the ceiling on what interest pays out.
+        # NOT a vault any more. The treasury is ONE pot for the whole bot and lives in
+        # central_bank.reserve; what is left in this table is per-group BOOKKEEPING -
+        # which day this group's interest was last paid, and when its last heist was
+        # attempted. Those genuinely are per group. The money is not.
+        #
+        # The `balance` column is DROPPED by the migration below rather than left
+        # sitting at zero: a stale column that still looks authoritative is exactly the
+        # drift this codebase keeps getting bitten by, and code that still reads it
+        # should fail loudly instead of quietly seeing 0.
         c.execute('''
             CREATE TABLE IF NOT EXISTS bank_treasury (
                 chat_id BIGINT PRIMARY KEY,
-                balance DOUBLE PRECISION DEFAULT 0,
                 last_interest_date TEXT DEFAULT '',
                 last_heist_at TIMESTAMPTZ
             )
@@ -480,9 +486,10 @@ def init_db():
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS bank_log_chat_idx ON bank_log (chat_id, created_at DESC)')
 
-        # The central bank. Only `loans_out` is stored here - the reserve itself is the
-        # SUM of the per-group member accounts in bank_treasury, never a second copy, so
-        # the two can't drift apart. See get_central_bank().
+        # The central bank, and the ONE treasury the whole bot shares. `reserve` is the
+        # single stored balance: there is no per-group vault and no per-group share of
+        # this one, so there is nothing for "pool == sum of shares" to drift away from.
+        # Balances stay strictly per group in `users.size`; the bank does not.
         c.execute('''
             CREATE TABLE IF NOT EXISTS central_bank (
                 id INTEGER PRIMARY KEY,
@@ -490,7 +497,9 @@ def init_db():
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
+        c.execute('ALTER TABLE central_bank ADD COLUMN IF NOT EXISTS reserve DOUBLE PRECISION DEFAULT 0')
         c.execute('INSERT INTO central_bank (id) VALUES (1) ON CONFLICT (id) DO NOTHING')
+
 
         # ---------------------------------------------------------------- crypto market
         # One market for the whole bot, exactly like the central bank: a coin is worth
@@ -691,9 +700,6 @@ def init_db():
         # conservation rule every other fee follows.
         c.execute("SELECT value FROM bot_meta WHERE key = 'deposit_fee_backfilled'")
         if not c.fetchone():
-            c.execute('INSERT INTO bank_treasury (chat_id) '
-                      'SELECT DISTINCT chat_id FROM bank_accounts WHERE COALESCE(balance,0) > 0 '
-                      'ON CONFLICT (chat_id) DO NOTHING')
             c.execute("""
                 WITH fees AS (
                     SELECT user_id, chat_id,
@@ -712,9 +718,10 @@ def init_db():
                            'کارمزد واریزهای قبلی'
                     FROM deb RETURNING 1
                 ),
-                agg AS (SELECT chat_id, SUM(fee) AS tot FROM deb GROUP BY chat_id)
-                UPDATE bank_treasury t SET balance = COALESCE(t.balance,0) + a.tot
-                FROM agg a WHERE t.chat_id = a.chat_id
+                agg AS (SELECT SUM(fee) AS tot FROM deb)
+                UPDATE central_bank SET reserve = COALESCE(reserve,0)
+                                               + COALESCE((SELECT tot FROM agg), 0)
+                WHERE id = 1
             """, (BACKFILL_DEPOSIT_FEE_RATIO,))
             c.execute("INSERT INTO bot_meta (key, value) VALUES ('deposit_fee_backfilled', '1') "
                       "ON CONFLICT (key) DO NOTHING")
@@ -786,6 +793,30 @@ def init_db():
                 claimed_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
+
+        # One-time: fold the per-group vaults into that single reserve. Guarded by
+        # bot_meta like every other data migration here, because init_db() runs on every
+        # startup and an unguarded fold would re-add the same money on each restart.
+        # Written to be a no-op on a fresh database (there is no `balance` column to
+        # fold) and to drop the column in the same pass, so there is never a window in
+        # which two different numbers both claim to be the treasury.
+        c.execute("SELECT value FROM bot_meta WHERE key = 'treasury_merged_global'")
+        if not c.fetchone():
+            c.execute("SELECT 1 FROM information_schema.columns "
+                      "WHERE table_name = 'bank_treasury' AND column_name = 'balance'")
+            if c.fetchone():
+                c.execute('UPDATE central_bank SET reserve = COALESCE(reserve,0) '
+                          '  + COALESCE((SELECT SUM(balance) FROM bank_treasury), 0) '
+                          'WHERE id = 1')
+                c.execute('ALTER TABLE bank_treasury DROP COLUMN balance')
+            # get_money_supply no longer counts a treasury share, so every group's
+            # stored baseline was measured with the old formula. Clearing it makes
+            # tonight a "first night" per group - tick_inflation just re-records the
+            # baseline - instead of reading the definition change as a collapse in the
+            # money supply and deflating every price in the game overnight.
+            c.execute('UPDATE economy SET supply_last = NULL')
+            c.execute("INSERT INTO bot_meta (key, value) VALUES ('treasury_merged_global', '1') "
+                      "ON CONFLICT (key) DO NOTHING")
 
 
 def get_last_chat(user_id):
@@ -2131,7 +2162,7 @@ for _name, _obj in list(globals().items()):
 # them true:
 #   1. Banked size is not wallet size. It lives in bank_accounts, so the leaderboard,
 #      the crown and /dozdi (all of which read users.size) simply never see it.
-#   2. The bank cannot mint. Interest is paid only out of bank_treasury, which is
+#   2. The bank cannot mint. Interest is paid only out of the one reserve, which is
 #      filled by real sinks (shop, burnt lottery rake, lost spectator bets, /ejma).
 #      When the treasury is empty, interest is zero. There is no other path in.
 
@@ -2202,11 +2233,8 @@ def bank_deposit(user_id, chat_id, amount, today_str, daily_cap, fee_ratio=0.0):
         brow = c.fetchone()
         _bank_log(c, chat_id, user_id, 'deposit', credited, brow[0])
         if fee > 0:
-            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                      'ON CONFLICT (chat_id) DO UPDATE SET '
-                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                      (chat_id, fee, fee))
-            _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد واریز')
+            tbal = _reserve_credit(c, fee)
+            _bank_log(c, chat_id, user_id, 'treasury_in', fee, tbal, 'کارمزد واریز')
         return (True, float(brow[0]), float(brow[1]), fee)
 
 
@@ -2231,8 +2259,7 @@ def bank_withdraw(user_id, chat_id, amount, fee_ratio=0.0):
         loans_out = float(crow[0]) if crow else 0.0
         c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE COALESCE(balance,0) > 0')
         deposits = float(c.fetchone()[0] or 0.0)
-        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-        reserve = float(c.fetchone()[0] or 0.0)
+        reserve = _reserve_balance(c)
         cash = reserve + deposits - loans_out
         if amount > cash:
             return (False, 'run', max(0.0, round(cash, 2)), 0.0)
@@ -2257,32 +2284,38 @@ def bank_withdraw(user_id, chat_id, amount, fee_ratio=0.0):
                   (chat_id, user_id, paid_out, wrow[0], 'bank_withdraw', None))
         _bank_log(c, chat_id, user_id, 'withdraw', -amount, brow[0])
         if fee > 0:
-            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                      'ON CONFLICT (chat_id) DO UPDATE SET '
-                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                      (chat_id, fee, fee))
-            _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد برداشت')
+            tbal = _reserve_credit(c, fee)
+            _bank_log(c, chat_id, user_id, 'treasury_in', fee, tbal, 'کارمزد برداشت')
         return (True, float(brow[0]), paid_out, fee)
 
 
 # ---------------------------------------------------------------- the central bank
-# Every group's treasury row is now a MEMBER ACCOUNT of one central bank rather than a
-# vault of its own. The pooled reserve is deliberately *derived* - it is the SUM of
-# those member accounts, never a second stored number - which is what makes this merge
-# safe: the twenty-odd places that already credit or debit a group's treasury keep
-# working untouched, and "pool == sum of shares" is true by construction instead of
-# being an invariant something could silently break.
+# ONE treasury for the whole bot. Not a pool of member accounts, not a vault per group:
+# a single stored number, central_bank.reserve. Every sink in the game feeds it and
+# every payout comes out of it, whichever group the player was standing in.
 #
-# What actually merged is the behaviour, not the storage:
-#   - the deposit rate is one global number, off the pooled coverage
-#   - interest is paid out of the POOL, so a group whose own share is thin still pays
-#     its savers, funded by the richer groups
-#   - /vam lends out of pooled DEPOSITS under a reserve requirement, which is what
-#     makes this a bank rather than a safety deposit box
-# What stays per group, on purpose: deposits remember which group they were made in
-# (so the bank can never be used as a free cross-group transfer, which would reopen
-# the farm-group exploit the /enteghal gate exists to stop), and a heist reaches only
-# the raided group's own share and depositors.
+# The line this draws is worth stating plainly, because it is the design:
+#
+#   BALANCES ARE LOCAL. THE BANK IS GLOBAL.
+#
+# `users.size` is still per (user, chat) and always will be - 100 in one group and 1000
+# in another are two unrelated numbers, and every league is still independent. What is
+# no longer per group is the *institution*: one reserve, one deposit rate, one loan
+# book, one set of books.
+#
+# An earlier version kept a treasury row per group and derived the pool as their SUM.
+# That was a safe way to merge the behaviour without touching live balances, but it
+# left the storage saying something the game no longer meant, and every read had to
+# decide whether it wanted the share or the sum. There is now only one number to read.
+#
+# Two things stay per group, and both are load-bearing:
+#   - Deposits remember which group they were made in, so the bank can never be used as
+#     a free cross-group transfer (that would reopen the farm-group exploit the
+#     /enteghal source gate exists to stop). There is a regression test asserting it.
+#   - A group's CLAIM on the shared reserve is bounded by its weight in the bot - see
+#     _group_weight. The reserve is one pot, but one lucky heist or one corrupt decree
+#     in the smallest group on the bot must not be able to empty the vault that backs
+#     every other group's savings.
 
 CB_RESERVE_RATIO = 0.35      # share of deposits that must stay liquid, never lent out
 CB_SINGLETON = 1
@@ -2301,13 +2334,13 @@ def get_central_bank():
         c = conn.cursor()
         c.execute('INSERT INTO central_bank (id) VALUES (%s) ON CONFLICT (id) DO NOTHING',
                   (CB_SINGLETON,))
-        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-        reserve = float(c.fetchone()[0] or 0.0)
         c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE COALESCE(balance,0) > 0')
         deposits = float(c.fetchone()[0] or 0.0)
-        c.execute('SELECT COALESCE(loans_out,0) FROM central_bank WHERE id = %s',
-                  (CB_SINGLETON,))
-        loans_out = float((c.fetchone() or (0.0,))[0] or 0.0)
+        c.execute('SELECT COALESCE(reserve,0), COALESCE(loans_out,0) FROM central_bank '
+                  'WHERE id = %s', (CB_SINGLETON,))
+        crow = c.fetchone() or (0.0, 0.0)
+        reserve = float(crow[0] or 0.0)
+        loans_out = float(crow[1] or 0.0)
         return {
             'reserve': reserve,
             'deposits': deposits,
@@ -2324,74 +2357,84 @@ def get_central_bank():
         }
 
 
-def _cb_spread_cost(c, amount):
-    """Charges `amount` against the pooled reserve, split across the member accounts in
-    proportion to what each holds. This is the merge in one function: the cost of paying
-    one group's savers is carried by every group's share, not just their own."""
+def _reserve_balance(c, lock=False):
+    """The one treasury balance. `lock` takes a row lock for a read-modify-write."""
+    c.execute('INSERT INTO central_bank (id) VALUES (%s) ON CONFLICT (id) DO NOTHING',
+              (CB_SINGLETON,))
+    c.execute('SELECT COALESCE(reserve,0) FROM central_bank WHERE id = %s'
+              + (' FOR UPDATE' if lock else ''), (CB_SINGLETON,))
+    row = c.fetchone()
+    return float(row[0] or 0.0) if row else 0.0
+
+
+def _reserve_credit(c, amount):
+    """Puts size into the one treasury. Returns the balance afterwards, which is what
+    every caller wants for its bank_log row."""
     if amount <= 0:
-        return 0.0
-    c.execute('SELECT chat_id, COALESCE(balance,0) FROM bank_treasury '
-              'WHERE COALESCE(balance,0) > 0 ORDER BY chat_id FOR UPDATE')
-    rows = c.fetchall()
-    total = sum(float(b) for _cid, b in rows)
-    if total <= 0:
-        return 0.0
-    take = min(float(amount), total)
-    # Largest share absorbs the rounding remainder, so the debits sum to `take` exactly
-    # and the pool can never drift from what was actually paid out.
-    debits, running = [], 0.0
-    for cid, bal in rows:
-        part = round(take * (float(bal) / total), 2)
-        debits.append([cid, part])
-        running += part
-    if debits:
-        debits[max(range(len(debits)), key=lambda i: float(rows[i][1]))][1] += round(take - running, 2)
-    for cid, part in debits:
-        if part <= 0:
-            continue
-        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
-                  'WHERE chat_id = %s', (part, cid))
-    return take
+        return _reserve_balance(c)
+    c.execute('INSERT INTO central_bank (id, reserve) VALUES (%s, %s) ON CONFLICT (id) '
+              'DO UPDATE SET reserve = COALESCE(central_bank.reserve,0) + %s '
+              'RETURNING reserve', (CB_SINGLETON, amount, amount))
+    return float(c.fetchone()[0] or 0.0)
 
 
-def _cb_spread_credit(c, amount, fallback_chat_id):
-    """Credits `amount` INTO the pooled reserve, split across the member accounts in
-    proportion to what each already holds - the mirror of _cb_spread_cost.
-
-    Both directions must be pooled or neither. Crediting one group's account while
-    debiting everyone's is not merely inconsistent, it is farmable: a player in a group
-    holding 1% of the pool could buy and immediately sell at a flat price, moving ~1020
-    out of the other groups' shares and into their own for a personal cost of 60 - and
-    a group's own share is exactly what a heist reaches. Symmetry is what closes that.
-
-    `fallback_chat_id` takes the whole credit when the pool is empty and there are no
-    proportions to split by, so a market can bootstrap from zero."""
+def _reserve_take(c, amount):
+    """Draws up to `amount` out of the one treasury, never past zero. Returns
+    (taken, balance_after). The bank cannot mint, so a caller owed more than this
+    returns has to decide for itself what to do about the shortfall."""
     if amount <= 0:
-        return 0.0
-    c.execute('SELECT chat_id, COALESCE(balance,0) FROM bank_treasury '
-              'WHERE COALESCE(balance,0) > 0 ORDER BY chat_id FOR UPDATE')
-    rows = c.fetchall()
-    total = sum(float(b) for _cid, b in rows)
+        return (0.0, _reserve_balance(c))
+    available = _reserve_balance(c, lock=True)
+    take = min(float(amount), max(0.0, available))
+    if take <= 0:
+        return (0.0, available)
+    c.execute('UPDATE central_bank SET reserve = COALESCE(reserve,0) - %s '
+              'WHERE id = %s RETURNING reserve', (take, CB_SINGLETON))
+    return (take, float(c.fetchone()[0] or 0.0))
+
+
+def _group_weight(c, chat_id):
+    """How big a slice of the whole bot one group is: its money (wallets + deposits) as
+    a fraction of every group's money.
+
+    This is DERIVED, never stored - there is no per-group treasury for it to be a
+    balance of. It exists for one job: bounding what a single group can pull OUT of the
+    shared reserve. A heist takes a fraction of "the treasury", and so does a corrupt
+    decree; against one global pot those would let a player in the smallest group on the
+    bot walk off with the vault backing every other group's savings. Scaling the draw by
+    the group's weight keeps the pot single while keeping the raid local in size.
+
+    Negative wallets are floored at zero. Debt is real - _collect drives a defaulter's
+    size below zero on purpose - but a group carrying a big debtor is not thereby
+    *smaller*, and letting one negative wallet shrink a group's whole claim would make
+    the bound move for reasons that have nothing to do with the group's size."""
+    c.execute('SELECT COALESCE(SUM(GREATEST(COALESCE(size,0),0)),0) FROM users '
+              'WHERE chat_id = %s', (chat_id,))
+    mine = float(c.fetchone()[0] or 0.0)
+    c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts '
+              'WHERE chat_id = %s AND COALESCE(balance,0) > 0', (chat_id,))
+    mine += float(c.fetchone()[0] or 0.0)
+    c.execute('SELECT COALESCE(SUM(GREATEST(COALESCE(size,0),0)),0) FROM users')
+    total = float(c.fetchone()[0] or 0.0)
+    c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts WHERE COALESCE(balance,0) > 0')
+    total += float(c.fetchone()[0] or 0.0)
     if total <= 0:
-        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                  'ON CONFLICT (chat_id) DO UPDATE SET '
-                  'balance = COALESCE(bank_treasury.balance,0) + %s',
-                  (fallback_chat_id, amount, amount))
-        return float(amount)
-    # Largest share absorbs the rounding remainder, so the credits sum to `amount`
-    # exactly and the pool never drifts from what was actually paid in.
-    credits, running = [], 0.0
-    for cid, bal in rows:
-        part = round(float(amount) * (float(bal) / total), 2)
-        credits.append([cid, part])
-        running += part
-    credits[max(range(len(credits)), key=lambda i: float(rows[i][1]))][1] += round(float(amount) - running, 2)
-    for cid, part in credits:
-        if part <= 0:
-            continue
-        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) + %s '
-                  'WHERE chat_id = %s', (part, cid))
-    return float(amount)
+        return 1.0
+    return max(0.0, min(1.0, mine / total))
+
+
+def _group_claim(c, chat_id):
+    """The most of the shared reserve this group could take at once - see _group_weight."""
+    return _reserve_balance(c) * _group_weight(c, chat_id)
+
+
+def group_reserve_claim(chat_id):
+    """Public read of the above, so /sarghat can quote the player the same number
+    heist_take will actually hand over. A displayed number drifting from the real one is
+    a bug class this codebase has already been bitten by."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        return round(_group_claim(c, chat_id), 2)
 
 
 def treasury_add(chat_id, amount, note=None):
@@ -2401,11 +2444,8 @@ def treasury_add(chat_id, amount, note=None):
         return
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                  'ON CONFLICT (chat_id) DO UPDATE SET balance = COALESCE(bank_treasury.balance,0) + %s '
-                  'RETURNING balance', (chat_id, amount, amount))
-        row = c.fetchone()
-        _bank_log(c, chat_id, None, 'treasury_in', amount, row[0], note)
+        tbal = _reserve_credit(c, amount)
+        _bank_log(c, chat_id, None, 'treasury_in', amount, tbal, note)
 
 
 def treasury_take_up_to(chat_id, amount, note=None):
@@ -2420,26 +2460,25 @@ def treasury_take_up_to(chat_id, amount, note=None):
         return 0.0
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('INSERT INTO bank_treasury (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING',
-                  (chat_id,))
-        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
-                  (chat_id,))
-        available = float(c.fetchone()[0] or 0.0)
-        take = min(float(amount), max(0.0, available))
+        take, after = _reserve_take(c, amount)
         if take <= 0:
             return 0.0
-        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
-                  'WHERE chat_id = %s RETURNING balance', (take, chat_id))
-        _bank_log(c, chat_id, None, 'treasury_out', -take, c.fetchone()[0], note)
+        _bank_log(c, chat_id, None, 'treasury_out', -take, after, note)
         return take
 
 
 def get_treasury(chat_id):
+    """(reserve, last_interest_date, last_heist_at).
+
+    The balance is the WHOLE bot's - there is no per-group treasury to return - while
+    the two stamps are this group's own. Callers that want to know what this group could
+    actually draw out of it want group_reserve_claim() instead."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT COALESCE(balance,0), COALESCE(last_interest_date,%s), last_heist_at '
+        c.execute('SELECT COALESCE(last_interest_date,%s), last_heist_at '
                   'FROM bank_treasury WHERE chat_id = %s', ('', chat_id))
-        return c.fetchone() or (0.0, '', None)
+        row = c.fetchone() or ('', None)
+        return (_reserve_balance(c), row[0], row[1])
 
 
 def get_bank_totals(chat_id):
@@ -2476,23 +2515,25 @@ def claim_interest_run(chat_id, today_str):
 
 
 def pay_interest(chat_id, rate, max_share):
-    """Pays one day's interest to ONE group's depositors, out of the CENTRAL reserve.
+    """Pays one day's interest to ONE group's depositors, out of the ONE treasury.
 
-    Returns (rows_paid, total_paid, reserve_left) - `reserve_left` is the pool's, not
-    this group's share, because the pool is what the rate and the next payout are
-    judged against now.
+    Returns (rows_paid, total_paid, reserve_left), where `reserve_left` is the whole
+    bot's - that is the number the rate and the next payout are judged against.
 
-    This is the merge doing its work: the money comes from every group's member account
-    in proportion (see _cb_spread_cost), so a group whose own share is empty still pays
-    its savers as long as the bank as a whole is solvent. The pooled reserve is still a
-    hard ceiling - the bank cannot mint - and if what everyone is owed exceeds what it
-    can afford (capped further by `max_share`, so one day never drains the whole thing)
-    every depositor is scaled down by the same factor rather than the early rows being
-    paid in full and the late ones getting nothing."""
+    A group whose own players have paid nothing into the treasury still pays its savers,
+    funded by the groups that have. That is what a shared bank *is*; there is no local
+    vault left to run dry on its own. The reserve is still a hard ceiling - the bank
+    cannot mint - and if what everyone is owed exceeds what it can afford (capped
+    further by `max_share`, so one day never drains the whole thing) every depositor is
+    scaled down by the same factor rather than the early rows being paid in full and the
+    late ones getting nothing.
+
+    Note the draw is deliberately NOT weight-capped the way a heist or a decree is:
+    interest is the bank honouring a debt it owes to named savers, not a group helping
+    itself to the pot."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-        treasury = float(c.fetchone()[0] or 0.0)
+        treasury = _reserve_balance(c)
         if treasury <= 0:
             return (0, 0.0, treasury)
 
@@ -2525,11 +2566,9 @@ def pay_interest(chat_id, rate, max_share):
             paid_rows += 1
 
         if paid_total > 0:
-            _cb_spread_cost(c, paid_total)
-            c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-            treasury = float(c.fetchone()[0] or 0.0)
+            _, treasury = _reserve_take(c, paid_total)
             _bank_log(c, chat_id, None, 'interest_out', -paid_total, treasury,
-                      'از ذخیرهٔ بانک مرکزی')
+                      'از خزانهٔ مشترک')
         return (paid_rows, paid_total, treasury)
 
 
@@ -2589,11 +2628,8 @@ def charge_maintenance(chat_id, ratio):
             total += fee
             rows += 1
         if total > 0:
-            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                      'ON CONFLICT (chat_id) DO UPDATE SET '
-                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                      (chat_id, total, total))
-            _bank_log(c, chat_id, None, 'treasury_in', total, c.fetchone()[0],
+            tbal = _reserve_credit(c, total)
+            _bank_log(c, chat_id, None, 'treasury_in', total, tbal,
                       'کارمزد نگهداری حساب')
         return (rows, round(total, 2))
 
@@ -2783,12 +2819,12 @@ def crypto_buy(user_id, chat_id, symbol, spend, fee_ratio, today_str, daily_cap,
                       'VALUES (%s,%s,%s,%s,%s,%s)',
                       (chat_id, user_id, -fee, after, 'crypto_fee', symbol))
 
-        # Into the POOL, spread across every member account - the market's counterparty
-        # is the central bank, not this group's share. See _cb_spread_credit for why
-        # both legs have to be pooled rather than just the payout.
-        _cb_spread_credit(c, total, chat_id)
-        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-        tbal = float(c.fetchone()[0])
+        # The market's counterparty is the one treasury, on both legs. When the vault
+        # was still split per group this had to be spread proportionally in both
+        # directions or it was farmable - crediting one group's share while debiting
+        # everyone's is a transfer dressed up as a trade. With a single pot there is
+        # nothing left to spread and nothing left to farm.
+        tbal = _reserve_credit(c, total)
         _bank_log(c, chat_id, user_id, 'crypto_in', gross, tbal, f'خرید {symbol}')
         if fee > 0:
             _bank_log(c, chat_id, user_id, 'treasury_in', fee, tbal, 'کارمزد معاملهٔ کریپتو')
@@ -2847,8 +2883,7 @@ def crypto_sell(user_id, chat_id, symbol, units, fee_ratio, impact_depth, impact
         # Liquidity is the CENTRAL bank's pooled reserve, not this group's slice of it.
         # A market whose depth depended on which group you happened to be in would be
         # arbitrary - a small group could barely trade while a rich one traded freely.
-        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-        available = float(c.fetchone()[0] or 0.0)
+        available = _reserve_balance(c)
 
         c.execute('SELECT price, base_price, COALESCE(net_units,0) FROM crypto_prices '
                   'WHERE symbol = %s FOR UPDATE', (symbol,))
@@ -2868,8 +2903,8 @@ def crypto_sell(user_id, chat_id, symbol, units, fee_ratio, impact_depth, impact
             # Trim to what the bank can actually pay. This has to be solved, not
             # divided: fewer units means less impact means a HIGHER price per unit, so
             # `available / price` overshoots and the shortfall would be minted -
-            # _cb_spread_cost caps what it takes from the pool while the wallet is
-            # credited in full. Proceeds are monotonically increasing in units (the
+            # _reserve_take caps what it hands over while the wallet is credited in
+            # full. Proceeds are monotonically increasing in units (the
             # impact cap keeps the curve well inside the turning point), so a bisection
             # lands on the largest fill the bank can honour, exactly.
             lo, hi = 0.0, units
@@ -2893,9 +2928,7 @@ def crypto_sell(user_id, chat_id, symbol, units, fee_ratio, impact_depth, impact
         basis = round(units * avg, 2)
         pnl = round(net - basis, 2)
 
-        _cb_spread_cost(c, net)
-        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-        tbal = float(c.fetchone()[0])
+        _, tbal = _reserve_take(c, net)
         # -gross out as a position payout, +fee back in as income: the two sum to the
         # -net actually debited, and only the fee lands in the window get_treasury_income
         # reads.
@@ -2974,15 +3007,15 @@ def heist_take(chat_id, thief_id, treasury_ratio, deposit_ratio):
     Returns (total_loot, treasury_part, [(user_id, name, amount), ...])."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE', (chat_id,))
-        row = c.fetchone()
-        treasury = float(row[0]) if row else 0.0
-        treasury_part = round(max(0.0, treasury) * treasury_ratio, 2)
+        # `treasury_ratio` of what this GROUP could claim, not of the whole bot's
+        # reserve. The vault is one pot now, so without the weight bound a single lucky
+        # memory game in the smallest group would empty the savings of every player in
+        # every group - see _group_weight.
+        want = round(max(0.0, _group_claim(c, chat_id)) * treasury_ratio, 2)
+        treasury_part, after = _reserve_take(c, want)
+        treasury_part = round(treasury_part, 2)
         if treasury_part > 0:
-            c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
-                      'WHERE chat_id = %s RETURNING balance', (treasury_part, chat_id))
-            trow = c.fetchone()
-            _bank_log(c, chat_id, thief_id, 'heist_treasury', -treasury_part, trow[0])
+            _bank_log(c, chat_id, thief_id, 'heist_treasury', -treasury_part, after)
 
         c.execute('SELECT b.user_id, COALESCE(u.first_name, %s), COALESCE(b.balance,0) '
                   'FROM bank_accounts b LEFT JOIN users u '
@@ -3172,11 +3205,8 @@ def pay_heist_bail(user_id, chat_id):
         c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
                   'VALUES (%s, %s, %s, %s, %s, %s)',
                   (chat_id, user_id, -bail, new_size, 'heist_bail', 'وثیقهٔ سرقت بانک'))
-        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                  'ON CONFLICT (chat_id) DO UPDATE SET '
-                  'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                  (chat_id, bail, bail))
-        _bank_log(c, chat_id, user_id, 'treasury_in', bail, c.fetchone()[0], 'وثیقهٔ سرقت بانک')
+        tbal = _reserve_credit(c, bail)
+        _bank_log(c, chat_id, user_id, 'treasury_in', bail, tbal, 'وثیقهٔ سرقت بانک')
         return (True, bail)
 
 
@@ -3314,8 +3344,7 @@ def accept_loan(loan_id, borrower_id, term_days, origination_ratio=0.0):
             c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_accounts '
                       'WHERE COALESCE(balance,0) > 0')
             deposits = float(c.fetchone()[0] or 0.0)
-            c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
-            reserve = float(c.fetchone()[0] or 0.0)
+            reserve = _reserve_balance(c)
 
             lendable = deposits * (1.0 - CB_RESERVE_RATIO) + reserve - loans_out
             cash = reserve + deposits - loans_out
@@ -3360,11 +3389,8 @@ def accept_loan(loan_id, borrower_id, term_days, origination_ratio=0.0):
         if _size_move(c, chat_id, borrower_id, handed, 'loan_principal', f'وام #{loan_id}') is None:
             raise RuntimeError('borrower has no users row')
         if fee > 0:
-            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                      'ON CONFLICT (chat_id) DO UPDATE SET '
-                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                      (chat_id, fee, fee))
-            _bank_log(c, chat_id, borrower_id, 'treasury_in', fee, c.fetchone()[0],
+            tbal = _reserve_credit(c, fee)
+            _bank_log(c, chat_id, borrower_id, 'treasury_in', fee, tbal,
                       f'کارمزد صدور وام #{loan_id}')
         return (True, float(principal), float(due_amount), fee)
 
@@ -3467,12 +3493,9 @@ def settle_loan(loan_id, forced, today_str=''):
                       'WHERE id = %s RETURNING loans_out', (principal, CB_SINGLETON))
             loans_left = c.fetchone()[0]
             if interest_earned > 0:
-                c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                          'ON CONFLICT (chat_id) DO UPDATE SET '
-                          'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                          (chat_id, interest_earned, interest_earned))
+                tbal = _reserve_credit(c, interest_earned)
                 _bank_log(c, chat_id, borrower_id, 'loan_interest', interest_earned,
-                          c.fetchone()[0], f'سود وام #{loan_id}')
+                          tbal, f'سود وام #{loan_id}')
             _bank_log(c, chat_id, borrower_id, 'loan_repaid', principal, loans_left,
                       f'اصل وام #{loan_id} برگشت به سپرده‌ها')
         else:
@@ -3898,11 +3921,8 @@ def cross_group_transfer(user_id, from_chat, to_chat, amount, fee_ratio):
             c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
                       'VALUES (%s, %s, %s, %s, %s, %s)',
                       (from_chat, user_id, -fee, srow[0], 'xfer_fee', 'کارمزد انتقال'))
-            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                      'ON CONFLICT (chat_id) DO UPDATE SET '
-                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                      (from_chat, fee, fee))
-            _bank_log(c, from_chat, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد انتقال')
+            tbal = _reserve_credit(c, fee)
+            _bank_log(c, from_chat, user_id, 'treasury_in', fee, tbal, 'کارمزد انتقال')
 
         # The destination row must already exist - you can only send to a league you
         # actually play in, which is what stops this being a way to seed a brand new
@@ -3945,11 +3965,8 @@ def charge_credit_check(user_id, chat_id, fee):
         c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
                   'VALUES (%s, %s, %s, %s, %s, %s)',
                   (chat_id, user_id, -fee, row[0], 'credit_check', 'کارمزد اعتبارسنجی'))
-        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                  'ON CONFLICT (chat_id) DO UPDATE SET '
-                  'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                  (chat_id, fee, fee))
-        _bank_log(c, chat_id, user_id, 'treasury_in', fee, c.fetchone()[0], 'کارمزد اعتبارسنجی')
+        tbal = _reserve_credit(c, fee)
+        _bank_log(c, chat_id, user_id, 'treasury_in', fee, tbal, 'کارمزد اعتبارسنجی')
         return True
 
 
@@ -4132,13 +4149,18 @@ def get_economy_full(chat_id):
 
 
 def get_money_supply(chat_id):
-    """Everything in circulation in one group: wallets + deposits + the treasury."""
+    """Everything in circulation in one group: wallets + deposits.
+
+    The treasury is deliberately NOT part of this any more. It is one pot for the whole
+    bot, so counting it here would count the same size once per group and make every
+    group's inflation move together for reasons that have nothing to do with that group.
+    Size paid into a sink has genuinely left this league's circulation, and the index
+    should say so."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute('SELECT COALESCE((SELECT SUM(size) FROM users WHERE chat_id = %s), 0) '
-                  '     + COALESCE((SELECT SUM(balance) FROM bank_accounts WHERE chat_id = %s), 0) '
-                  '     + COALESCE((SELECT balance FROM bank_treasury WHERE chat_id = %s), 0)',
-                  (chat_id, chat_id, chat_id))
+                  '     + COALESCE((SELECT SUM(balance) FROM bank_accounts WHERE chat_id = %s), 0)',
+                  (chat_id, chat_id))
         return float(c.fetchone()[0] or 0)
 
 
@@ -4164,9 +4186,8 @@ def tick_inflation(chat_id, today_str):
         inflation, supply_last = float(row[0]), row[1]
 
         c.execute('SELECT COALESCE((SELECT SUM(size) FROM users WHERE chat_id = %s), 0) '
-                  '     + COALESCE((SELECT SUM(balance) FROM bank_accounts WHERE chat_id = %s), 0) '
-                  '     + COALESCE((SELECT balance FROM bank_treasury WHERE chat_id = %s), 0)',
-                  (chat_id, chat_id, chat_id))
+                  '     + COALESCE((SELECT SUM(balance) FROM bank_accounts WHERE chat_id = %s), 0)',
+                  (chat_id, chat_id))
         supply = float(c.fetchone()[0] or 0)
 
         if supply_last is None or float(supply_last) <= 0:
@@ -4308,10 +4329,10 @@ def apply_decree(chat_id, king_id, king_name, today_str, code, title, kind, eff)
         inflation, unrest, fee_m, int_m, grow_m = (float(x) for x in row)
         inflation_before = inflation
 
-        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
-                  (chat_id,))
-        trow = c.fetchone()
-        treasury = float(trow[0]) if trow else 0.0
+        # What this group could actually draw on, not the whole bot's reserve: a
+        # corrupt decree helps itself to a fraction of "the treasury", and the treasury
+        # is now shared with every other group. See _group_weight.
+        treasury = _group_claim(c, chat_id)
 
         king_delta = 0.0
         treasury_delta = 0.0
@@ -4422,11 +4443,12 @@ def apply_decree(chat_id, king_id, king_name, today_str, code, title, kind, eff)
                           (chat_id, king_id, king_delta, krow[0], 'decree', title))
 
         if abs(treasury_delta) > 0.009:
-            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                      'ON CONFLICT (chat_id) DO UPDATE SET '
-                      'balance = GREATEST(0, COALESCE(bank_treasury.balance,0) + %s) '
-                      'RETURNING balance', (chat_id, max(0.0, treasury_delta), treasury_delta))
-            _bank_log(c, chat_id, king_id, 'decree', treasury_delta, c.fetchone()[0], title)
+            if treasury_delta > 0:
+                tbal = _reserve_credit(c, treasury_delta)
+            else:
+                treasury_delta, tbal = _reserve_take(c, -treasury_delta)
+                treasury_delta = -treasury_delta
+            _bank_log(c, chat_id, king_id, 'decree', treasury_delta, tbal, title)
 
         # --- the dials ---
         inflation = max(INFLATION_MIN, min(INFLATION_MAX,

@@ -120,7 +120,7 @@ kill theft and challenges in one move.
 
 Two invariants hold the economy together, and both have regression coverage:
 
-- **The bank cannot mint size.** Interest is paid *only* out of `bank_treasury`, and
+- **The bank cannot mint size.** Interest is paid *only* out of `central_bank.reserve`, and
   `pay_interest` scales every depositor down by the same factor when the treasury can't
   cover what's owed. An empty treasury pays exactly zero. **The rate itself now moves
   with the treasury** (see below), so that proportional haircut is the backstop rather
@@ -133,40 +133,57 @@ Two invariants hold the economy together, and both have regression coverage:
   depositor's balance into the thief's wallet in one transaction, and returns the
   per-victim amounts so the group message can name who paid.
 
-### One central bank over every group
+### Balances are local. The bank is global.
 
-Every group's `bank_treasury` row is now a **member account** of one central bank, not a
-vault of its own. The pooled reserve is deliberately **derived** — `SUM(bank_treasury.balance)`,
-never a second stored number — which is what made this merge safe to ship against live
-balances: the twenty-odd places that already credit or debit a group's treasury keep
-working untouched, "pool == sum of shares" is true by construction rather than an
-invariant something could break, and **no destructive migration was needed at all**.
-Only `central_bank.loans_out` is stored, because nothing else derives it.
+That one line is the whole design, and the two halves are separate on purpose:
 
-What actually merged is behaviour:
+- **`users.size` is per `(user, chat)` and always will be.** 100 in one group and 1000
+  in another are two unrelated numbers. Every group is still an independent league with
+  its own leaderboard, its own king, its own theft and its own challenges.
+- **There is exactly one treasury for the entire bot**, stored as `central_bank.reserve`
+  — a single number, not a vault per group and not a pool of member accounts. Every sink
+  feeds it and every payout comes out of it, whichever group the player was standing in.
+  `bank_treasury` still exists but holds only per-group *bookkeeping*: which day this
+  group's interest was last paid, and when its last heist was attempted.
 
-- **One rate for the whole bot**, off pooled coverage (`reserve / deposits` across every
-  group). The crown's `interest_mult` is still per group, so two groups can see
-  different rates off the same coverage — the bank is shared, the politics are not.
-- **Interest is paid from the pool**, with the cost split across member accounts in
-  proportion (`_cb_spread_cost`). A group whose own share is empty still pays its savers,
-  funded by the richer groups. That is the whole point of a central bank.
-- **`/vam` lends out of pooled deposits** rather than the sink-fed reserve.
+An earlier version kept a `balance` per group and derived the pool as their `SUM`. That
+was a safe way to merge the *behaviour* without touching live balances, but it left the
+storage saying something the game no longer meant, and every read had to decide whether
+it wanted the group's share or the sum. `init_db` now folds those rows into the one
+number and **drops the column**, guarded by the `bot_meta` key
+`treasury_merged_global`. Dropping rather than zeroing is deliberate: a stale column
+that still looks authoritative is the drift bug class this repo keeps hitting, and code
+that still reads it should fail loudly instead of quietly seeing `0`.
 
-Two things stay per group, and both are load-bearing:
+The same migration also clears `economy.supply_last`, because `get_money_supply` no
+longer counts a treasury share — without that reset, the first night after the deploy
+would read the *definition change* as a collapse in every group's money supply and
+deflate every price in the game.
 
-- **Deposits remember which group they were made in.** Withdrawals only work in the
-  group the deposit was made in. If they didn't, "deposit in the farm group, withdraw in
-  the main group" would be a free, frictionless cross-group transfer and would reopen
-  the exact farm-group exploit the `/enteghal` gate exists to stop. There is a
-  regression test asserting it.
-- **A heist reaches only the raided group's share and its own depositors.** A global
-  drain would mean one player winning an 8-symbol memory game wipes out every player in
-  every group.
+**One group's claim on the pot is bounded, and that bound is load-bearing.** A heist
+takes a fraction of "the treasury", and so does a corrupt decree. Against one global pot
+those would let a lucky player in the smallest group on the bot walk off with the vault
+backing every other group's savers — the exact failure the old per-group split prevented
+by accident. So `db._group_weight` derives a group's weight (its wallets + deposits over
+every group's) and `_group_claim` scales the draw by it. It is **derived, never stored**:
+there is no per-group treasury for it to be a balance of, and it exists only to bound
+withdrawals, never to hold money. Negative wallets are floored at zero — a group carrying
+a big debtor is not thereby smaller.
+
+Interest is deliberately **not** weight-capped: that is the bank honouring a debt it owes
+to named savers, not a group helping itself to the pot. A group whose players have paid
+nothing into the treasury still pays its savers, funded by the groups that have. That is
+what a shared bank *is*, and there is a regression test asserting it.
+
+The other thing that stays per group is **deposits remember which group they were made
+in.** Withdrawals only work in the group the deposit was made in. If they didn't,
+"deposit in the farm group, withdraw in the main group" would be a free, frictionless
+cross-group transfer and would reopen the exact farm-group exploit the `/enteghal` gate
+exists to stop. There is a regression test asserting it.
 
 ### Deposits fund loans, which is what makes it a bank and not a box
 
-`accept_loan`'s treasury branch takes `principal` out of the pooled deposits and books it
+`accept_loan`'s treasury branch takes `principal` out of the deposits and books it
 as `loans_out`; `settle_loan` retires the principal and books **only the interest** as
 reserve. Booking the whole `due_amount` as reserve — which is what it used to do — would
 count the principal twice now that it came from deposits rather than from the vault.
@@ -249,7 +266,7 @@ treasury, decide explicitly which of the two it is.
 ### The account-maintenance fee is what makes the rate self-funding
 
 `BANK_MAINTENANCE_FEE_RATIO` is charged nightly on every deposit balance, straight into
-that group's own member account of the reserve. It is the structural half of the fix:
+the one reserve. It is the structural half of the fix:
 the fee is levied on **precisely the number the interest bill is levied on**, so cost and
 income scale together by construction rather than by luck. A saver nets
 `(rate − fee)` a day.
@@ -259,9 +276,11 @@ Three details that are load-bearing:
 - It is charged **after** interest lands and **inside the same `claim_interest_run`
   slot**, so a restart can no more double-charge the fee than it can double-pay the
   interest.
-- It is charged to the group's **own** share, not spread across the pool
-  (`_cb_spread_cost`), because this group's savers are the ones paying it — unlike
-  interest, which the pool cross-subsidises.
+- It lands in the one reserve like every other fee. It used to be charged to the
+  group's own member account specifically so that this group's savers funded their own
+  maintenance; with a single pot there is nowhere else for it to go, and the
+  cost-tracks-income argument above is unaffected because both are levied on the same
+  deposit base.
 - It is logged as `treasury_in`, so it feeds the income window above. That is the
   feedback loop: a bigger deposit base directly funds the rate paid on it.
 
@@ -516,8 +535,8 @@ main lever if usury turns out to be too safe for lenders.
 the central bank. Only holdings are per `(user, chat)`, because size is. Prices move
 every minute via `crypto_tick_job`, a `run_repeating` at `CRYPTO_TICK_SECONDS`.
 
-**The central bank's pooled reserve is the counterparty on both legs, and that is the
-entire economic design.** A buy moves size into the pool; a sell moves it back out.
+**The one treasury is the counterparty on both legs, and that is the entire economic
+design.** A buy moves size into it; a sell moves it back out.
 Nothing is created and nothing is destroyed — the same shape as the spectator book's
 house, except that here the house **cannot mint at all**:
 
@@ -526,18 +545,17 @@ house, except that here the house **cannot mint at all**:
 > in the player's hands. A coin that has tripled is a claim on the bank, not a claim on
 > the universe.
 
-Liquidity is **pooled, not per group** — one deep book for the whole bot, since a market
-whose depth depended on which group you happened to be in would be arbitrary. The buy
-credits via `_cb_spread_credit` and the sell debits via `_cb_spread_cost`, both
-proportional across member accounts, exactly like `pay_interest`.
+Liquidity is the whole bot's, not the trading group's — a market whose depth depended on
+which group you happened to be in would be arbitrary.
 
-**Both legs must be pooled or neither**, and this is the part to be careful with. Pooling
-only the payout — the obvious way to give the market deeper liquidity — is farmable: a
-player in a group holding 1% of the pool could buy and immediately sell at a flat price,
-moving ~1020 out of the other groups' shares into their own for a personal cost of 60,
-and a group's own share is exactly what a heist reaches. `_cb_spread_credit` exists to
-close that, and there is a regression test that runs flat round trips from a 0.2% group
-and asserts no other group is drained.
+This used to be the delicate part. When the vault was a pool of per-group accounts, both
+legs had to be spread proportionally or neither: crediting one group's account while
+debiting everyone's was farmable — a player in a group holding 0.2% of the pool could
+round-trip at a flat price and quietly move the other groups' shares into their own, and
+a group's own share was exactly what a heist reached. **With a single stored number there
+are no shares left to move between, so that attack is structurally gone rather than
+merely closed.** The regression test now asserts the only thing a flat round trip can do
+is pay the bank its two fees, and that no wallet in any other group moves at all.
 
 That one rule is what keeps this from being a money printer, and there are regression
 tests asserting it: a 50× moonshot against a thin vault stays exactly zero-sum, the
@@ -595,8 +613,8 @@ Two consequences worth knowing before retuning any of it:
   across both players and the bank.
 
 A partial fill has to be **solved, not divided**. Fewer units means less impact means a
-higher price per unit, so `available / price` overshoots — and `_cb_spread_cost` caps
-what it takes from the pool while the wallet is credited in full, which mints. Proceeds
+higher price per unit, so `available / price` overshoots — and `_reserve_take` caps what
+it hands over while the wallet is credited in full, which mints. Proceeds
 are monotonically increasing in units inside the cap, so `crypto_sell` bisects for the
 largest fill the bank can honour. This was a real bug, caught by the conservation test.
 
@@ -636,8 +654,8 @@ toward the leaderboard or the crown — until you sell, it isn't size.
 
 ## Fees are transfers, never sinks
 
-Every fee in the game moves size into `bank_treasury` via `db.treasury_add` (or, inside
-a bank/transfer transaction, an inline treasury upsert). None of them delete size. This
+Every fee in the game moves size into the one reserve via `db.treasury_add` (or, inside
+a bank/transfer transaction, `db._reserve_credit`). None of them delete size. This
 matters because the treasury is the *only* thing funding deposit interest: a fee that
 deleted size would quietly lower everyone's yield instead of raising it.
 
@@ -677,7 +695,7 @@ for the week) — on top of, not instead of, whatever the nightly supply-driven
 before this call) must never bump inflation again for the same sellout event; only the
 purchase that actually crosses the cap does.
 
-As before, every centimetre paid lands directly in `bank_treasury` via
+As before, every centimetre paid lands directly in the shared treasury via
 `db.treasury_add` — the shop was already one of the treasury's few real sinks, and that
 did not change.
 
@@ -801,8 +819,12 @@ size — quietly shrinks. That single asymmetry is why savers and debtors want o
 kings, and it is the whole reason the crown's choices matter to anyone but the king.
 
 It moves two ways. `tick_inflation` runs nightly and chases the actual money supply
-(wallets + deposits + treasury), so a group that prints finds its shop expensive without
-anyone deciding that. Decrees push the same number deliberately.
+(**wallets + deposits — the group's own**, not the shared treasury), so a group that
+prints finds its shop expensive without anyone deciding that. The treasury is
+deliberately excluded now that it is one pot for the whole bot: counting it would count
+the same size once per group and make every group's index move together for reasons that
+have nothing to do with that group. Size paid into a sink genuinely has left this
+league's circulation, and the index should say so. Decrees push the same number deliberately.
 
 ### The decrees are asymmetric on purpose
 

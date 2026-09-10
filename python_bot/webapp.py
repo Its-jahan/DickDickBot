@@ -366,7 +366,10 @@ def api_economy():
     crown, _changed = bot.refresh_king(chat_id)
     rate, _b, cov = bot.bank_effective_rate(chat_id)
     income = db.get_treasury_income(bot.BANK_INCOME_WINDOW_DAYS)
+    # One treasury for the whole bot; `group_claim` is the most of it this group could
+    # ever draw (a heist, a corrupt decree) - see db._group_weight.
     treasury, _t2, _t3 = db.get_treasury(chat_id)
+    group_claim = db.group_reserve_claim(chat_id)
     return jsonify({
         'ok': True,
         'inflation': float(e[0]), 'unrest': float(e[1]),
@@ -375,7 +378,8 @@ def api_economy():
         'consort': crown[3] if crown else None,
         'is_king': bool(crown) and crown[0] == uid,
         'bank_rate': rate, 'coverage': cov,
-        'bank_income': income, 'group_share': float(treasury or 0),
+        'bank_income': income, 'treasury': float(treasury or 0),
+        'group_claim': float(group_claim or 0),
     })
 
 

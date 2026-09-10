@@ -3223,9 +3223,9 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   💼 جیب (قابل دزدیدن): {int(wallet)} سانت\n"
         f"   🔒 بانک (امن از دزدی): {int(balance)} سانت\n"
         f"   📥 سقف واریز امروز: {remaining} از {cap} سانت\n\n"
-        f"🏛 صندوق گروه\n"
-        f"   💰 خزانه: {int(treasury)} سانت\n"
-        f"   🧾 کل سپرده‌ها: {int(total_dep)} سانت از {holders} نفر\n\n"
+        f"🏛 خزانهٔ مشترک (یکی برای کل بات)\n"
+        f"   💰 موجودی خزانه: {int(treasury)} سانت\n"
+        f"   🧾 سپرده‌های این گروه: {int(total_dep)} سانت از {holders} نفر\n\n"
         f"📈 سود روزانهٔ الان: {live_rate*100:.2f}٪ "
         f"(پوشش ذخیره {live_cov*100:.0f}٪ سپرده‌ها)\n"
         f"🧾 کارمزد نگهداری حساب: {maint*100:.2f}٪ در روز\n"
@@ -3356,7 +3356,7 @@ async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.track_chat(chat_id)
     cb = db.get_central_bank()
-    my_share, _, _ = db.get_treasury(chat_id)
+    my_claim = db.group_reserve_claim(chat_id)
     my_dep, my_holders = db.get_bank_totals(chat_id)
     rate, _base, cov = bank_effective_rate(chat_id)
 
@@ -3375,7 +3375,7 @@ async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         "🏛 <b>بانک مرکزی</b> — همهٔ گروه‌ها زیر یک بانک", "",
         "<b>دارایی‌ها</b>",
-        f"   💰 ذخیره (سهم همهٔ گروه‌ها): {int(cb['reserve'])} سانت",
+        f"   💰 خزانه (یکی، مشترکِ همهٔ گروه‌ها): {int(cb['reserve'])} سانت",
         f"   📄 وام‌های پرداخت‌شده: {int(cb['loans_out'])} سانت", "",
         "<b>بدهی‌ها</b>",
         f"   🔒 سپردهٔ مردم: {int(cb['deposits'])} سانت",
@@ -3394,9 +3394,11 @@ async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   🧾 کارمزد نگهداری: {maint*100:.2f}٪ روزانهٔ سپرده‌ها",
         "   └ نرخ سود از درآمد بانک تغذیه می‌شه — بیشتر از اون پرداخت نمی‌کنه",
         "",
-        "<b>سهم این گروه</b>",
-        f"   🏛 تو ذخیره: {int(my_share)} سانت",
+        "<b>این گروه</b>",
         f"   🔒 سپردهٔ اعضا: {int(my_dep)} سانت از {my_holders} نفر",
+        f"   🥷 سقف برداشت از خزانه: {int(my_claim)} سانت",
+        "   └ خزانه یکیه، ولی هر گروه فقط به‌اندازهٔ وزنش (سایز اعضا + سپرده‌ها)",
+        "      می‌تونه ازش برداره — با سرقت یا فرمان پادشاه.",
     ]
     lines.append(f"\n🏛 نرخ وام بانکی الان: {bank_loan_rate(chat_id)*100:.0f}٪ "
                  f"(+{int(BANK_LOAN_ORIGINATION_RATIO*100)}٪ کارمزد صدور)")
@@ -3471,9 +3473,12 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اول امروز /d بزن بعد برو سراغ بانک! 🥷")
         return
 
-    treasury, _, _ = db.get_treasury(chat_id)
+    # What's actually stealable. The treasury is one pot shared with every other group,
+    # so a heist reaches this group's CLAIM on it (bounded by the group's weight in the
+    # bot - see db._group_weight), never the whole thing: one lucky memory game must not
+    # be able to empty the vault backing every player in every group.
+    treasury = db.group_reserve_claim(chat_id)
     total_dep, holders = db.get_bank_totals(chat_id)
-    # What's actually stealable: the treasury plus everyone else's deposits.
     others = max(0.0, total_dep - db.get_bank(user.id, chat_id)[0])
     vault = treasury + others
     if vault < HEIST_MIN_VAULT:
@@ -3870,16 +3875,16 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
 # argue about the same price. Only holdings are per (user, chat), because size is.
 #
 # THE CENTRAL BANK'S POOLED RESERVE IS THE COUNTERPARTY, and that is the entire economic
-# design. A buy moves size into the pool; a sell moves it back out. Nothing is created
+# design. A buy moves size into the treasury; a sell moves it back out. Nothing is created
 # and nothing is destroyed, exactly like the spectator book's house - except that here
 # the house cannot mint at all: a sale the reserve cannot cover is PARTIALLY FILLED (see
 # db.crypto_sell) rather than paid out of thin air. A coin that has tripled is a claim on
 # the bank, not a claim on the universe.
 #
-# Pooled rather than per group on both legs. One deep book for the whole bot is the point
-# - a market whose depth depended on which group you were in would be arbitrary - but the
-# symmetry is also load-bearing: crediting one group while debiting everyone would be
-# farmable. See db._cb_spread_credit.
+# One deep book for the whole bot, because a market whose depth depended on which group
+# you happened to be in would be arbitrary. This used to be the delicate part: with a
+# vault split into per-group accounts, crediting one group while debiting everyone was
+# farmable. There is one stored number now, so there are no shares left to move between.
 #
 # The house edge is CRYPTO_FEE_RATIO on both legs, which is where the bank's new daily
 # income actually comes from: a round trip costs a trader ~6% whatever the price does,
@@ -4439,7 +4444,7 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.track_chat(chat_id)
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    treasury, _, _ = db.get_treasury(chat_id)
+    cb = db.get_central_bank()
     score, repaid, late, defaults = db.get_credit(user.id, chat_id)
     loan_rate = bank_loan_rate(chat_id)
     # The official bank is the strict lender: bad credit is refused outright rather
@@ -4454,7 +4459,9 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return
-    ceiling = int(min(_credit_cap(size, score), treasury * BANK_LOAN_MAX_TREASURY_SHARE))
+    # Bounded by the bank's remaining lending headroom, not by a group's own vault -
+    # there isn't one any more. accept_loan re-checks this against the live books.
+    ceiling = int(min(_credit_cap(size, score), cb['lendable'] * BANK_LOAN_MAX_TREASURY_SHARE))
 
     parts = update.message.text.split()
     amount = None
@@ -4469,7 +4476,8 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"نرخ: {loan_rate*100:.0f}٪ — سررسید {LOAN_TERM_DAYS} روز\n"
             f"🧾 کارمزد صدور: {int(BANK_LOAN_ORIGINATION_RATIO*100)}٪ (از مبلغ وام کم می‌شه)\n"
             f"📊 امتیاز اعتباریت: {score}/200 — {_credit_grade(score)}\n"
-            f"💰 خزانه: {int(treasury)} سانت\n"
+            f"💰 خزانهٔ مشترک: {int(cb['reserve'])} سانت\n"
+            f"🪙 ظرفیت وام‌دهی باقی‌مونده: {int(cb['lendable'])} سانت\n"
             f"📈 سقف وام تو الان: {ceiling} سانت\n\n"
             f"/vam <مقدار>"
         )
@@ -4481,7 +4489,7 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"سقف وام تو الان {ceiling} سانته.\n"
             f"(سایز {int(size)} × ضریب اعتبار {_credit_factor(score):.2f}، "
-            f"و سقف خزانه: {int(treasury)} سانت)"
+            f"و ظرفیت وام‌دهی بانک: {int(cb['lendable'])} سانت)"
         )
         return
     if db.count_active_loans(chat_id, user.id, as_lender=False) >= LOAN_MAX_BORROWER_LOANS:
@@ -4985,8 +4993,10 @@ async def economy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supply = db.get_money_supply(chat_id)
     treasury, _, _ = db.get_treasury(chat_id)
     deposits, holders = db.get_bank_totals(chat_id)
-    econ_cov = bank_coverage(treasury, deposits)
-    econ_rate = max(0.0, min(0.50, bank_base_rate(treasury, deposits) * int_m))
+    # One treasury and one rate for the whole bot, so quote the same function /bank and
+    # tonight's job use rather than recomputing a local one off this group's numbers -
+    # a shown number drifting from the paid one is a bug class this repo has already hit.
+    econ_rate, _econ_base, econ_cov = bank_effective_rate(chat_id)
     kingdom = db.get_kingdom(chat_id)
     king = kingdom[1] if kingdom and kingdom[1] else "—"
 
