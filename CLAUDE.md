@@ -516,15 +516,28 @@ main lever if usury turns out to be too safe for lenders.
 the central bank. Only holdings are per `(user, chat)`, because size is. Prices move
 every minute via `crypto_tick_job`, a `run_repeating` at `CRYPTO_TICK_SECONDS`.
 
-**The treasury is the counterparty on both legs, and that is the entire economic
-design.** A buy moves size into the vault; a sell moves it back out. Nothing is created
-and nothing is destroyed — the same shape as the spectator book's house, except that
-here the house **cannot mint at all**:
+**The central bank's pooled reserve is the counterparty on both legs, and that is the
+entire economic design.** A buy moves size into the pool; a sell moves it back out.
+Nothing is created and nothing is destroyed — the same shape as the spectator book's
+house, except that here the house **cannot mint at all**:
 
-> A sale the treasury cannot cover is **partially filled** (`db.crypto_sell` scales the
-> units down to what the vault can actually pay) and the remainder of the position stays
-> in the player's hands. A coin that has tripled is a claim on the vault, not a claim on
+> A sale the reserve cannot cover is **partially filled** (`db.crypto_sell` scales the
+> units down to what the bank can actually pay) and the remainder of the position stays
+> in the player's hands. A coin that has tripled is a claim on the bank, not a claim on
 > the universe.
+
+Liquidity is **pooled, not per group** — one deep book for the whole bot, since a market
+whose depth depended on which group you happened to be in would be arbitrary. The buy
+credits via `_cb_spread_credit` and the sell debits via `_cb_spread_cost`, both
+proportional across member accounts, exactly like `pay_interest`.
+
+**Both legs must be pooled or neither**, and this is the part to be careful with. Pooling
+only the payout — the obvious way to give the market deeper liquidity — is farmable: a
+player in a group holding 1% of the pool could buy and immediately sell at a flat price,
+moving ~1020 out of the other groups' shares into their own for a personal cost of 60,
+and a group's own share is exactly what a heist reaches. `_cb_spread_credit` exists to
+close that, and there is a regression test that runs flat round trips from a 0.2% group
+and asserts no other group is drained.
 
 That one rule is what keeps this from being a money printer, and there are regression
 tests asserting it: a 50× moonshot against a thin vault stays exactly zero-sum, the

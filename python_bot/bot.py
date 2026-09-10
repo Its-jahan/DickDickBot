@@ -3850,12 +3850,17 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
 # One market for the whole bot: a coin costs the same in every group, so two groups can
 # argue about the same price. Only holdings are per (user, chat), because size is.
 #
-# THE TREASURY IS THE COUNTERPARTY, and that is the entire economic design. A buy moves
-# size into the vault; a sell moves it back out. Nothing is created and nothing is
-# destroyed, exactly like the spectator book's house - except that here the house cannot
-# mint at all: a sale the treasury cannot cover is PARTIALLY FILLED (see db.crypto_sell)
-# rather than paid out of thin air. A coin that has tripled is a claim on the vault, not
-# a claim on the universe.
+# THE CENTRAL BANK'S POOLED RESERVE IS THE COUNTERPARTY, and that is the entire economic
+# design. A buy moves size into the pool; a sell moves it back out. Nothing is created
+# and nothing is destroyed, exactly like the spectator book's house - except that here
+# the house cannot mint at all: a sale the reserve cannot cover is PARTIALLY FILLED (see
+# db.crypto_sell) rather than paid out of thin air. A coin that has tripled is a claim on
+# the bank, not a claim on the universe.
+#
+# Pooled rather than per group on both legs. One deep book for the whole bot is the point
+# - a market whose depth depended on which group you were in would be arbitrary - but the
+# symmetry is also load-bearing: crediting one group while debiting everyone would be
+# farmable. See db._cb_spread_credit.
 #
 # The house edge is CRYPTO_FEE_RATIO on both legs, which is where the bank's new daily
 # income actually comes from: a round trip costs a trader ~6% whatever the price does,
@@ -3973,7 +3978,8 @@ async def crypto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     held = {sym: (amt, avg) for sym, amt, avg in
             db.crypto_holdings_of(update.effective_user.id, chat_id)}
-    treasury, _, _ = db.get_treasury(chat_id)
+    # Pooled, not this group's slice: the counterparty is the central bank.
+    liquidity = db.get_central_bank()['reserve']
 
     lines = ["📉 <b>بازار کریپتوی دودول</b>", "قیمت‌ها هر دقیقه تکون می‌خورن.", ""]
     for sym, name, price, prev, base, _vol in rows:
@@ -3988,7 +3994,7 @@ async def crypto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     lines += [
         "",
-        f"🏛 نقدینگی بازار (خزانهٔ گروه): {int(treasury)} سانت",
+        f"🏛 نقدینگی بازار (ذخیرهٔ بانک مرکزی): {int(liquidity)} سانت",
         f"🧾 کارمزد هر معامله: {int(CRYPTO_FEE_RATIO*100)}٪ → مستقیم به خزانه",
         "",
         "🛒 /kharid &lt;کوین&gt; &lt;سانت&gt;",

@@ -2227,6 +2227,46 @@ def _cb_spread_cost(c, amount):
     return take
 
 
+def _cb_spread_credit(c, amount, fallback_chat_id):
+    """Credits `amount` INTO the pooled reserve, split across the member accounts in
+    proportion to what each already holds - the mirror of _cb_spread_cost.
+
+    Both directions must be pooled or neither. Crediting one group's account while
+    debiting everyone's is not merely inconsistent, it is farmable: a player in a group
+    holding 1% of the pool could buy and immediately sell at a flat price, moving ~1020
+    out of the other groups' shares and into their own for a personal cost of 60 - and
+    a group's own share is exactly what a heist reaches. Symmetry is what closes that.
+
+    `fallback_chat_id` takes the whole credit when the pool is empty and there are no
+    proportions to split by, so a market can bootstrap from zero."""
+    if amount <= 0:
+        return 0.0
+    c.execute('SELECT chat_id, COALESCE(balance,0) FROM bank_treasury '
+              'WHERE COALESCE(balance,0) > 0 ORDER BY chat_id FOR UPDATE')
+    rows = c.fetchall()
+    total = sum(float(b) for _cid, b in rows)
+    if total <= 0:
+        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET '
+                  'balance = COALESCE(bank_treasury.balance,0) + %s',
+                  (fallback_chat_id, amount, amount))
+        return float(amount)
+    # Largest share absorbs the rounding remainder, so the credits sum to `amount`
+    # exactly and the pool never drifts from what was actually paid in.
+    credits, running = [], 0.0
+    for cid, bal in rows:
+        part = round(float(amount) * (float(bal) / total), 2)
+        credits.append([cid, part])
+        running += part
+    credits[max(range(len(credits)), key=lambda i: float(rows[i][1]))][1] += round(float(amount) - running, 2)
+    for cid, part in credits:
+        if part <= 0:
+            continue
+        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) + %s '
+                  'WHERE chat_id = %s', (part, cid))
+    return float(amount)
+
+
 def treasury_add(chat_id, amount, note=None):
     """The only way size enters the treasury: a sink hands over what it just destroyed.
     Called from the spots that used to simply delete size."""
@@ -2489,9 +2529,10 @@ def crypto_holdings_of(user_id, chat_id):
 def crypto_buy(user_id, chat_id, symbol, units, price, fee_ratio, today_str, daily_cap):
     """Buys `units` at `price`, wallet -> treasury, in ONE transaction.
 
-    The treasury is the counterparty, exactly like the spectator book's house: the size
-    a buyer spends is not destroyed, it is held against the position and paid back out
-    on a sale. Only the FEE is income, and it is the only part logged as 'treasury_in'.
+    The CENTRAL BANK's pooled reserve is the counterparty, exactly like the spectator
+    book's house: the size a buyer spends is not destroyed, it is held against the
+    position and paid back out on a sale. Only the FEE is income, and it is the only
+    part logged as 'treasury_in'.
 
     Returns (True, spent, fee, new_amount, new_avg) or (False, reason, remaining_cap)."""
     gross = round(units * price, 2)
@@ -2539,10 +2580,11 @@ def crypto_buy(user_id, chat_id, symbol, units, price, fee_ratio, today_str, dai
                       'VALUES (%s,%s,%s,%s,%s,%s)',
                       (chat_id, user_id, -fee, after, 'crypto_fee', symbol))
 
-        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
-                  'ON CONFLICT (chat_id) DO UPDATE SET '
-                  'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
-                  (chat_id, total, total))
+        # Into the POOL, spread across every member account - the market's counterparty
+        # is the central bank, not this group's share. See _cb_spread_credit for why
+        # both legs have to be pooled rather than just the payout.
+        _cb_spread_credit(c, total, chat_id)
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
         tbal = float(c.fetchone()[0])
         _bank_log(c, chat_id, user_id, 'crypto_in', gross, tbal, f'خرید {symbol}')
         if fee > 0:
@@ -2565,11 +2607,16 @@ def crypto_buy(user_id, chat_id, symbol, units, price, fee_ratio, today_str, dai
 def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
     """Sells up to `units` at `price`, treasury -> wallet, in ONE transaction.
 
-    PARTIALLY FILLS rather than minting. The treasury is the counterparty, so a sale it
-    cannot cover is a market with no liquidity, not a licence to create size: whatever
-    the vault can actually pay is sold and the rest of the position simply stays put.
-    That is the one rule keeping this feature from becoming a money printer, since a
-    coin that has doubled would otherwise pay out size nobody ever put in.
+    PARTIALLY FILLS rather than minting. The central bank's POOLED reserve is the
+    counterparty, so a sale it cannot cover is a market with no liquidity, not a licence
+    to create size: whatever the bank can actually pay is sold and the rest of the
+    position simply stays put. That is the one rule keeping this feature from becoming a
+    money printer, since a coin that has doubled would otherwise pay out size nobody
+    ever put in.
+
+    Liquidity is pooled and the cost is spread across every member account, the same way
+    pay_interest works: one deep book for the whole bot instead of a market whose depth
+    depends on which group you happen to be in.
 
     Returns (True, sold_units, net, fee, pnl, left) or (False, reason, held)."""
     if units <= 0:
@@ -2585,10 +2632,11 @@ def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
         held, avg = float(hrow[0]), float(hrow[1])
         units = min(units, held)
 
-        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
-                  (chat_id,))
-        trow = c.fetchone()
-        available = float(trow[0]) if trow else 0.0
+        # Liquidity is the CENTRAL bank's pooled reserve, not this group's slice of it.
+        # A market whose depth depended on which group you happened to be in would be
+        # arbitrary - a small group could barely trade while a rich one traded freely.
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
+        available = float(c.fetchone()[0] or 0.0)
         per_unit_net = price * (1.0 - fee_ratio)
         if per_unit_net <= 0:
             return (False, 'amount', held)
@@ -2606,8 +2654,8 @@ def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
         basis = round(units * avg, 2)
         pnl = round(net - basis, 2)
 
-        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
-                  'WHERE chat_id = %s RETURNING balance', (net, chat_id))
+        _cb_spread_cost(c, net)
+        c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
         tbal = float(c.fetchone()[0])
         # -gross out as a position payout, +fee back in as income: the two sum to the
         # -net actually debited, and only the fee lands in the window get_treasury_income
