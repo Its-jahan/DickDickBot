@@ -7,7 +7,7 @@ import datetime
 from datetime import time
 from zoneinfo import ZoneInfo
 import math
-from telegram import Update, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from telegram.error import Forbidden
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, InlineQueryHandler, CallbackQueryHandler, TypeHandler
 from uuid import uuid4
@@ -82,6 +82,13 @@ async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     its *outgoing* API calls, which is why a total absence of replies was ambiguous."""
     try:
         if update.message is not None:
+            # Cheapest place to learn a group's name: every delivered message carries it,
+            # and this handler already sees every one of them.
+            if update.message.chat.id < 0 and update.message.chat.title:
+                try:
+                    db.track_chat(update.message.chat.id, update.message.chat.title)
+                except Exception:
+                    pass
             logging.info("RX message chat=%s user=%s text=%r",
                          update.message.chat.id,
                          update.message.from_user.id if update.message.from_user else None,
@@ -142,6 +149,7 @@ BOT_COMMANDS = [
     ("sarghat", "🚨 سرقت از بانک گروه (تقریباً غیرممکنه!)"),
     ("vasighe", "🔓 وثیقه برای آزادی از زندان بانک"),
     ("afv", "👑 عفو زندانی بانک (فقط پادشاه)"),
+    ("app", "🎮 باز کردن بازی توی مرورگر"),
     ("crypto", "📉 بازار کریپتو — قیمت‌ها هر دقیقه عوض می‌شن"),
     ("kharid", "🛒 خرید کوین — /kharid بیت‌کیر 100"),
     ("frush", "💰 فروش کوین — /frush بیت‌کیر همه"),
@@ -669,6 +677,7 @@ HELP_TEXT = (
     "📜 /farmanha — تاریخچهٔ فرمان‌ها\n"    "🪖 /hokm — (پادشاه) حکومت نظامی، هر ۳ روز یک بار\n"
     "🤡 /dalghak — دلقک‌های دربار\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
+    "🎮 /app — نسخهٔ وب بازی با تصویر (سایز، جدول، بانک، بازار، فروشگاه، کوله)\n"
     "📉 /crypto — بازار کریپتو، قیمت‌ها هر دقیقه بالا و پایین می‌شن\n"
     "🛒 /kharid <کوین> <سانت> — خرید کوین\n"
     "💰 /frush <کوین> <سانت|همه> — فروش کوین\n"
@@ -4472,6 +4481,27 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+WEBAPP_URL = "https://app.inddex.app/"
+
+
+async def webapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/app` - open the Mini App.
+
+    A WebApp button only works on a button attached to a message, and Telegram refuses
+    web_app buttons in inline mode, so this is a plain command rather than something
+    bolted onto an existing keyboard."""
+    chat_id = update.effective_chat.id
+    if chat_id < 0:
+        db.track_chat(chat_id, update.effective_chat.title)
+    keyboard = [[InlineKeyboardButton("🎮 باز کردن بازی", web_app=WebAppInfo(url=WEBAPP_URL))]]
+    await update.message.reply_text(
+        "🎮 <b>نسخهٔ وب دودول</b>\n\n"
+        "سایز، جدول، بانک، بازار کریپتو، فروشگاه و کوله‌ت — همه با تصویر.\n"
+        "کارهای گروهی (چالش، دزدی، اجماع، سرقت) همچنان همین‌جا توی گروه انجام می‌شن.",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+    )
+
+
 async def debts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/bedehi` - what you owe and what you're owed."""
     user = update.effective_user
@@ -6145,6 +6175,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(vasighe|bail)\b'), heist_bail_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(markazi|centralbank)\b'), central_bank_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(afv|pardon)\b'), heist_pardon_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(app|web|bazi)\b'), webapp_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(crypto|bazar)\b'), crypto_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(kharid|buycoin)\b'), crypto_buy_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(frush|forush|sellcoin)\b'), crypto_sell_cmd))

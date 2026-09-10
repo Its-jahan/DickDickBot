@@ -1,0 +1,22 @@
+# The Mini App, as its own unit. Separate from dickbot and dickbot-admin on purpose:
+# all three read the same database through db.py, and any one of them crashing must
+# not take the other two with it.
+[Unit]
+Description=DickDickBot Mini App
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/DickDickBot/python_bot
+# SUPABASE_DB_URL lives here, mode 600 and outside the repo - same file the admin
+# panel reads. The Mini App needs no secret of its own: it authenticates callers
+# against the bot token, which is already in bot.py.
+EnvironmentFile=/etc/dickbot-admin.env
+ExecStart=/opt/DickDickBot/venv/bin/gunicorn \
+    --workers 2 --bind 127.0.0.1:8012 \
+    --access-logfile - --error-logfile - \
+    webapp:app
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

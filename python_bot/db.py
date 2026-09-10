@@ -170,6 +170,10 @@ def init_db():
         # 'blocked' (never). Heuristics can be gamed by someone patient enough with
         # enough alt accounts, so the last word has to be a human's.
         c.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS xfer_policy TEXT DEFAULT 'auto'")
+        # Group name, so the web app's group picker can say "خانواده" instead of
+        # "-1001858630001". Recorded opportunistically from whatever update comes in -
+        # Telegram is the only source of it and the bot never asked before.
+        c.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS title TEXT")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS inventory (
@@ -696,11 +700,25 @@ def get_last_chat(user_id):
         return rows[0][0] if len(rows) == 1 else None
 
 
-def track_chat(chat_id):
+def track_chat(chat_id, title=None):
+    """`title` is written only when one is supplied, so the ~40 call sites that don't
+    have it can never blank a name the logger already recorded."""
     if chat_id < 0:
         with get_connection() as conn:
             c = conn.cursor()
-            c.execute('INSERT INTO chats (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING', (chat_id,))
+            c.execute('INSERT INTO chats (chat_id, title) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'title = COALESCE(EXCLUDED.title, chats.title)', (chat_id, title))
+
+
+def get_chat_titles(chat_ids):
+    """{chat_id: title} for the ones that have a name recorded."""
+    if not chat_ids:
+        return {}
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT chat_id, title FROM chats WHERE chat_id = ANY(%s)', (list(chat_ids),))
+        return {row[0]: row[1] for row in c.fetchall() if row[1]}
 
 
 def remove_chat(chat_id):

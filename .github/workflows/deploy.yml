@@ -42,3 +42,11 @@ jobs:
               sleep 2
               systemctl is-active dickbot-admin
             fi
+            # Same story for the Mini App (webapp.py): its gunicorn workers keep running
+            # the old code until restarted. Guarded the same way, so a server that has
+            # not had the unit installed yet still deploys cleanly.
+            if systemctl list-unit-files dickbot-web.service >/dev/null 2>&1; then
+              systemctl restart dickbot-web
+              sleep 2
+              systemctl is-active dickbot-web
+            fi

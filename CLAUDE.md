@@ -883,6 +883,65 @@ and `CREDIT_DAILY_GAIN_CAP` bounds a day's total. Penalties are deliberately uns
 credit should be slow to build and quick to lose, and a cheap practice default should
 still hurt.
 
+## The Mini App is a third service, and it imports `bot.py` on purpose
+
+`python_bot/webapp.py` is the browser face of the game: a Flask/gunicorn service
+(`dickbot-web`, 127.0.0.1:8012) at **https://app.inddex.app**, launched from `/app` in
+Telegram. The whole front end is one file, `python_bot/templates/app.html` — no bundler,
+no build step, matching the rest of the repo.
+
+**It imports `bot.py`, and the admin panel deliberately does not. That difference is the
+point.** The panel is a tool that reaches *around* the game; this is the game, in a
+browser. Every price, cap, fee and rate it shows has to be the number the bot itself
+would charge, and two copies of a rule drift — the bug class this codebase keeps getting
+bitten by. `bot.py` imports with no side effects (its whole runtime lives under
+`if __name__ == '__main__'`), so importing it is the drift-safe choice and re-deriving
+its constants inside `webapp.py` would be the dangerous one. There is a regression test
+asserting the rate, the deposit cap, the shop price and the coin price the API returns
+are *identical* to `bank_effective_rate` / `_bank_daily_cap` / `shop_item_price` /
+`crypto_display_price`.
+
+Every write endpoint calls the same `db.py` function the Telegram handler calls, with the
+same constants. `api_shop_buy` in particular mirrors `buy_callback` step for step —
+claim the slot, price off the counts the claim returned, charge, hand over, bump
+inflation only on the purchase that actually crosses a cap. If that ordering changes in
+one, change it in both.
+
+### Auth is Telegram's signature, and nothing else
+
+There is no password and no session store. Telegram hands a Mini App an `initData`
+string carrying the user plus an HMAC-SHA256 taken with a key derived from the bot token;
+`_verify_init_data` checks it with `compare_digest` and rejects anything older than
+`INIT_DATA_MAX_AGE_SECONDS` — a valid signature over a stale payload is still stale, and
+without that check a leaked `initData` would be a permanent credential.
+
+**Two rules that must not be relaxed:**
+
+- The user id comes *only* from the verified payload, never from the request body.
+- `_scope()` checks the client-supplied `chat_id` against `db.get_user_groups(user_id)`
+  before anything reads or writes. Without it, changing one number in a request would
+  read — and trade against — any group in the bot. Every league is independent here for
+  exactly the reason it is in the bot. There are tests asserting a player cannot read or
+  write a group they are not in, that an unsigned caller gets 403, that a payload signed
+  with a different token is refused, and that swapping the user id while keeping the
+  signature is refused.
+
+`X-Frame-Options` is deliberately **not** set: Telegram has to be able to frame a Mini
+App. That is asserted too, so nobody "hardens" it into a blank screen.
+
+### What is deliberately not in it
+
+Challenges, theft, `/ejma`, heists, decrees and the crown's powers are absent by design,
+not by omission. Their entire point is a message landing in the chat for other people to
+react to, and a browser tab has nobody to post to. The home screen links back to the chat
+for those instead. Item use follows the same line: theft items and the golden ticket can
+be armed from the web because they only touch the player's own state, while anything
+needing a target (`DIRECT_ITEMS`) is pushed back to the group.
+
+`chats.title` is recorded opportunistically in `log_incoming` — every delivered message
+carries the group name and that handler already sees all of them — purely so the group
+picker can say a name instead of a chat id.
+
 ## Admin panel
 
 `python_bot/admin_panel.py` is a separate Flask/gunicorn service (`dickbot-admin`,
