@@ -3893,6 +3893,19 @@ CRYPTO_DAILY_BUY_RATIO = 0.30
 CRYPTO_DAILY_BUY_FLOOR = 50
 CRYPTO_MIN_TRADE = 5
 
+# Real demand, on top of the random walk: a coin the market is long trades above its
+# mid, one the market is short trades below it. CRYPTO_IMPACT_DEPTH is the net notional
+# that would move a price a full 100% if the cap let it, so ~1000 of net buying moves a
+# coin about 10%.
+#
+# Pumping is closed by the PRICING, not by a limit - db._crypto_exec_price charges the
+# average price along the move, which makes an immediate round trip return exactly what
+# it cost. A whale can shove a price wherever they like and will get back precisely
+# their own money minus two fees. The cap below is not what stops the pump; it only
+# stops the board showing absurd numbers and bounds what the bank is on the hook for.
+CRYPTO_IMPACT_DEPTH = 10000.0
+CRYPTO_IMPACT_CAP = 0.50
+
 _crypto_rng = random.SystemRandom()
 
 
@@ -3914,6 +3927,15 @@ def crypto_next_price(price, base, vol):
     return round(max(base * CRYPTO_MIN_MULT, min(base * CRYPTO_MAX_MULT, nxt)), 4)
 
 
+def crypto_display_price(mid, base_price, net_units):
+    """What a coin is quoted at right now: the random walk's mid, shifted by how long
+    or short the market as a whole is. This is the number players see; what a given
+    order actually fills at also depends on its own size (db._crypto_exec_price)."""
+    impact = db._crypto_impact(float(net_units) * float(base_price),
+                               CRYPTO_IMPACT_DEPTH, CRYPTO_IMPACT_CAP)
+    return max(0.0001, float(mid) * (1.0 + impact))
+
+
 async def crypto_tick_job(context: ContextTypes.DEFAULT_TYPE):
     """Moves every price, once a minute, silently. Deliberately posts nothing: at one
     tick a minute any announcement would be pure spam, and /crypto is where the board
@@ -3923,8 +3945,8 @@ async def crypto_tick_job(context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             return
         db.crypto_set_prices([
-            (sym, crypto_next_price(price, base, vol))
-            for sym, _name, price, _prev, base, vol in rows
+            (sym, crypto_next_price(mid, base, vol))
+            for sym, _name, mid, _prev, base, vol, _net in rows
         ])
     except Exception:
         logging.exception("crypto tick failed")
@@ -3981,14 +4003,25 @@ async def crypto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Pooled, not this group's slice: the counterparty is the central bank.
     liquidity = db.get_central_bank()['reserve']
 
-    lines = ["📉 <b>بازار کریپتوی دودول</b>", "قیمت‌ها هر دقیقه تکون می‌خورن.", ""]
-    for sym, name, price, prev, base, _vol in rows:
+    lines = ["📉 <b>بازار کریپتوی دودول</b>",
+             "قیمت‌ها هر دقیقه تکون می‌خورن — و خرید و فروش خودتون هم تکونشون می‌ده.", ""]
+    for sym, name, mid, prev_mid, base, _vol, net in rows:
+        price = crypto_display_price(mid, base, net)
+        prev = crypto_display_price(prev_mid, base, net)
         arrow, pct = _crypto_arrow(price, prev)
-        vs_base = (float(price) - float(base)) / float(base) * 100.0
+        vs_base = (price - float(base)) / float(base) * 100.0
+        demand = db._crypto_impact(float(net) * float(base),
+                                   CRYPTO_IMPACT_DEPTH, CRYPTO_IMPACT_CAP)
+        if demand > 0.005:
+            dem_txt = f" 🔥 تقاضا {demand*100:+.0f}٪"
+        elif demand < -0.005:
+            dem_txt = f" 🧊 تقاضا {demand*100:+.0f}٪"
+        else:
+            dem_txt = ""
         mine = held.get(sym)
         mine_txt = f" • تو: {mine[0]:.4g}".rstrip('0').rstrip('.') if mine else ""
         lines.append(
-            f"{arrow} <b>{_esc(name)}</b> <code>{sym}</code>\n"
+            f"{arrow} <b>{_esc(name)}</b> <code>{sym}</code>{dem_txt}\n"
             f"    {_fmt_price(price)} سانت ({pct:+.2f}٪ | نسبت به پایه {vs_base:+.0f}٪)"
             f"{mine_txt}"
         )
@@ -3996,6 +4029,8 @@ async def crypto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
         f"🏛 نقدینگی بازار (ذخیرهٔ بانک مرکزی): {int(liquidity)} سانت",
         f"🧾 کارمزد هر معامله: {int(CRYPTO_FEE_RATIO*100)}٪ → مستقیم به خزانه",
+        "⚖️ خرید قیمت رو بالا می‌بره و فروش پایین — ولی قیمتی که بهت می‌خوره "
+        "میانگینِ مسیره، پس بالا بردنِ قیمت با پول خودت هیچ سودی نداره.",
         "",
         "🛒 /kharid &lt;کوین&gt; &lt;سانت&gt;",
         "💰 /frush &lt;کوین&gt; &lt;سانت|همه&gt;",
@@ -4035,12 +4070,12 @@ async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"حداقل خرید {CRYPTO_MIN_TRADE} سانته.")
         return
 
-    sym, name, price = coin[0], coin[1], float(coin[2])
+    sym, name = coin[0], coin[1]
     # The fee is charged ON TOP of the spend, so "خرید ۱۰۰" always buys 100 size worth
-    # of coin and the receipt is never a surprise.
-    units = round(spend / price, 6)
-    res = db.crypto_buy(user.id, chat_id, sym, units, price, CRYPTO_FEE_RATIO,
-                        tehran_today_str(), cap)
+    # of coin and the receipt is never a surprise. The unit count and the fill price are
+    # settled inside the transaction, off the locked inventory.
+    res = db.crypto_buy(user.id, chat_id, sym, spend, CRYPTO_FEE_RATIO,
+                        tehran_today_str(), cap, CRYPTO_IMPACT_DEPTH, CRYPTO_IMPACT_CAP)
     if not res[0]:
         reason, extra = res[1], res[2]
         if reason == 'cap':
@@ -4056,11 +4091,18 @@ async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("مقدار نامعتبره!")
         return
 
-    _ok, total, fee, new_amount, new_avg = res
+    _ok, units, price, total, fee, new_amount, new_avg = res
+    after = db.crypto_all()
+    now_row = next((r for r in after if r[0] == sym), None)
+    moved = ""
+    if now_row is not None:
+        new_px = crypto_display_price(now_row[2], now_row[4], now_row[6])
+        moved = f"📈 قیمت بازار رفت رو {_fmt_price(new_px)}\n"
     await update.message.reply_text(
         f"🛒 <b>خرید انجام شد!</b>\n\n"
         f"{_esc(user.first_name)} <b>{units:.6g}</b> {_esc(name)} خرید.\n"
-        f"💱 قیمت: {_fmt_price(price)} سانت\n"
+        f"💱 قیمت خوردهٔ تو: {_fmt_price(price)} سانت\n"
+        f"{moved}"
         f"💸 پرداختی: <b>{int(total)}</b> سانت (کارمزد {int(fee)} → خزانه)\n\n"
         f"📦 موجودی: {new_amount:.6g} {_esc(name)} "
         f"(میانگین خرید {_fmt_price(new_avg)})\n"
@@ -4090,7 +4132,8 @@ async def crypto_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if coin is None:
         await update.message.reply_text("همچین کوینی نداریم! لیست: /crypto")
         return
-    sym, name, price = coin[0], coin[1], float(coin[2])
+    sym, name = coin[0], coin[1]
+    price = crypto_display_price(coin[2], coin[4], coin[6])
     holding = dict((s, (a, c)) for s, a, c in db.crypto_holdings_of(user.id, chat_id)).get(sym)
     if not holding or holding[0] <= 0:
         await update.message.reply_text(f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
@@ -4111,7 +4154,8 @@ async def crypto_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         units = min(held_units, round(want / price, 6))
 
-    res = db.crypto_sell(user.id, chat_id, sym, units, price, CRYPTO_FEE_RATIO)
+    res = db.crypto_sell(user.id, chat_id, sym, units, CRYPTO_FEE_RATIO,
+                         CRYPTO_IMPACT_DEPTH, CRYPTO_IMPACT_CAP)
     if not res[0]:
         if res[1] == 'liquidity':
             await update.message.reply_text(
@@ -4123,15 +4167,22 @@ async def crypto_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
         return
 
-    _ok, sold, net, fee, pnl, left = res
+    _ok, sold, fill_price, net, fee, pnl, left = res
     partial = ""
     if sold < units - 1e-6:
         partial = ("\n⚠️ بازار فقط همین‌قدر رو کشید — بقیهٔ سکه‌هات دست خودت موند.")
+    after = db.crypto_all()
+    now_row = next((r for r in after if r[0] == sym), None)
+    moved = ""
+    if now_row is not None:
+        new_px = crypto_display_price(now_row[2], now_row[4], now_row[6])
+        moved = f"📉 قیمت بازار اومد رو {_fmt_price(new_px)}\n"
     verdict = "📈 سود" if pnl >= 0 else "📉 ضرر"
     await update.message.reply_text(
         f"💰 <b>فروش انجام شد!</b>\n\n"
         f"{_esc(user.first_name)} <b>{sold:.6g}</b> {_esc(name)} فروخت.\n"
-        f"💱 قیمت: {_fmt_price(price)} سانت\n"
+        f"💱 قیمت خوردهٔ تو: {_fmt_price(fill_price)} سانت\n"
+        f"{moved}"
         f"📥 دریافتی: <b>{int(net)}</b> سانت (کارمزد {int(fee)} → خزانه)\n"
         f"{verdict}: <b>{int(pnl):+}</b> سانت\n\n"
         f"📦 باقی‌مونده: {left:.6g} {_esc(name)}{partial}",
@@ -4148,7 +4199,7 @@ async def crypto_portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     db.track_chat(chat_id)
     wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    prices = {r[0]: (r[1], float(r[2])) for r in db.crypto_all()}
+    prices = {r[0]: (r[1], crypto_display_price(r[2], r[4], r[6])) for r in db.crypto_all()}
     holdings = db.crypto_holdings_of(user.id, chat_id)
     if not holdings:
         await update.message.reply_text(

@@ -556,6 +556,50 @@ Note the split in `bank_log`, which is not cosmetic: the **stake** is logged as
 `crypto_in` and the **fee** as `treasury_in`. Only the latter counts in
 `get_treasury_income`, because the stake may have to be handed straight back.
 
+### Player demand moves the price, and pumping is closed by the pricing
+
+The random walk is only half the price. `crypto_prices.net_units` is the market's net
+long position across every player in every group; `crypto_display_price` shifts the mid
+by `_crypto_impact(net_notional, CRYPTO_IMPACT_DEPTH, CRYPTO_IMPACT_CAP)`. Buying pushes
+a coin up, selling pushes it down, and a coin nobody holds trades at its mid.
+
+**`db._crypto_exec_price` is the anti-pump, and it is the one thing here not to
+"simplify".** Price is a function of inventory alone, so a trade's cost is the integral
+of that function along the path it walks. Charging the *average* — which for a linear
+impact is just the price at the **midpoint** inventory — gives:
+
+```
+buy  n units at inventory q    -> pay      mid * n * (1 + imp(q + n/2))
+sell n units at inventory q+n  -> receive  mid * n * (1 + imp(q + n/2))
+```
+
+Identical. **A player can never profit from the price move their own order caused**, at
+any size: an immediate round trip returns exactly what it cost, and the two trading fees
+are pure loss. Quoting the pre- or post-trade price instead breaks that equality and
+hands a big wallet free size. There is a regression suite that runs pump-and-dumps from
+100 up to 500,000 (including one that pins the impact cap) and asserts each loses
+precisely its two fees, plus one that slices the pump into eight orders.
+
+`CRYPTO_IMPACT_CAP` is **not** what stops the pump — the pricing is. The cap only keeps
+the board off absurd numbers and bounds what the bank is on the hook for.
+
+Two consequences worth knowing before retuning any of it:
+
+- **Impact is measured in notional at `base_price`, not at the live mid.** Using the mid
+  would feed the price back into its own impact — up begets up. The base keeps the curve
+  fixed per coin.
+- **Selling into someone else's pump is legitimate and stays zero-sum.** A player who was
+  already holding when a whale buys does profit, and the whale pays for it. That is
+  trading, not an exploit, and it cannot be closed without deleting impact entirely; the
+  daily buy cap is what bounds it. There is a test asserting the whole episode balances
+  across both players and the bank.
+
+A partial fill has to be **solved, not divided**. Fewer units means less impact means a
+higher price per unit, so `available / price` overshoots — and `_cb_spread_cost` caps
+what it takes from the pool while the wallet is credited in full, which mints. Proceeds
+are monotonically increasing in units inside the cap, so `crypto_sell` bisects for the
+largest fill the bank can honour. This was a real bug, caught by the conservation test.
+
 ### The price walk
 
 `crypto_next_price` is a **mean-reverting geometric** random walk: `pull` toward

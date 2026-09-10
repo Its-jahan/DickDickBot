@@ -420,6 +420,13 @@ def init_db():
         ''')
         c.execute('CREATE INDEX IF NOT EXISTS crypto_holdings_owner_idx '
                   'ON crypto_holdings (user_id, chat_id)')
+        # The market's net long position, in units, across every player in every group.
+        # This is what makes buying push the price up: `price` stays the random-walk
+        # MID, and what anyone actually pays is that mid shifted by the inventory (see
+        # _crypto_exec_price). Stored rather than derived from crypto_holdings only
+        # because the sum would have to be recomputed on every quote.
+        c.execute('ALTER TABLE crypto_prices ADD COLUMN IF NOT EXISTS '
+                  'net_units DOUBLE PRECISION DEFAULT 0')
 
         # ---------------------------------------------------------------- economy
         # One row per group. `inflation` is a price index: everything the game charges
@@ -2488,11 +2495,14 @@ def crypto_seed(coins):
 
 
 def crypto_all():
-    """(symbol, name, price, prev_price, base_price, volatility) for the whole market."""
+    """(symbol, name, mid, prev_mid, base_price, volatility, net_units) for the market.
+
+    `mid` is the random walk's price, NOT what a trade executes at - apply the inventory
+    impact on top (bot.crypto_display_price) before showing or quoting anything."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT symbol, name, price, prev_price, base_price, volatility '
-                  'FROM crypto_prices ORDER BY base_price DESC, symbol')
+        c.execute('SELECT symbol, name, price, prev_price, base_price, volatility, '
+                  'COALESCE(net_units,0) FROM crypto_prices ORDER BY base_price DESC, symbol')
         return c.fetchall()
 
 
@@ -2516,6 +2526,56 @@ def crypto_set_prices(pairs):
                   'WHERE cp.symbol = v.symbol', args)
 
 
+def _crypto_impact(net_notional, depth, cap):
+    """How far the market's net position has pushed a coin off its mid, as a fraction.
+
+    Linear in the inventory, which is not an aesthetic choice - it is what makes
+    _crypto_exec_price exact. Clamped so no amount of buying can drive a coin to the
+    moon or to zero on inventory alone."""
+    if depth <= 0:
+        return 0.0
+    return max(-cap, min(cap, float(net_notional) / float(depth)))
+
+
+def _crypto_exec_price(mid, base_price, net_units, delta_units, depth, cap):
+    """The AVERAGE price a trade of `delta_units` actually executes at.
+
+    This is the whole anti-pump design, and it is worth understanding before touching
+    it. Price is a function of inventory alone, so the cost of a trade is the integral
+    of that function along the path the trade walks. Charging the average - which for a
+    linear impact is just the price at the MIDPOINT inventory - means:
+
+        buy n units at inventory q  -> pay      mid * n * (1 + imp(q + n/2))
+        sell n units at inventory q+n -> receive mid * n * (1 + imp(q + n/2))
+
+    Identical. A player can never profit from the price move their own order caused, no
+    matter how large: an immediate round trip returns exactly what it cost, and the two
+    trading fees are pure loss. Pump-and-dump is not merely discouraged here, it is
+    arithmetically impossible.
+
+    Quoting the post-trade price instead (or the pre-trade one) breaks that equality and
+    hands a big wallet free size, so do not "simplify" this to a single lookup."""
+    midpoint = (float(net_units) + float(delta_units) / 2.0) * float(base_price)
+    return max(1e-6, float(mid) * (1.0 + _crypto_impact(midpoint, depth, cap)))
+
+
+def _crypto_solve_units(mid, base_price, net_units, spend, depth, cap, sign):
+    """Units whose execution cost lands on `spend`.
+
+    The execution price depends on how many units are traded, and the unit count depends
+    on the price, so this is a fixed point. Three passes converge to well under a
+    rounding unit - the correction is second-order in the trade size - and unlike a
+    quadratic solve it stays correct when the impact clamps."""
+    px = _crypto_exec_price(mid, base_price, net_units, 0.0, depth, cap)
+    units = float(spend) / px if px > 0 else 0.0
+    for _ in range(3):
+        px = _crypto_exec_price(mid, base_price, net_units, sign * units, depth, cap)
+        if px <= 0:
+            return (0.0, 0.0)
+        units = float(spend) / px
+    return (units, px)
+
+
 def crypto_holdings_of(user_id, chat_id):
     """(symbol, amount, avg_cost) for everything this player holds in this group."""
     with get_connection() as conn:
@@ -2526,19 +2586,23 @@ def crypto_holdings_of(user_id, chat_id):
         return c.fetchall()
 
 
-def crypto_buy(user_id, chat_id, symbol, units, price, fee_ratio, today_str, daily_cap):
-    """Buys `units` at `price`, wallet -> treasury, in ONE transaction.
+def crypto_buy(user_id, chat_id, symbol, spend, fee_ratio, today_str, daily_cap,
+               impact_depth, impact_cap):
+    """Spends `spend` size on a coin at the live impact-adjusted price, in ONE
+    transaction.
 
     The CENTRAL BANK's pooled reserve is the counterparty, exactly like the spectator
     book's house: the size a buyer spends is not destroyed, it is held against the
     position and paid back out on a sale. Only the FEE is income, and it is the only
     part logged as 'treasury_in'.
 
-    Returns (True, spent, fee, new_amount, new_avg) or (False, reason, remaining_cap)."""
-    gross = round(units * price, 2)
-    fee = round(gross * fee_ratio, 2)
-    total = round(gross + fee, 2)
-    if units <= 0 or gross <= 0:
+    The unit count and the price are both worked out INSIDE the transaction, off the
+    inventory read under lock - quoting outside it would let two racing buyers both
+    execute at the pre-trade price and skip each other's impact.
+
+    Returns (True, units, price, spent, fee, new_amount, new_avg)
+    or (False, reason, remaining_cap)."""
+    if spend <= 0:
         return (False, 'amount', 0.0)
     with get_connection() as conn:
         c = conn.cursor()
@@ -2559,8 +2623,27 @@ def crypto_buy(user_id, chat_id, symbol, units, price, fee_ratio, today_str, dai
         remaining = daily_cap - used
         if remaining <= 0:
             return (False, 'cap', 0.0)
-        if gross > remaining:
+        if spend > remaining:
             return (False, 'cap', remaining)
+
+        # Locked for the whole trade: the inventory decides the price, so two buyers
+        # landing together must queue rather than both quoting off the same mid.
+        c.execute('SELECT price, base_price, COALESCE(net_units,0) FROM crypto_prices '
+                  'WHERE symbol = %s FOR UPDATE', (symbol,))
+        prow = c.fetchone()
+        if prow is None:
+            return (False, 'amount', remaining)
+        mid, base_price, net_units = float(prow[0]), float(prow[1]), float(prow[2])
+        units, price = _crypto_solve_units(mid, base_price, net_units, spend,
+                                           impact_depth, impact_cap, +1)
+        units = round(units, 6)
+        if units <= 0:
+            return (False, 'amount', remaining)
+        gross = round(units * price, 2)
+        fee = round(gross * fee_ratio, 2)
+        total = round(gross + fee, 2)
+        if gross <= 0:
+            return (False, 'amount', remaining)
 
         c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
                   'WHERE user_id = %s AND chat_id = %s AND COALESCE(size,0) >= %s RETURNING size',
@@ -2601,11 +2684,16 @@ def crypto_buy(user_id, chat_id, symbol, units, price, fee_ratio, today_str, dai
                   'bought_today = COALESCE(bought_today,0) + %s '
                   'WHERE user_id = %s AND chat_id = %s AND symbol = %s',
                   (new_amount, new_avg, gross, user_id, chat_id, symbol))
-        return (True, total, fee, new_amount, new_avg)
+        # The market is now longer by these units, so the next quote is dearer. This is
+        # the demand side of the price.
+        c.execute('UPDATE crypto_prices SET net_units = COALESCE(net_units,0) + %s '
+                  'WHERE symbol = %s', (units, symbol))
+        return (True, units, price, total, fee, new_amount, new_avg)
 
 
-def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
-    """Sells up to `units` at `price`, treasury -> wallet, in ONE transaction.
+def crypto_sell(user_id, chat_id, symbol, units, fee_ratio, impact_depth, impact_cap):
+    """Sells up to `units` at the live impact-adjusted price, treasury -> wallet, in
+    ONE transaction.
 
     PARTIALLY FILLS rather than minting. The central bank's POOLED reserve is the
     counterparty, so a sale it cannot cover is a market with no liquidity, not a licence
@@ -2618,7 +2706,11 @@ def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
     pay_interest works: one deep book for the whole bot instead of a market whose depth
     depends on which group you happen to be in.
 
-    Returns (True, sold_units, net, fee, pnl, left) or (False, reason, held)."""
+    Selling pushes the price DOWN by the same curve buying pushes it up, and executes
+    at the average along the way - see _crypto_exec_price for why that symmetry is what
+    makes pumping your own bags pointless.
+
+    Returns (True, sold_units, price, net, fee, pnl, left) or (False, reason, held)."""
     if units <= 0:
         return (False, 'amount', 0.0)
     with get_connection() as conn:
@@ -2637,11 +2729,38 @@ def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
         # arbitrary - a small group could barely trade while a rich one traded freely.
         c.execute('SELECT COALESCE(SUM(balance),0) FROM bank_treasury')
         available = float(c.fetchone()[0] or 0.0)
-        per_unit_net = price * (1.0 - fee_ratio)
-        if per_unit_net <= 0:
+
+        c.execute('SELECT price, base_price, COALESCE(net_units,0) FROM crypto_prices '
+                  'WHERE symbol = %s FOR UPDATE', (symbol,))
+        prow = c.fetchone()
+        if prow is None:
+            return (False, 'none', held)
+        mid, base_price, net_units = float(prow[0]), float(prow[1]), float(prow[2])
+
+        def _net_for(u):
+            px = _crypto_exec_price(mid, base_price, net_units, -u, impact_depth, impact_cap)
+            return (u * px * (1.0 - fee_ratio), px)
+
+        proceeds, price = _net_for(units)
+        if price <= 0:
             return (False, 'amount', held)
-        if units * per_unit_net > available:
-            units = available / per_unit_net
+        if proceeds > available:
+            # Trim to what the bank can actually pay. This has to be solved, not
+            # divided: fewer units means less impact means a HIGHER price per unit, so
+            # `available / price` overshoots and the shortfall would be minted -
+            # _cb_spread_cost caps what it takes from the pool while the wallet is
+            # credited in full. Proceeds are monotonically increasing in units (the
+            # impact cap keeps the curve well inside the turning point), so a bisection
+            # lands on the largest fill the bank can honour, exactly.
+            lo, hi = 0.0, units
+            for _ in range(48):
+                probe = (lo + hi) / 2.0
+                if _net_for(probe)[0] <= available:
+                    lo = probe
+                else:
+                    hi = probe
+            units = lo
+            proceeds, price = _net_for(units)
         units = round(min(units, held), 6)
         if units <= 0:
             return (False, 'liquidity', held)
@@ -2690,7 +2809,10 @@ def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
             c.execute('UPDATE crypto_holdings SET amount = %s '
                       'WHERE user_id = %s AND chat_id = %s AND symbol = %s',
                       (left, user_id, chat_id, symbol))
-        return (True, units, net, fee, pnl, left)
+        # The market is now shorter by these units, so the next quote is cheaper.
+        c.execute('UPDATE crypto_prices SET net_units = COALESCE(net_units,0) - %s '
+                  'WHERE symbol = %s', (units, symbol))
+        return (True, units, price, net, fee, pnl, left)
 
 
 def crypto_market_totals():
