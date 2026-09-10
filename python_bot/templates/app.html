@@ -101,13 +101,27 @@ function sheet(html) {
 }
 const closeSheet = () => document.getElementById('sheet').className = 'sheet';
 
+// HTTP header values are Latin-1 ONLY. The Login Widget's payload carries the
+// player's Telegram display name verbatim, and a Persian name (or an emoji) is not
+// Latin-1 - so putting it in a header made fetch() refuse to run at all:
+//   "String contains non ISO-8859-1 code point"
+// Not a failed login: every single call the page made threw before leaving the
+// browser. Values that already fit are passed through byte-for-byte, so initData and
+// logins saved before this fix are completely unaffected.
+function headerSafe(v) {
+  if (/^[\x00-\xFF]*$/.test(v)) return v;
+  let s = '';
+  for (const b of new TextEncoder().encode(v)) s += String.fromCharCode(b);
+  return 'b64:' + btoa(s);
+}
+
 function authHeaders() {
   // Inside Telegram, initData is re-issued on every launch and is always the freshest
   // thing we have. In a browser it is empty and the stored Login Widget payload is
   // what identifies the player. Sending both is harmless - the server tries initData
   // first and falls back.
-  const h = { 'X-Telegram-Init-Data': TG?.initData || '' };
-  if (S.login) h['X-Telegram-Login'] = S.login;
+  const h = { 'X-Telegram-Init-Data': headerSafe(TG?.initData || '') };
+  if (S.login) h['X-Telegram-Login'] = headerSafe(S.login);
   return h;
 }
 async function api(path, body) {

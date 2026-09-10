@@ -1010,6 +1010,18 @@ silently breaks one of them:
 | `_verify_init_data` | `HMAC-SHA256(b"WebAppData", token)` | Mini App, opened from `/app` |
 | `_verify_login_widget` | `SHA256(token)` | Login Widget, an ordinary browser |
 
+**Both headers are Latin-1 or nothing.** HTTP header values may only contain Latin-1,
+and the Login Widget's payload carries the player's Telegram display name *verbatim* —
+which for this bot's players is Persian. `JSON.stringify` does not escape it (unlike
+Python's `json.dumps`, worth knowing when writing a fixture for this), so the raw
+payload in a header made the browser throw `String contains non ISO-8859-1 code point`
+and refuse to send **any** request. The symptom is therefore the whole app dying, not a
+failed login, and it never appeared inside Telegram because initData arrives
+percent-encoded. `headerSafe()` in `app.html` base64-encodes anything that doesn't fit
+behind a `b64:` marker and `_header_value()` decodes it; values that already fit are
+passed through byte-for-byte, which matters because the widget's HMAC is taken over
+exactly those bytes.
+
 `_auth()` tries initData first and falls back to the widget, so nothing downstream can
 tell which was used and none of it cares. Both are header-borne, both use
 `compare_digest`, and both expire (`INIT_DATA_MAX_AGE_SECONDS` / `LOGIN_MAX_AGE_SECONDS`

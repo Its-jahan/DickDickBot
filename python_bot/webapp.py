@@ -29,6 +29,7 @@ message landing in the chat for other people to react to, and a browser tab has 
 to post to. Those open a deep link back into Telegram instead. What lives here is
 everything a player does alone - their balance, the market, the shop, their bag.
 """
+import base64
 import hashlib
 import hmac
 import json
@@ -135,6 +136,34 @@ def _verify_login_widget(raw):
     return data
 
 
+def _header_value(name):
+    """One auth header, decoded.
+
+    HTTP header values are Latin-1 ONLY, and a Telegram display name is routinely
+    Persian or has an emoji in it. The Login Widget hands the page that name verbatim
+    inside its JSON payload, so putting the payload straight into a header made the
+    browser refuse the whole request before it was sent:
+
+        Failed to execute 'fetch' on 'Window': Failed to read the 'headers' property
+        from 'RequestInit': String contains non ISO-8859-1 code point
+
+    That is not a failed login, it is fetch() declining to run - so *every* call the
+    page made threw, and the app was completely unusable in a browser for anyone whose
+    name isn't Latin-1. It never showed up inside Telegram because initData arrives
+    percent-encoded, which is why /app kept working the whole time.
+
+    So the page base64-encodes any value that doesn't fit, behind a 'b64:' marker.
+    Anything without the marker is passed through untouched, which keeps initData and
+    every login stored before this fix working byte-for-byte as they did."""
+    raw = request.headers.get(name, '')
+    if not raw.startswith('b64:'):
+        return raw
+    try:
+        return base64.b64decode(raw[4:], validate=True).decode('utf-8')
+    except (ValueError, UnicodeDecodeError):
+        return ''
+
+
 def _auth():
     """(user_id, first_name, username) for this request, or None.
 
@@ -143,9 +172,9 @@ def _auth():
     Telegram, and a Login Widget payload when it is opened in an ordinary browser. The
     rest of the app cannot tell which was used, and must not care.
     """
-    user = _verify_init_data(request.headers.get('X-Telegram-Init-Data', ''))
+    user = _verify_init_data(_header_value('X-Telegram-Init-Data'))
     if user is None:
-        user = _verify_login_widget(request.headers.get('X-Telegram-Login', ''))
+        user = _verify_login_widget(_header_value('X-Telegram-Login'))
     if user is None:
         return None
     return (int(user['id']), user.get('first_name') or 'بازیکن', user.get('username'))
