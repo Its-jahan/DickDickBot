@@ -51,6 +51,12 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 # How old a Telegram signature may be. The signature itself never expires, so without
 # this a leaked initData string would be a permanent credential.
 INIT_DATA_MAX_AGE_SECONDS = 24 * 3600
+# A Login Widget payload is a longer-lived credential than initData - it is what a
+# browser keeps between visits - so it gets its own window rather than borrowing one
+# that was sized for a signature Telegram re-issues on every launch.
+LOGIN_MAX_AGE_SECONDS = 30 * 24 * 3600
+# Shown to the page so the widget can be rendered without hardcoding it in two places.
+BOT_USERNAME = os.environ.get('BOT_USERNAME', 'dickchallengerbot')
 
 
 def _verify_init_data(raw):
@@ -91,13 +97,55 @@ def _verify_init_data(raw):
     return user if isinstance(user, dict) and user.get('id') else None
 
 
+def _verify_login_widget(raw):
+    """Validate a Telegram Login Widget payload and return it, or None.
+
+    This is a DIFFERENT scheme from the Mini App's, and mixing the two up silently
+    rejects (or, worse, silently accepts) everything: the widget's key is
+    SHA256(token), while initData's is HMAC-SHA256(b"WebAppData", token). Same
+    data-check-string shape, same compare_digest, same freshness rule.
+
+    The widget is what lets someone play in an ordinary browser instead of inside
+    Telegram. It requires the domain to be registered with BotFather (/setdomain);
+    a Mini App does not, which is why this arrived later than the rest of the app.
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    data = {k: v for k, v in data.items() if v is not None}
+    their_hash = data.pop('hash', None)
+    if not their_hash or not data.get('id'):
+        return None
+
+    check = '\n'.join(f'{k}={v}' for k, v in sorted(data.items()))
+    secret = hashlib.sha256(bot.TOKEN.encode()).digest()
+    ours = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(ours, str(their_hash)):
+        return None
+    try:
+        if time.time() - int(data.get('auth_date', 0)) > LOGIN_MAX_AGE_SECONDS:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return data
+
+
 def _auth():
     """(user_id, first_name, username) for this request, or None.
 
-    initData arrives in a header rather than the body so it cannot be confused with
-    anything the page itself chose to send.
+    Two ways in, both cryptographic and both header-borne so neither can be confused
+    with anything the page itself chose to send: initData when the app is opened inside
+    Telegram, and a Login Widget payload when it is opened in an ordinary browser. The
+    rest of the app cannot tell which was used, and must not care.
     """
     user = _verify_init_data(request.headers.get('X-Telegram-Init-Data', ''))
+    if user is None:
+        user = _verify_login_widget(request.headers.get('X-Telegram-Login', ''))
     if user is None:
         return None
     return (int(user['id']), user.get('first_name') or 'بازیکن', user.get('username'))
@@ -558,6 +606,13 @@ def index():
                                'templates', 'app.html'), encoding='utf-8') as fh:
             _PAGE = fh.read()
     return Response(_PAGE, mimetype='text/html; charset=utf-8')
+
+
+@app.get('/api/config')
+def api_config():
+    """Public: just the bot's username, so the Login Widget can be rendered without
+    the name being hardcoded in the template as well as here."""
+    return jsonify({'ok': True, 'bot': BOT_USERNAME})
 
 
 @app.get('/healthz')

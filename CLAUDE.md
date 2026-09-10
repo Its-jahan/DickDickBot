@@ -926,8 +926,42 @@ without that check a leaked `initData` would be a permanent credential.
   with a different token is refused, and that swapping the user id while keeping the
   signature is refused.
 
+There are **two** auth schemes, and they are not interchangeable — confusing them
+silently breaks one of them:
+
+| | key | used by |
+|---|---|---|
+| `_verify_init_data` | `HMAC-SHA256(b"WebAppData", token)` | Mini App, opened from `/app` |
+| `_verify_login_widget` | `SHA256(token)` | Login Widget, an ordinary browser |
+
+`_auth()` tries initData first and falls back to the widget, so nothing downstream can
+tell which was used and none of it cares. Both are header-borne, both use
+`compare_digest`, and both expire (`INIT_DATA_MAX_AGE_SECONDS` / `LOGIN_MAX_AGE_SECONDS`
+— the widget's window is longer because it is what a browser keeps between visits, while
+initData is reissued on every launch). There is a test asserting a widget payload is
+*not* accepted as initData.
+
+Only the Login Widget needs the domain registered with BotFather (`/setdomain`). A Mini
+App opened from a `web_app` keyboard button works on any HTTPS URL with no registration —
+worth knowing before debugging the wrong thing.
+
 `X-Frame-Options` is deliberately **not** set: Telegram has to be able to frame a Mini
 App. That is asserted too, so nobody "hardens" it into a blank screen.
+
+### Bringing it up on a server
+
+`deploy/setup-web.sh` does the whole thing and is idempotent: installs the unit, installs
+the nginx vhost, gets the certificate, starts the service, and proves the chain by
+fetching `/healthz` *through nginx* rather than trusting `systemctl is-active`.
+
+The one subtlety worth keeping: nginx refuses to start when an `ssl_certificate` file is
+missing, and certbot's HTTP-01 needs nginx already serving port 80 — a deadlock on a
+first run. The script breaks it by installing only the first `server {}` block (the
+HTTP/ACME half) until the cert exists, then swapping in the full vhost.
+
+It deliberately does **not** do the Cloudflare DNS record (that needs an API token this
+script has no business holding — it checks the name resolves and stops with instructions)
+or BotFather `/setdomain` (there is no API for it).
 
 ### What is deliberately not in it
 

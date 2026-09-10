@@ -78,7 +78,8 @@ a.tg{color:var(--acc);text-decoration:none;font-weight:700}
 <script>
 const TG = window.Telegram?.WebApp;
 if (TG) { TG.ready(); TG.expand(); }
-const S = { chat: null, tab: 'home', data: {}, groups: [], name: '' };
+const S = { chat: null, tab: 'home', data: {}, groups: [], name: '', login: null };
+try { S.login = localStorage.getItem('login'); } catch (e) {}
 const app = document.getElementById('app'), nav = document.getElementById('nav');
 
 const fa = n => (n ?? 0).toLocaleString('fa-IR');
@@ -100,8 +101,17 @@ function sheet(html) {
 }
 const closeSheet = () => document.getElementById('sheet').className = 'sheet';
 
+function authHeaders() {
+  // Inside Telegram, initData is re-issued on every launch and is always the freshest
+  // thing we have. In a browser it is empty and the stored Login Widget payload is
+  // what identifies the player. Sending both is harmless - the server tries initData
+  // first and falls back.
+  const h = { 'X-Telegram-Init-Data': TG?.initData || '' };
+  if (S.login) h['X-Telegram-Login'] = S.login;
+  return h;
+}
 async function api(path, body) {
-  const opt = { headers: { 'X-Telegram-Init-Data': TG?.initData || '' } };
+  const opt = { headers: authHeaders() };
   if (body) {
     opt.method = 'POST';
     opt.headers['Content-Type'] = 'application/json';
@@ -149,6 +159,10 @@ V.home = d => `
       <span class="dim">خشم مردم ${fa(Math.round(d.unrest))}</span></div>
   </div>
   <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <button class="sm ghost" onclick="pickGroup()">تعویض گروه</button>
+      ${TG?.initData ? '' : '<button class="sm ghost" onclick="logout()">خروج از حساب</button>'}
+    </div>
     <div class="dim" style="margin-bottom:10px">اینا فقط توی گروه کار می‌کنن، چون بقیه باید ببیننشون:</div>
     <div class="row" style="flex-wrap:wrap;gap:8px">
       ${['d|رشد روزانه','c|چالش','dozdi|دزدی','ejma|اجماع','sarghat|سرقت از بانک','farman|فرمان']
@@ -323,7 +337,9 @@ async function render() {
 
 function pickGroup() {
   nav.style.display = 'none';
-  app.innerHTML = `<h2>سلام ${esc(S.name)} 👋</h2>
+  app.innerHTML = `<div class="row"><h2 style="margin:0">سلام ${esc(S.name)} 👋</h2>
+      ${TG?.initData ? '' : '<button class="sm ghost" onclick="logout()">خروج</button>'}</div>
+    <div style="height:12px"></div>
     <div class="dim" style="margin-bottom:14px">کدوم گروه؟ هر گروه لیگ جداگانهٔ خودشه.</div>`
     + S.groups.map(g => `<div class="card" style="cursor:pointer" onclick="pick(${g.chat_id})">
         <div class="row"><b>${esc(g.title)}</b><b>${num(g.size)} سانت</b></div></div>`).join('');
@@ -331,20 +347,61 @@ function pickGroup() {
 window.pick = async id => { S.chat = id; try { localStorage.setItem('chat', id); } catch(e){} 
   drawNav(); await render(); };
 
-(async () => {
-  if (!TG?.initData) {
-    app.innerHTML = `<div class="empty">این صفحه رو باید از داخل تلگرام باز کنی.<br>
-      توی گروه بزن <b>/app</b></div>`;
-    return;
-  }
+// Telegram calls this back from the Login Widget's iframe.
+window.onTelegramAuth = user => {
+  S.login = JSON.stringify(user);
+  try { localStorage.setItem('login', S.login); } catch (e) {}
+  boot();
+};
+window.logout = () => {
+  S.login = null; S.chat = null;
+  try { localStorage.removeItem('login'); localStorage.removeItem('chat'); } catch (e) {}
+  boot();
+};
+
+async function loginScreen() {
+  nav.style.display = 'none';
+  let botName = 'dickchallengerbot';
+  try { botName = (await (await fetch('/api/config')).json()).bot || botName; } catch (e) {}
+  app.innerHTML = `
+    <div style="text-align:center;padding:40px 8px 24px">
+      <div style="font-size:54px">🍆</div>
+      <h2 style="font-size:22px;margin:14px 0 6px">دودول</h2>
+      <div class="dim" style="margin-bottom:26px">
+        با اکانت تلگرامت وارد شو تا سایز، بانک، بازار و کوله‌ت رو ببینی.</div>
+      <div id="tgbtn"></div>
+      <div class="dim" style="margin-top:26px;font-size:13px">
+        رمزی در کار نیست — تلگرام هویتت رو امضا می‌کنه و ما همون امضا رو چک می‌کنیم.<br>
+        اگه توی تلگرامی، می‌تونی توی گروه <b>/app</b> بزنی.</div>
+    </div>`;
+  const sc = document.createElement('script');
+  sc.async = true;
+  sc.src = 'https://telegram.org/js/telegram-widget.js?22';
+  sc.setAttribute('data-telegram-login', botName);
+  sc.setAttribute('data-size', 'large');
+  sc.setAttribute('data-radius', '12');
+  sc.setAttribute('data-request-access', 'write');
+  sc.setAttribute('data-onauth', 'onTelegramAuth(user)');
+  document.getElementById('tgbtn').appendChild(sc);
+}
+
+async function boot() {
+  if (!TG?.initData && !S.login) return loginScreen();
   try {
-    const r = await fetch('/api/groups', { headers: { 'X-Telegram-Init-Data': TG.initData } });
+    const r = await fetch('/api/groups', { headers: authHeaders() });
     const j = await r.json();
-    if (!j.ok) throw new Error(j.error);
+    if (!j.ok) {
+      // A stored login that the server no longer accepts (expired, or the bot token
+      // rotated) must drop the player back to the widget rather than stranding them
+      // on an error they cannot act on.
+      if (r.status === 403 && S.login) return window.logout();
+      throw new Error(j.error);
+    }
     S.name = j.name; S.groups = j.groups;
     if (!j.groups.length) {
-      app.innerHTML = `<div class="empty">هنوز توی هیچ گروهی بازی نکردی.<br>
-        اول توی گروه یه بار <b>/d</b> بزن.</div>`;
+      app.innerHTML = `<div class="empty">سلام ${esc(j.name)} 👋<br><br>
+        هنوز توی هیچ گروهی بازی نکردی.<br>
+        اول توی گروه یه بار <b>/d</b> بزن، بعد برگرد.</div>`;
       return;
     }
     let saved = null; try { saved = +localStorage.getItem('chat'); } catch(e){}
@@ -354,7 +411,8 @@ window.pick = async id => { S.chat = id; try { localStorage.setItem('chat', id);
   } catch (e) {
     app.innerHTML = `<div class="empty">${esc(e.message || 'خطا در اتصال')}</div>`;
   }
-})();
+}
+boot();
 </script>
 </body>
 </html>
