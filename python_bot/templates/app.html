@@ -374,6 +374,7 @@ async function loginScreen() {
         رمزی در کار نیست — تلگرام هویتت رو امضا می‌کنه و ما همون امضا رو چک می‌کنیم.<br>
         اگه توی تلگرامی، می‌تونی توی گروه <b>/app</b> بزنی.</div>
     </div>`;
+  const host = document.getElementById('tgbtn');
   const sc = document.createElement('script');
   sc.async = true;
   sc.src = 'https://telegram.org/js/telegram-widget.js?22';
@@ -382,7 +383,29 @@ async function loginScreen() {
   sc.setAttribute('data-radius', '12');
   sc.setAttribute('data-request-access', 'write');
   sc.setAttribute('data-onauth', 'onTelegramAuth(user)');
-  document.getElementById('tgbtn').appendChild(sc);
+  host.appendChild(sc);
+
+  // The widget renders an <iframe> when it works. When the domain is not the one
+  // registered with BotFather it instead prints a bare English "Bot domain invalid",
+  // which tells a player nothing and tells the owner nothing about the fix either.
+  // Replace it with something actionable rather than leaving Telegram's string.
+  setTimeout(() => {
+    if (host.querySelector('iframe')) return;
+    host.innerHTML = `
+      <div class="card" style="text-align:right">
+        <b>ورود با مرورگر هنوز فعال نیست</b>
+        <div class="dim" style="margin-top:8px">
+          تلگرام این دامنه رو برای این بات نمی‌شناسه، برای همین دکمهٔ ورود بالا نمیاد.
+        </div>
+        <div class="dim" style="margin-top:10px">
+          <b>فعلاً از داخل تلگرام بازی کن:</b> توی گروه بزن <b>/app</b> — همه‌چیز کامل کار می‌کنه.
+        </div>
+        <div class="dim" style="margin-top:10px;font-size:12px">
+          (برای ادمین: توی <b>@BotFather</b> بزن <b>/setdomain</b>، بات رو انتخاب کن،
+          و بفرست <b>${esc(location.hostname)}</b>)
+        </div>
+      </div>`;
+  }, 3500);
 }
 
 async function boot() {
