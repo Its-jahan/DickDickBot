@@ -220,6 +220,80 @@ job, `/bank` and `/eghtesad` all call it, so what a player is shown is exactly w
 paid. Do not reintroduce a constant for display — a shown number drifting from the real
 one is a bug class this codebase has already been bitten by.
 
+### …and on whether the bank actually earns anything
+
+Coverage is a measure of **stock**, and a bank can be rich and still be dying. The
+production ledger showed exactly that shape: deposits growing ~19k net a week while the
+only recurring income was fees on other people's activity. The interest bill scales with
+deposits; the earnings do not. Left alone, the liability outruns the income no matter
+how full the vault looks today.
+
+So `bank_effective_rate` takes the **lower** of two caps, and both bind:
+
+- the coverage rate above (`bank_base_rate`), and
+- `bank_income_cap(deposits, income)` — what the bank's own earnings over
+  `BANK_INCOME_WINDOW_DAYS` could actually fund, paying out only
+  `BANK_INCOME_PAYOUT_SHARE` of them so the rest is retained and rebuilds the reserve.
+
+They catch different failures: coverage catches a **drained** vault, income catches a
+vault that is **full but unprofitable**. `BANK_RATE_MIN` floors the income cap, so a bad
+week throttles the rate rather than switching interest off — absorbing that is what a
+reserve is for.
+
+`db.get_treasury_income(days)` counts **only `treasury_in` rows**, which is deliberately
+narrower than "the treasury went up". A crypto buyer parking size against a position is
+logged as `crypto_in` and must never read as income, because the bank may have to hand
+every centimetre of it back on the next sale. If you add a path that moves size into the
+treasury, decide explicitly which of the two it is.
+
+### The account-maintenance fee is what makes the rate self-funding
+
+`BANK_MAINTENANCE_FEE_RATIO` is charged nightly on every deposit balance, straight into
+that group's own member account of the reserve. It is the structural half of the fix:
+the fee is levied on **precisely the number the interest bill is levied on**, so cost and
+income scale together by construction rather than by luck. A saver nets
+`(rate − fee)` a day.
+
+Three details that are load-bearing:
+
+- It is charged **after** interest lands and **inside the same `claim_interest_run`
+  slot**, so a restart can no more double-charge the fee than it can double-pay the
+  interest.
+- It is charged to the group's **own** share, not spread across the pool
+  (`_cb_spread_cost`), because this group's savers are the ones paying it — unlike
+  interest, which the pool cross-subsidises.
+- It is logged as `treasury_in`, so it feeds the income window above. That is the
+  feedback loop: a bigger deposit base directly funds the rate paid on it.
+
+The fee does **not** by itself make a night profitable — at a 6% rate against a 2% fee
+the bank still runs a deficit, and the income cap is what stops that continuing
+indefinitely. The regression test asserts the accounting identity (the night's treasury
+change is exactly fee collected minus interest paid), not profitability.
+
+### Lending is a business, not a favour
+
+The ledger's clearest finding: players lending to each other with `/nozul` had earned
+~14,770 in interest against the official bank's ~417 from `/vam` — **35×**. The loan
+market is where the money in this game actually is, and the bank had no share of it.
+
+Two changes, and the first matters more than it looks:
+
+- **`bank_loan_rate` is derived from what the bank pays savers**, never a constant
+  sitting next to it: `base_deposit_rate × LOAN_TERM_DAYS × BANK_LOAN_SPREAD`, clamped
+  to `[BANK_LOAN_RATE_MIN, BANK_LOAN_RATE_MAX]`. A fixed loan rate against a *floating*
+  deposit rate is a spread that can silently go negative. It anchors to the **base**
+  rate rather than the crown-adjusted one, so a king who halves his group's interest
+  doesn't thereby get cheap loans — the bank's margin is a property of the bank, not of
+  local politics. There is a test asserting the spread survives at both ends of the band.
+- **`BANK_LOAN_ORIGINATION_RATIO` is withheld from the disbursement**, not billed later:
+  the borrower receives `principal − fee` but still owes the full `due_amount`. That
+  ordering is the whole point — it is the one part of a loan the bank collects **even
+  when the loan later defaults**, and there is no path where the fee fails because a
+  wallet was empty. `accept_loan` therefore returns four values now.
+
+A player lender is charged nothing of the sort: `/nozul` is unregulated, which is half
+the reason it exists.
+
 ### Deposits must never count as ledger losses
 
 A deposit leaves the wallet, so it lands in `size_log` as a large negative delta. The
@@ -228,7 +302,8 @@ would read as "this player is losing badly" and reward them with a growth bonus 
 deposit, withdraw, repeat is then the cheapest exploit in the game.
 `get_recent_net_by_user` therefore excludes the `bank_deposit` and `bank_withdraw`
 sources. Any future feature that shuffles size between two pockets of the same player
-must be excluded there too.
+must be excluded there too — `crypto_principal` is the newest one, for exactly this
+reason.
 
 The per-day deposit cap counts **gross** deposits (`deposited_today`), so
 deposit → withdraw → deposit cannot refill the allowance. This is what keeps size in
@@ -435,6 +510,73 @@ and the lender is made whole in every case, so a default is still zero-sum.
 stops a single default from burying a player past any hope of recovery, and it is the
 main lever if usury turns out to be too safe for lenders.
 
+## The crypto market has a house, and it cannot mint
+
+`/crypto` is one market for the whole bot — a coin costs the same in every group, like
+the central bank. Only holdings are per `(user, chat)`, because size is. Prices move
+every minute via `crypto_tick_job`, a `run_repeating` at `CRYPTO_TICK_SECONDS`.
+
+**The treasury is the counterparty on both legs, and that is the entire economic
+design.** A buy moves size into the vault; a sell moves it back out. Nothing is created
+and nothing is destroyed — the same shape as the spectator book's house, except that
+here the house **cannot mint at all**:
+
+> A sale the treasury cannot cover is **partially filled** (`db.crypto_sell` scales the
+> units down to what the vault can actually pay) and the remainder of the position stays
+> in the player's hands. A coin that has tripled is a claim on the vault, not a claim on
+> the universe.
+
+That one rule is what keeps this from being a money printer, and there are regression
+tests asserting it: a 50× moonshot against a thin vault stays exactly zero-sum, the
+treasury never goes negative, and a completely empty vault moves nothing at all and says
+so rather than paying.
+
+### Where the bank's daily income actually comes from
+
+`CRYPTO_FEE_RATIO` is charged on **both** legs, so a round trip costs a trader ~6%
+whatever the price does. It lands in the treasury as `treasury_in` and therefore raises
+everyone's deposit rate: trading against your friends pays the savers. This is the
+third income source, and unlike the other two it scales with how much fun people are
+having rather than with how much they deposit.
+
+Note the split in `bank_log`, which is not cosmetic: the **stake** is logged as
+`crypto_in` and the **fee** as `treasury_in`. Only the latter counts in
+`get_treasury_income`, because the stake may have to be handed straight back.
+
+### The price walk
+
+`crypto_next_price` is a **mean-reverting geometric** random walk: `pull` toward
+`base_price` at `CRYPTO_MEAN_REVERT`, plus a lognormal shock scaled by the coin's own
+volatility, clamped to `[base × CRYPTO_MIN_MULT, base × CRYPTO_MAX_MULT]`.
+
+- **Geometric, not additive**, so a 2-size coin and a 500-size coin move by comparable
+  *percentages*. An additive shock would leave the cheap coins flat and the expensive
+  ones berserk.
+- **Mean-reverting**, so one lucky coin can't wander off and become the only thing worth
+  holding. Without it the market stops being a market.
+- `crypto_set_prices` writes the whole board in **one** statement. This runs every minute
+  forever; a per-coin loop would be ten Supabase round trips a minute for the life of the
+  bot.
+
+`db.crypto_seed` is called next to `init_db()` on every startup and **never resets a live
+price** — it only inserts genuinely new symbols. A deploy mid-rally must not hand
+everyone's position back at the base price, and there is a test for it.
+
+### Crypto splits the ledger the same way loans do
+
+`crypto_principal` (the stake going in, and the cost basis coming back out) is
+**excluded** from `get_recent_net_by_user`; `crypto_pnl` and `crypto_fee` are **counted**.
+Without that split, dumping a wallet into a coin before the nightly handicap reads the
+ledger would look like a catastrophic loss and pay a growth bonus for it — the deposit
+exploit wearing a different hat. This is why `crypto_holdings.avg_cost` exists: a sale is
+not separable into "my money coming back" and "what I actually made" without a cost basis.
+
+`CRYPTO_DAILY_BUY_RATIO` caps a day's buying against the wallet and counts **gross**
+spend, so buy → sell → buy cannot refill the allowance. Same reasoning as the deposit
+cap: without it the whole wallet leaves circulation and `/dozdi` stops being worth
+typing. Portfolio value is deliberately **not** part of `users.size`, so it doesn't count
+toward the leaderboard or the crown — until you sell, it isn't size.
+
 ## Fees are transfers, never sinks
 
 Every fee in the game moves size into `bank_treasury` via `db.treasury_add` (or, inside
@@ -443,8 +585,10 @@ matters because the treasury is the *only* thing funding deposit interest: a fee
 deleted size would quietly lower everyone's yield instead of raising it.
 
 Current fees: theft loot (`THEFT_FEE_RATIO`), challenge winnings — never the returned
-stake (`CHALLENGE_FEE_RATIO`), deposits and withdrawals (`BANK_*_FEE_RATIO`), and the
-cross-group transfer (`XFER_FEE_RATIO`). The challenge settlement also sweeps the
+stake (`CHALLENGE_FEE_RATIO`), deposits and withdrawals (`BANK_*_FEE_RATIO`), the
+cross-group transfer (`XFER_FEE_RATIO`), nightly account maintenance
+(`BANK_MAINTENANCE_FEE_RATIO`), loan origination (`BANK_LOAN_ORIGINATION_RATIO`), and
+both legs of a crypto trade (`CRYPTO_FEE_RATIO`). The challenge settlement also sweeps the
 `spread` — anything a shielding perk stops the winner collecting while the loser still
 pays in full — which used to evaporate.
 
@@ -876,3 +1020,8 @@ The spectator book is the one mechanic that can be *either*, depending on how th
 goes: it pays winners out of the treasury (and mints only if the treasury is dry) and
 banks the losers' stakes back into it. That is neutral by construction while the house is
 solvent — see "The spectator book has a house".
+
+The crypto market looks similar but is strictly tighter: it is **always** zero-sum,
+because a payout the treasury cannot cover is partially filled rather than minted. It is
+therefore a pure transfer mechanic plus a fee sink — see "The crypto market has a house,
+and it cannot mint".

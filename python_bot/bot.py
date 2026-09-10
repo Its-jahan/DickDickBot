@@ -142,6 +142,10 @@ BOT_COMMANDS = [
     ("sarghat", "🚨 سرقت از بانک گروه (تقریباً غیرممکنه!)"),
     ("vasighe", "🔓 وثیقه برای آزادی از زندان بانک"),
     ("afv", "👑 عفو زندانی بانک (فقط پادشاه)"),
+    ("crypto", "📉 بازار کریپتو — قیمت‌ها هر دقیقه عوض می‌شن"),
+    ("kharid", "🛒 خرید کوین — /kharid بیت‌کیر 100"),
+    ("frush", "💰 فروش کوین — /frush بیت‌کیر همه"),
+    ("portfo", "📊 سبد کریپتوی من"),
     ("nozul", "🤝 نزول دادن به یکی — /nozul @user 100 25"),
     ("vam", "🏛 وام از بانک — /vam 100"),
     ("bedehi", "📜 بدهی‌ها و طلب‌های من"),
@@ -665,6 +669,10 @@ HELP_TEXT = (
     "📜 /farmanha — تاریخچهٔ فرمان‌ها\n"    "🪖 /hokm — (پادشاه) حکومت نظامی، هر ۳ روز یک بار\n"
     "🤡 /dalghak — دلقک‌های دربار\n"
     "🎟️ /lottery — لاتاری روزانه (قرعه‌کشی نیمه‌شب)\n"
+    "📉 /crypto — بازار کریپتو، قیمت‌ها هر دقیقه بالا و پایین می‌شن\n"
+    "🛒 /kharid <کوین> <سانت> — خرید کوین\n"
+    "💰 /frush <کوین> <سانت|همه> — فروش کوین\n"
+    "📊 /portfo — سبد کریپتوی من\n"
     "⚖️ تعادل خودکار: هر شب ربات از روی سود و زیان چند روز اخیر، ضریب رشد و شانس "
     "دزدی رو کم‌کم تنظیم می‌کنه تا صدرنشین‌ها بی‌رقیب نشن و عقب‌مونده‌ها جا بمونن.\n"
     "🏅 /ach — نشان‌های من\n"
@@ -2403,6 +2411,28 @@ BANK_COVERAGE_POOR = 0.05          # treasury worth 5% of deposits or less -> th
 BANK_COVERAGE_RICH = 0.50          # treasury worth half the deposits or more -> the ceiling
 BANK_INTEREST_MAX_TREASURY_SHARE = 0.25  # never drain more than a quarter of the vault in one night
 
+# Coverage alone is a STOCK measure, and a bank can be rich and still be dying: a fat
+# reserve against fast-growing deposits pays a high rate today and cannot possibly keep
+# paying it, because the interest bill grows with the deposits while the earnings do
+# not. That divergence is exactly what the ledger showed - deposits climbing while the
+# only real income was fees on other people's activity.
+#
+# So there is a second cap, on FLOW: the rate may never exceed what the bank's own
+# recent earnings can fund. The two are complementary and both bind - coverage catches
+# a drained vault, income catches a vault that is full but unprofitable.
+#
+# Only a share of the earnings is paid out; the rest is retained and grows the reserve,
+# which is what lets the bank recover from a bad week instead of running flat forever.
+BANK_INCOME_WINDOW_DAYS = 7
+BANK_INCOME_PAYOUT_SHARE = 0.55
+
+# The account-maintenance fee is the other half of the same fix, and the structural one:
+# it is levied on precisely the number the interest bill is levied on, so the cost and
+# the income scale together by construction rather than by luck. A saver nets
+# (rate - fee) a day; the bank keeps the fee. It is also honest in-fiction - the vault
+# is what makes your size un-stealable, and you pay it for that.
+BANK_MAINTENANCE_FEE_RATIO = 0.02
+
 
 def bank_coverage(treasury, deposits):
     """How much of what savers hold the treasury could actually cover. With nothing
@@ -2421,6 +2451,19 @@ def bank_base_rate(treasury, deposits):
     return BANK_RATE_MIN + frac * (BANK_RATE_MAX - BANK_RATE_MIN)
 
 
+def bank_income_cap(deposits, income_window_total):
+    """The highest daily rate the bank's own recent earnings could actually fund.
+
+    A cap, not a target: it is compared against the coverage rate and the lower of the
+    two wins. BANK_RATE_MIN is the floor on it, so a bad week throttles the rate rather
+    than switching interest off entirely - the reserve absorbs that much, which is what
+    a reserve is for."""
+    if deposits <= 0:
+        return BANK_RATE_MAX
+    per_day = max(0.0, float(income_window_total)) / max(1, BANK_INCOME_WINDOW_DAYS)
+    return max(BANK_RATE_MIN, (per_day * BANK_INCOME_PAYOUT_SHARE) / float(deposits))
+
+
 def bank_effective_rate(chat_id, econ=None):
     """(rate, base_rate, coverage) as they stand right now, so /bank and /economy quote
     the number the nightly job will actually pay rather than an advertised constant.
@@ -2428,11 +2471,31 @@ def bank_effective_rate(chat_id, econ=None):
     Coverage is the CENTRAL bank's - pooled reserve against pooled deposits - because
     the reserve that pays your interest is everyone's now. The crown's interest_mult is
     still per group, so two groups can see different rates off the same coverage: the
-    bank is shared, the politics aren't."""
+    bank is shared, the politics aren't.
+
+    `base` is the lower of the coverage rate and the income cap, so what is quoted here
+    is what tonight's job can actually afford - see bank_income_cap."""
     cb = db.get_central_bank()
     e = econ or db.get_economy(chat_id)
-    base = bank_base_rate(cb['reserve'], cb['deposits'])
+    income = db.get_treasury_income(BANK_INCOME_WINDOW_DAYS)
+    base = min(bank_base_rate(cb['reserve'], cb['deposits']),
+               bank_income_cap(cb['deposits'], income))
     return (max(0.0, min(0.50, base * e[3])), base, bank_coverage(cb['reserve'], cb['deposits']))
+
+
+def bank_loan_rate(chat_id, econ=None):
+    """What /vam charges over the whole term, derived from what the bank pays savers.
+
+    Anchored to the BASE deposit rate rather than the group's crown-adjusted one: a king
+    who halves his group's interest should not thereby get cheap loans, and one who
+    doubles it should not make borrowing unaffordable. The bank's margin is a property
+    of the bank, not of local politics."""
+    cb = db.get_central_bank()
+    income = db.get_treasury_income(BANK_INCOME_WINDOW_DAYS)
+    base = min(bank_base_rate(cb['reserve'], cb['deposits']),
+               bank_income_cap(cb['deposits'], income))
+    over_term = base * LOAN_TERM_DAYS * BANK_LOAN_SPREAD
+    return max(BANK_LOAN_RATE_MIN, min(BANK_LOAN_RATE_MAX, over_term))
 # You cannot shovel a whole balance in at once: a day's deposits are capped at a share
 # of your wallet, with a floor so small players can still use the bank at all. This is
 # what keeps size in circulation - and keeps /dozdi worth typing.
@@ -2497,7 +2560,18 @@ NOZUL_MIN_RATE = 0.10
 NOZUL_MAX_RATE = 1.00
 # The official loan is cheap by comparison, and capped so one borrower cannot empty the
 # vault that everyone else's interest is paid from.
-BANK_LOAN_RATE = 0.20
+# The bank's lending rate is DERIVED from what it pays savers, never a constant sitting
+# next to it: spread = income, and a fixed loan rate against a floating deposit rate is
+# a spread that can silently go negative. BANK_LOAN_SPREAD is what guarantees every
+# loan is profitable, and the clamps keep it sane at both ends of the deposit band.
+#
+# This matters more than it looks. The ledger says players lending to each other with
+# /nozul have earned ~35x what the official bank has ever earned from /vam - the loan
+# market is where the money in this game actually is, and the bank had no share of it.
+BANK_LOAN_SPREAD = 1.75
+BANK_LOAN_RATE_MIN = 0.10          # over the whole term, not per day
+BANK_LOAN_RATE_MAX = 0.60
+BANK_LOAN_ORIGINATION_RATIO = 0.05  # withheld from the disbursement, kept even on default
 BANK_LOAN_MAX_TREASURY_SHARE = 0.30
 
 # ---------------------------------------------------------------- treasury fees
@@ -3122,6 +3196,7 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # The live rate, not an advertised constant: what's quoted here is exactly what
     # tonight's job will pay, so the two can't drift apart.
     live_rate, _live_base, live_cov = bank_effective_rate(chat_id)
+    maint = fee_of(chat_id, BANK_MAINTENANCE_FEE_RATIO)
 
     msg = (
         f"🏦 <b>بانک دودول</b>\n\n"
@@ -3133,12 +3208,14 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   💰 خزانه: {int(treasury)} سانت\n"
         f"   🧾 کل سپرده‌ها: {int(total_dep)} سانت از {holders} نفر\n\n"
         f"📈 سود روزانهٔ الان: {live_rate*100:.2f}٪ "
-        f"(خزانه {live_cov*100:.0f}٪ سپرده‌ها رو پوشش می‌ده)\n"
-        f"   └ نرخ ثابت نیست: خزانه پرتر = سود بیشتر، بین "
-        f"{BANK_RATE_MIN*100:.1f}٪ تا {BANK_RATE_MAX*100:.0f}٪.\n"
+        f"(پوشش ذخیره {live_cov*100:.0f}٪ سپرده‌ها)\n"
+        f"🧾 کارمزد نگهداری حساب: {maint*100:.2f}٪ در روز\n"
+        f"   └ خالص روزانه برای تو: <b>{(live_rate - maint)*100:+.2f}٪</b>\n"
+        f"   └ نرخ ثابت نیست: هم به ذخیرهٔ بانک بستگی داره هم به درآمدش "
+        f"(بین {BANK_RATE_MIN*100:.1f}٪ تا {BANK_RATE_MAX*100:.0f}٪).\n"
         f"⚠️ سایزِ بانک تو لیدربرد و تاج حساب نمی‌شه.\n"
         f"🥷 خزانه و سپرده‌ها با /sarghat قابل سرقتن!\n\n"
-        f"دستورها: /variz &lt;مقدار&gt; • /bardasht &lt;مقدار&gt; • /sarghat"
+        f"دستورها: /variz &lt;مقدار&gt; • /bardasht &lt;مقدار&gt; • /sarghat • /markazi"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -3264,6 +3341,10 @@ async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     my_dep, my_holders = db.get_bank_totals(chat_id)
     rate, _base, cov = bank_effective_rate(chat_id)
 
+    income = db.get_treasury_income(BANK_INCOME_WINDOW_DAYS)
+    income_day = income / max(1, BANK_INCOME_WINDOW_DAYS)
+    maint = fee_of(chat_id, BANK_MAINTENANCE_FEE_RATIO)
+    interest_bill = cb['deposits'] * rate
     lent_pct = (cb['loans_out'] / cb['deposits'] * 100) if cb['deposits'] > 0 else 0.0
     if cb['cash'] <= 0:
         liquidity = "❌ نقدینگی تمومه — برداشت فعلاً ممکن نیست"
@@ -3287,11 +3368,20 @@ async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 نرخ سود امروزِ این گروه: <b>{rate*100:.2f}٪</b> (پوشش {cov*100:.0f}٪)"
         if cov is not None else f"📈 نرخ سود امروزِ این گروه: <b>{rate*100:.2f}٪</b>",
         "",
+        "<b>سود و زیان بانک</b>",
+        f"   📥 درآمد {BANK_INCOME_WINDOW_DAYS} روز اخیر: {int(income)} سانت "
+        f"(~{int(income_day)} در روز)",
+        f"   📤 قبض سود امشب: ~{int(interest_bill)} سانت",
+        f"   🧾 کارمزد نگهداری: {maint*100:.2f}٪ روزانهٔ سپرده‌ها",
+        "   └ نرخ سود از درآمد بانک تغذیه می‌شه — بیشتر از اون پرداخت نمی‌کنه",
+        "",
         "<b>سهم این گروه</b>",
         f"   🏛 تو ذخیره: {int(my_share)} سانت",
         f"   🔒 سپردهٔ اعضا: {int(my_dep)} سانت از {my_holders} نفر",
     ]
-    lines.append("\nسود سپرده‌ها رو بهرهٔ وام‌گیرنده‌ها می‌ده — نه یه صندوق جادویی.")
+    lines.append(f"\n🏛 نرخ وام بانکی الان: {bank_loan_rate(chat_id)*100:.0f}٪ "
+                 f"(+{int(BANK_LOAN_ORIGINATION_RATIO*100)}٪ کارمزد صدور)")
+    lines.append("سود سپرده‌ها رو بهرهٔ وام‌گیرنده‌ها و کارمزدها می‌ده — نه یه صندوق جادویی.")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -3717,30 +3807,375 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
             rows, paid, left = db.pay_interest(
                 chat_id, rate, BANK_INTEREST_MAX_TREASURY_SHARE
             )
-            if rows <= 0 or paid <= 0:
+            # The maintenance fee is charged AFTER the interest lands, so a saver earns
+            # on what they held all day and is then billed on the same base. Both sit
+            # inside the one claim_interest_run slot above, so a restart can no more
+            # double-charge the fee than it can double-pay the interest.
+            fee_ratio = fee_of(chat_id, BANK_MAINTENANCE_FEE_RATIO, econ)
+            fee_rows, fee_total = db.charge_maintenance(chat_id, fee_ratio)
+            if (rows <= 0 or paid <= 0) and fee_rows <= 0:
                 continue
             total_dep, _ = db.get_bank_totals(chat_id)
+            treasury_now, _, _ = db.get_treasury(chat_id)
+            net_rate = rate - fee_ratio
             if base >= BANK_RATE_MAX - 1e-9:
                 mood = "خزانه پره — نرخ روی سقفه 🤑"
             elif base <= BANK_RATE_MIN + 1e-9:
-                mood = "خزانه ته کشیده — نرخ افتاده کف 😬"
+                mood = "بانک کم‌درآمده — نرخ افتاده کف 😬"
             else:
-                mood = "نرخ با وضع خزانه بالا و پایین می‌ره"
+                mood = "نرخ با درآمد و ذخیرهٔ بانک بالا و پایین می‌ره"
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(f"🏦 <b>سود روزانهٔ بانک</b>\n\n"
-                      f"📈 نرخ امروز: <b>{rate*100:.2f}٪</b> — {mood}\n"
-                      f"به {rows} سپرده‌گذار در مجموع {int(paid)} سانت سود داده شد.\n"
-                      f"🧾 کل سپرده‌ها: {int(total_dep)} سانت\n"
-                      f"💰 باقی‌ماندهٔ خزانه: {int(left)} سانت "
-                      f"(پوشش {coverage*100:.0f}٪ سپرده‌ها)\n\n"
-                      f"هرچی بیشتر از فروشگاه بخرید و کارمزد بدید، خزانه پرتر و سود همه بیشتر می‌شه."),
+                      f"📈 سود امروز: <b>{rate*100:.2f}٪</b> — {mood}\n"
+                      f"🧾 کارمزد نگهداری حساب: <b>{fee_ratio*100:.2f}٪</b>\n"
+                      f"   └ خالص برای سپرده‌گذار: <b>{net_rate*100:+.2f}٪</b>\n\n"
+                      f"💸 به {rows} نفر مجموعاً {int(paid)} سانت سود داده شد.\n"
+                      f"🏛 از {fee_rows} حساب مجموعاً {int(fee_total)} سانت کارمزد گرفته شد.\n"
+                      f"🔒 کل سپرده‌ها: {int(total_dep)} سانت\n"
+                      f"💰 سهم این گروه از ذخیره: {int(treasury_now)} سانت "
+                      f"(پوشش کل {coverage*100:.0f}٪)\n\n"
+                      f"نرخ سود از درآمد واقعی بانک میاد — هرچی بیشتر خرید و کارمزد و "
+                      f"معاملهٔ کریپتو باشه، سود همه بیشتر می‌شه."),
                 parse_mode="HTML"
             )
         except Forbidden:
             db.remove_chat(chat_id)
         except Exception:
             logging.exception(f"bank interest failed for {chat_id}")
+
+
+# ---------------------------------------------------------------- crypto market
+
+# One market for the whole bot: a coin costs the same in every group, so two groups can
+# argue about the same price. Only holdings are per (user, chat), because size is.
+#
+# THE TREASURY IS THE COUNTERPARTY, and that is the entire economic design. A buy moves
+# size into the vault; a sell moves it back out. Nothing is created and nothing is
+# destroyed, exactly like the spectator book's house - except that here the house cannot
+# mint at all: a sale the treasury cannot cover is PARTIALLY FILLED (see db.crypto_sell)
+# rather than paid out of thin air. A coin that has tripled is a claim on the vault, not
+# a claim on the universe.
+#
+# The house edge is CRYPTO_FEE_RATIO on both legs, which is where the bank's new daily
+# income actually comes from: a round trip costs a trader ~6% whatever the price does,
+# and that lands in the treasury as `treasury_in` and therefore raises everyone's
+# deposit rate. Trading against your friends pays the savers.
+CRYPTO_COINS = [
+    # (symbol, display name, base price, per-tick volatility)
+    ("BTK", "بیت‌کیر",    500.0, 0.020),
+    ("ETK", "اترکیریوم",  180.0, 0.025),
+    ("KRD", "کیردانو",     40.0, 0.030),
+    ("KSL", "کوسلانا",     60.0, 0.035),
+    ("KRM", "کیریمیوم",    25.0, 0.045),
+    ("KRK", "کیرکونوک",    12.0, 0.055),
+    ("DDL", "دودولدار",     8.0, 0.060),
+    ("DGK", "دوج‌کیر",      2.0, 0.075),
+    ("SHK", "شیب‌کیر",      1.0, 0.090),
+    ("TXE", "تتر خایه",    10.0, 0.002),   # the "stablecoin" - it wobbles, barely
+]
+CRYPTO_TICK_SECONDS = 60
+# Mean reversion is what stops a random walk wandering off to zero or to the moon and
+# never coming back. Without it, one lucky coin eventually becomes the only thing worth
+# holding and the market stops being a market.
+CRYPTO_MEAN_REVERT = 0.02
+CRYPTO_MIN_MULT = 0.15             # a coin can lose 85% of its base value...
+CRYPTO_MAX_MULT = 6.0              # ...or be worth six times it, and no further
+CRYPTO_FEE_RATIO = 0.03            # each way, so a round trip is ~6% to the house
+# Same reasoning as the bank's deposit cap: without a daily ceiling the whole wallet
+# goes in at once, size leaves circulation, and /dozdi stops being worth typing.
+CRYPTO_DAILY_BUY_RATIO = 0.30
+CRYPTO_DAILY_BUY_FLOOR = 50
+CRYPTO_MIN_TRADE = 5
+
+_crypto_rng = random.SystemRandom()
+
+
+def _crypto_daily_cap(wallet_size):
+    return max(CRYPTO_DAILY_BUY_FLOOR, int(wallet_size * CRYPTO_DAILY_BUY_RATIO))
+
+
+def crypto_next_price(price, base, vol):
+    """One tick of a mean-reverting geometric random walk, clamped to the band.
+
+    Geometric rather than additive so a 2-size coin and a 500-size coin move by
+    comparable *percentages* - an additive shock would leave the cheap coins flat and
+    the expensive ones berserk."""
+    price = max(1e-6, float(price))
+    base = max(1e-6, float(base))
+    pull = CRYPTO_MEAN_REVERT * math.log(base / price)
+    shock = float(vol) * _crypto_rng.gauss(0.0, 1.0)
+    nxt = price * math.exp(pull + shock)
+    return round(max(base * CRYPTO_MIN_MULT, min(base * CRYPTO_MAX_MULT, nxt)), 4)
+
+
+async def crypto_tick_job(context: ContextTypes.DEFAULT_TYPE):
+    """Moves every price, once a minute, silently. Deliberately posts nothing: at one
+    tick a minute any announcement would be pure spam, and /crypto is where the board
+    lives."""
+    try:
+        rows = db.crypto_all()
+        if not rows:
+            return
+        db.crypto_set_prices([
+            (sym, crypto_next_price(price, base, vol))
+            for sym, _name, price, _prev, base, vol in rows
+        ])
+    except Exception:
+        logging.exception("crypto tick failed")
+
+
+def _crypto_find(rows, needle):
+    """Resolve a coin from whatever the player typed - symbol or Persian name, in any
+    case, with the various Arabic/Persian yeh-and-kaf spellings folded together."""
+    def norm(t):
+        return (str(t).strip().lower()
+                .replace('‌', '').replace(' ', '')
+                .replace('ي', 'ی').replace('ك', 'ک'))
+    n = norm(needle)
+    if not n:
+        return None
+    for row in rows:
+        if norm(row[0]) == n or norm(row[1]) == n:
+            return row
+    for row in rows:
+        if norm(row[1]).startswith(n) or norm(row[0]).startswith(n):
+            return row
+    return None
+
+
+def _crypto_arrow(price, prev):
+    if prev is None or prev <= 0:
+        return "▪️", 0.0
+    pct = (float(price) - float(prev)) / float(prev) * 100.0
+    if pct > 0.01:
+        return "🟢▲", pct
+    if pct < -0.01:
+        return "🔴▼", pct
+    return "▪️", pct
+
+
+def _fmt_price(p):
+    p = float(p)
+    return f"{p:,.2f}" if p < 100 else f"{int(round(p)):,}"
+
+
+async def crypto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/crypto` - the market board: every coin, its price, and the last minute's move."""
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    rows = db.crypto_all()
+    if not rows:
+        await update.message.reply_text("بازار هنوز باز نشده!")
+        return
+    held = {sym: (amt, avg) for sym, amt, avg in
+            db.crypto_holdings_of(update.effective_user.id, chat_id)}
+    treasury, _, _ = db.get_treasury(chat_id)
+
+    lines = ["📉 <b>بازار کریپتوی دودول</b>", "قیمت‌ها هر دقیقه تکون می‌خورن.", ""]
+    for sym, name, price, prev, base, _vol in rows:
+        arrow, pct = _crypto_arrow(price, prev)
+        vs_base = (float(price) - float(base)) / float(base) * 100.0
+        mine = held.get(sym)
+        mine_txt = f" • تو: {mine[0]:.4g}".rstrip('0').rstrip('.') if mine else ""
+        lines.append(
+            f"{arrow} <b>{_esc(name)}</b> <code>{sym}</code>\n"
+            f"    {_fmt_price(price)} سانت ({pct:+.2f}٪ | نسبت به پایه {vs_base:+.0f}٪)"
+            f"{mine_txt}"
+        )
+    lines += [
+        "",
+        f"🏛 نقدینگی بازار (خزانهٔ گروه): {int(treasury)} سانت",
+        f"🧾 کارمزد هر معامله: {int(CRYPTO_FEE_RATIO*100)}٪ → مستقیم به خزانه",
+        "",
+        "🛒 /kharid &lt;کوین&gt; &lt;سانت&gt;",
+        "💰 /frush &lt;کوین&gt; &lt;سانت|همه&gt;",
+        "📊 /portfo — سبد من",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/kharid <coin> <size>` - spend that much size on a coin at the live price."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    rows = db.crypto_all()
+    parts = update.message.text.split()
+    cap = _crypto_daily_cap(wallet)
+    if len(parts) < 3:
+        await update.message.reply_text(
+            f"🛒 خرید کریپتو\n\n/kharid <کوین> <مقدار سانت>\n"
+            f"مثال: /kharid بیت‌کیر 100\n\n"
+            f"سقف خرید امروزت: {cap} سانت\nلیست کوین‌ها: /crypto"
+        )
+        return
+    coin = _crypto_find(rows, parts[1])
+    if coin is None:
+        await update.message.reply_text("همچین کوینی نداریم! لیست: /crypto")
+        return
+    try:
+        spend = int(float(parts[2]))
+    except ValueError:
+        spend = 0
+    if spend < CRYPTO_MIN_TRADE:
+        await update.message.reply_text(f"حداقل خرید {CRYPTO_MIN_TRADE} سانته.")
+        return
+
+    sym, name, price = coin[0], coin[1], float(coin[2])
+    # The fee is charged ON TOP of the spend, so "خرید ۱۰۰" always buys 100 size worth
+    # of coin and the receipt is never a surprise.
+    units = round(spend / price, 6)
+    res = db.crypto_buy(user.id, chat_id, sym, units, price, CRYPTO_FEE_RATIO,
+                        tehran_today_str(), cap)
+    if not res[0]:
+        reason, extra = res[1], res[2]
+        if reason == 'cap':
+            await update.message.reply_text(
+                f"سقف خرید روزانه‌ت پر شده!\nباقی‌مونده: {int(extra)} از {cap} سانت"
+            )
+        elif reason == 'funds':
+            need = int(round(spend * (1 + CRYPTO_FEE_RATIO)))
+            await update.message.reply_text(
+                f"سانت کافی نداری! با کارمزد {need} سانت لازمه، تو {int(wallet)} داری."
+            )
+        else:
+            await update.message.reply_text("مقدار نامعتبره!")
+        return
+
+    _ok, total, fee, new_amount, new_avg = res
+    await update.message.reply_text(
+        f"🛒 <b>خرید انجام شد!</b>\n\n"
+        f"{_esc(user.first_name)} <b>{units:.6g}</b> {_esc(name)} خرید.\n"
+        f"💱 قیمت: {_fmt_price(price)} سانت\n"
+        f"💸 پرداختی: <b>{int(total)}</b> سانت (کارمزد {int(fee)} → خزانه)\n\n"
+        f"📦 موجودی: {new_amount:.6g} {_esc(name)} "
+        f"(میانگین خرید {_fmt_price(new_avg)})\n"
+        f"📊 /portfo",
+        parse_mode="HTML"
+    )
+
+
+async def crypto_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/frush <coin> <size|همه>` - sell coin worth that much size at the live price."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    rows = db.crypto_all()
+    parts = update.message.text.split()
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "💰 فروش کریپتو\n\n/frush <کوین> <مقدار سانت یا «همه»>\n"
+            "مثال: /frush بیت‌کیر 100\nمثال: /frush بیت‌کیر همه"
+        )
+        return
+    coin = _crypto_find(rows, parts[1])
+    if coin is None:
+        await update.message.reply_text("همچین کوینی نداریم! لیست: /crypto")
+        return
+    sym, name, price = coin[0], coin[1], float(coin[2])
+    holding = dict((s, (a, c)) for s, a, c in db.crypto_holdings_of(user.id, chat_id)).get(sym)
+    if not holding or holding[0] <= 0:
+        await update.message.reply_text(f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
+        return
+    held_units = float(holding[0])
+
+    raw = parts[2].strip()
+    if raw in ("همه", "all", "hame", "کل"):
+        units = held_units
+    else:
+        try:
+            want = float(raw)
+        except ValueError:
+            await update.message.reply_text("مقدار نامعتبره!")
+            return
+        if want < CRYPTO_MIN_TRADE:
+            await update.message.reply_text(f"حداقل فروش {CRYPTO_MIN_TRADE} سانته.")
+            return
+        units = min(held_units, round(want / price, 6))
+
+    res = db.crypto_sell(user.id, chat_id, sym, units, price, CRYPTO_FEE_RATIO)
+    if not res[0]:
+        if res[1] == 'liquidity':
+            await update.message.reply_text(
+                "🏜 بازار نقدینگی نداره!\n\n"
+                "خزانهٔ گروه الان اون‌قدر سانت نداره که این فروش رو بخره. "
+                "کمتر بفروش، یا صبر کن خزانه از کارمزدها پر بشه."
+            )
+        else:
+            await update.message.reply_text(f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
+        return
+
+    _ok, sold, net, fee, pnl, left = res
+    partial = ""
+    if sold < units - 1e-6:
+        partial = ("\n⚠️ بازار فقط همین‌قدر رو کشید — بقیهٔ سکه‌هات دست خودت موند.")
+    verdict = "📈 سود" if pnl >= 0 else "📉 ضرر"
+    await update.message.reply_text(
+        f"💰 <b>فروش انجام شد!</b>\n\n"
+        f"{_esc(user.first_name)} <b>{sold:.6g}</b> {_esc(name)} فروخت.\n"
+        f"💱 قیمت: {_fmt_price(price)} سانت\n"
+        f"📥 دریافتی: <b>{int(net)}</b> سانت (کارمزد {int(fee)} → خزانه)\n"
+        f"{verdict}: <b>{int(pnl):+}</b> سانت\n\n"
+        f"📦 باقی‌مونده: {left:.6g} {_esc(name)}{partial}",
+        parse_mode="HTML"
+    )
+
+
+async def crypto_portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/portfo` - what you hold, what it cost, and what it is worth right now."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        return
+    db.track_chat(chat_id)
+    wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+    prices = {r[0]: (r[1], float(r[2])) for r in db.crypto_all()}
+    holdings = db.crypto_holdings_of(user.id, chat_id)
+    if not holdings:
+        await update.message.reply_text(
+            "📊 سبد تو خالیه!\n\nبا /crypto بازار رو ببین و با /kharid بخر."
+        )
+        return
+
+    lines = [f"📊 <b>سبد {_esc(user.first_name)}</b>", ""]
+    total_val = total_cost = 0.0
+    for sym, amount, avg in holdings:
+        name, price = prices.get(sym, (sym, 0.0))
+        value = float(amount) * price
+        cost = float(amount) * float(avg)
+        pnl = value - cost
+        total_val += value
+        total_cost += cost
+        mark = "🟢" if pnl >= 0 else "🔴"
+        pct = (pnl / cost * 100.0) if cost > 0 else 0.0
+        lines.append(
+            f"{mark} <b>{_esc(name)}</b> — {float(amount):.6g}\n"
+            f"    ارزش: {int(value)} سانت | خرید: {int(cost)} | "
+            f"{int(pnl):+} ({pct:+.1f}٪)"
+        )
+    total_pnl = total_val - total_cost
+    lines += [
+        "",
+        f"💼 جیب: {int(wallet)} سانت",
+        f"🪙 ارزش کل سبد: <b>{int(total_val)}</b> سانت",
+        f"{'🟢' if total_pnl >= 0 else '🔴'} سود/زیان کل: <b>{int(total_pnl):+}</b> سانت",
+        "",
+        "⚠️ ارزش سبد تو لیدربرد و تاج حساب نمی‌شه — تا نفروشیش سایز نیست.",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------- loan commands
@@ -3872,7 +4307,9 @@ async def loan_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("این پیشنهاد برای تو نیست!", show_alert=True)
         return
 
-    ok, principal, due_amount = db.accept_loan(loan_id, user.id, LOAN_TERM_DAYS)
+    ok, principal, due_amount, orig_fee = db.accept_loan(
+        loan_id, user.id, LOAN_TERM_DAYS, BANK_LOAN_ORIGINATION_RATIO
+    )
     if not ok:
         reasons = {
             'gone': "این پیشنهاد دیگه معتبر نیست!",
@@ -3883,11 +4320,15 @@ async def loan_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     lender_label = "بانک" if loan[2] is None else loan[3]
-    await query.answer(f"{int(principal)} سانت گرفتی! یادت نره پس بدی 😈")
+    handed = int(round(principal - orig_fee))
+    await query.answer(f"{handed} سانت گرفتی! یادت نره پس بدی 😈")
+    fee_line = (f"🧾 کارمزد صدور: {int(orig_fee)} سانت → خزانه\n" if orig_fee > 0 else "")
     try:
         await query.edit_message_text(
             f"🤝 <b>نزول بسته شد!</b>\n\n"
-            f"{_esc(loan[5])} از {_esc(lender_label)} <b>{int(principal)}</b> سانت گرفت.\n"
+            f"{_esc(loan[5])} از {_esc(lender_label)} <b>{int(principal)}</b> سانت وام گرفت.\n"
+            f"{fee_line}"
+            f"📥 به دستش رسید: <b>{handed}</b> سانت\n"
             f"💸 باید تا {LOAN_TERM_DAYS} روز دیگه <b>{int(due_amount)}</b> سانت پس بده.\n\n"
             f"با /pardakht زودتر تسویه کن، وگرنه خودکار وصول می‌شه.",
             parse_mode="HTML"
@@ -3897,8 +4338,10 @@ async def loan_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/vam <amount>` - the official loan, funded by the group treasury at a flat rate.
-    Repayment goes back into the treasury, which is what pays everyone's bank interest."""
+    """`/vam <amount>` - the official loan, funded out of the central bank's pooled
+    deposits. The rate floats off what the bank pays savers (see bank_loan_rate) and an
+    origination fee is withheld from the disbursement, so lending is what earns the bank
+    its keep rather than a favour it does the borrower."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
@@ -3908,6 +4351,7 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     treasury, _, _ = db.get_treasury(chat_id)
     score, repaid, late, defaults = db.get_credit(user.id, chat_id)
+    loan_rate = bank_loan_rate(chat_id)
     # The official bank is the strict lender: bad credit is refused outright rather
     # than priced. Loan sharks are still an option, which is the point.
     if score < BANK_LOAN_MIN_SCORE:
@@ -3932,7 +4376,8 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if amount is None or amount <= 0:
         await update.message.reply_text(
             f"🏛 وام رسمی بانک\n\n"
-            f"نرخ: {int(BANK_LOAN_RATE*100)}٪ — سررسید {LOAN_TERM_DAYS} روز\n"
+            f"نرخ: {loan_rate*100:.0f}٪ — سررسید {LOAN_TERM_DAYS} روز\n"
+            f"🧾 کارمزد صدور: {int(BANK_LOAN_ORIGINATION_RATIO*100)}٪ (از مبلغ وام کم می‌شه)\n"
             f"📊 امتیاز اعتباریت: {score}/200 — {_credit_grade(score)}\n"
             f"💰 خزانه: {int(treasury)} سانت\n"
             f"📈 سقف وام تو الان: {ceiling} سانت\n\n"
@@ -3954,14 +4399,17 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     loan_id, due_amount = db.create_loan_offer(
-        chat_id, None, "بانک", user.id, user.first_name, amount, BANK_LOAN_RATE, LOAN_TERM_DAYS
+        chat_id, None, "بانک", user.id, user.first_name, amount, loan_rate, LOAN_TERM_DAYS
     )
+    orig_fee = int(round(amount * BANK_LOAN_ORIGINATION_RATIO))
     keyboard = [[InlineKeyboardButton("✍️ امضا می‌کنم", callback_data=f"loanok_{loan_id}")]]
     await update.message.reply_text(
         f"🏛 <b>وام بانکی</b>\n\n"
         f"{_esc(user.first_name)} می‌خواد <b>{amount}</b> سانت وام بگیره.\n"
+        f"📥 به دستت می‌رسه: <b>{amount - orig_fee}</b> سانت "
+        f"(کارمزد صدور {orig_fee} سانت کم شد)\n"
         f"💸 بازپرداخت: <b>{int(due_amount)}</b> سانت تا {LOAN_TERM_DAYS} روز دیگه "
-        f"(سود {int(BANK_LOAN_RATE*100)}٪)\n\n"
+        f"(سود {loan_rate*100:.0f}٪)\n\n"
         f"⛔️ سر موعد نداشته باشی، از جیب و بعد از سپردهٔ بانکیت وصول می‌شه.",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
     )
@@ -5585,6 +6033,10 @@ async def achievements_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     db.init_db()
+    # Coins are seeded, never reset: crypto_seed leaves a live price exactly where it
+    # is and only inserts genuinely new symbols, so a deploy mid-rally doesn't hand
+    # everyone's position back at the base price.
+    db.crypto_seed(CRYPTO_COINS)
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(setup_commands).build()
 
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
@@ -5598,6 +6050,7 @@ if __name__ == '__main__':
     app.job_queue.run_daily(collect_loans_job, time=time(hour=0, minute=15, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(auto_handicap_job, time=time(hour=0, minute=20, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(random_event_job, interval=RANDOM_EVENT_INTERVAL_SECONDS, first=300)
+    app.job_queue.run_repeating(crypto_tick_job, interval=CRYPTO_TICK_SECONDS, first=20)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
     app.job_queue.run_once(recover_expired_consensus, when=7)
     app.job_queue.run_once(recover_pending_lotteries, when=9)
@@ -5635,6 +6088,10 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/(vasighe|bail)\b'), heist_bail_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(markazi|centralbank)\b'), central_bank_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(afv|pardon)\b'), heist_pardon_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(crypto|bazar)\b'), crypto_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(kharid|buycoin)\b'), crypto_buy_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(frush|forush|sellcoin)\b'), crypto_sell_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/(portfo|portfolio|sabad)\b'), crypto_portfolio_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(nozul|nozool)\b'), nozul_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(vam|loan)\b'), vam_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(bedehi|debts)\b'), debts_cmd))

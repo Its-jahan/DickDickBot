@@ -386,6 +386,41 @@ def init_db():
         ''')
         c.execute('INSERT INTO central_bank (id) VALUES (1) ON CONFLICT (id) DO NOTHING')
 
+        # ---------------------------------------------------------------- crypto market
+        # One market for the whole bot, exactly like the central bank: a coin is worth
+        # the same in every group, so players can actually argue about the price. Only
+        # the CURRENT price is stored - `prev_price` is what the last tick moved it from,
+        # which is all the UI needs to draw an arrow. No history table: nobody has asked
+        # for a chart and an unbounded per-minute log would dwarf every other table here.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS crypto_prices (
+                symbol TEXT PRIMARY KEY,
+                name TEXT,
+                price DOUBLE PRECISION,
+                prev_price DOUBLE PRECISION,
+                base_price DOUBLE PRECISION,
+                volatility DOUBLE PRECISION,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+        ''')
+        # Holdings are per (user, chat) because size is. `avg_cost` is what makes a sale
+        # separable into "my money coming back" and "what I actually made" - see
+        # crypto_sell, and get_recent_net_by_user for why that split is load-bearing.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS crypto_holdings (
+                user_id BIGINT,
+                chat_id BIGINT,
+                symbol TEXT,
+                amount DOUBLE PRECISION DEFAULT 0,
+                avg_cost DOUBLE PRECISION DEFAULT 0,
+                bought_date TEXT DEFAULT \'\',
+                bought_today DOUBLE PRECISION DEFAULT 0,
+                PRIMARY KEY (user_id, chat_id, symbol)
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS crypto_holdings_owner_idx '
+                  'ON crypto_holdings (user_id, chat_id)')
+
         # ---------------------------------------------------------------- economy
         # One row per group. `inflation` is a price index: everything the game charges
         # or pays out is multiplied by it, so a group that prints money finds its shop
@@ -1734,7 +1769,13 @@ def get_recent_net_by_user(chat_id, days):
 
     Loan *interest* is deliberately NOT excluded. That is the one part of a loan that is
     real profit for the lender and a real cost to the borrower, so a player getting rich
-    from usury gets throttled by the handicap exactly like one getting rich from dice."""
+    from usury gets throttled by the handicap exactly like one getting rich from dice.
+
+    Crypto splits the same way and for the same reason: `crypto_principal` (the stake
+    going into a position and the cost basis coming back out) is excluded, while
+    `crypto_pnl` and `crypto_fee` are counted. Without that split, dumping a wallet into
+    a coin before the nightly job reads the ledger would look like a catastrophic loss
+    and pay a growth bonus for it - the deposit exploit wearing a different hat."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
@@ -1742,10 +1783,10 @@ def get_recent_net_by_user(chat_id, days):
             'FROM size_log l LEFT JOIN users u '
             '  ON u.user_id = l.user_id AND u.chat_id = l.chat_id '
             'WHERE l.chat_id = %s AND l.created_at >= NOW() - (%s || %s)::interval '
-            '  AND COALESCE(l.source, %s) NOT IN (%s, %s, %s, %s) '
+            '  AND COALESCE(l.source, %s) NOT IN (%s, %s, %s, %s, %s) '
             'GROUP BY l.user_id',
             ('', chat_id, days, ' days', '', 'bank_deposit', 'bank_withdraw',
-             'loan_principal', 'xfer_principal')
+             'loan_principal', 'xfer_principal', 'crypto_principal')
         )
         return c.fetchall()
 
@@ -2325,6 +2366,295 @@ def pay_interest(chat_id, rate, max_share):
         return (paid_rows, paid_total, treasury)
 
 
+# ---------------------------------------------------------------- treasury income
+
+def get_treasury_income(days):
+    """What the CENTRAL bank actually earned over the last `days` days.
+
+    Only rows tagged 'treasury_in' count, which is deliberately narrower than "the
+    treasury went up": a crypto buyer parking size against a position is logged as
+    'crypto_in' and must NOT read as income, because the bank may have to hand every
+    centimetre of it back on the next sale. Fees, shop purchases and the lottery rake
+    are income; a position is not.
+
+    Pooled rather than per group, matching the pooled rate: the reserve that pays your
+    interest is everyone's now, so the earnings that fund it are everyone's too."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(SUM(amount),0) FROM bank_log "
+                  "WHERE kind = 'treasury_in' AND created_at >= NOW() - (%s || %s)::interval",
+                  (days, ' days'))
+        return float(c.fetchone()[0] or 0.0)
+
+
+def charge_maintenance(chat_id, ratio):
+    """Charges one group's depositors a day's account-maintenance fee, straight into
+    that group's own member account of the reserve.
+
+    This is the piece that makes the deposit rate self-funding: the fee is levied on
+    exactly the same number the interest bill is levied on, so the two grow together
+    instead of the liability outrunning the income. Charged to the group's own share
+    (not spread across the pool) because it is this group's savers paying it - unlike
+    interest, which the pool cross-subsidises.
+
+    Returns (rows_charged, total_charged)."""
+    if ratio <= 0:
+        return (0, 0.0)
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, COALESCE(balance,0) FROM bank_accounts '
+                  'WHERE chat_id = %s AND COALESCE(balance,0) > 0 FOR UPDATE', (chat_id,))
+        holders = c.fetchall()
+        total, rows = 0.0, 0
+        for uid, bal in holders:
+            fee = round(float(bal) * ratio, 2)
+            # Never overdraw an account into debt on a fee, and skip the ones where a
+            # day's fee rounds away to nothing rather than logging a no-op row.
+            fee = min(fee, float(bal))
+            if fee <= 0:
+                continue
+            c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING balance', (fee, uid, chat_id))
+            brow = c.fetchone()
+            if brow is None:
+                continue
+            _bank_log(c, chat_id, uid, 'maintenance', -fee, brow[0], 'کارمزد نگهداری حساب')
+            total += fee
+            rows += 1
+        if total > 0:
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                      (chat_id, total, total))
+            _bank_log(c, chat_id, None, 'treasury_in', total, c.fetchone()[0],
+                      'کارمزد نگهداری حساب')
+        return (rows, round(total, 2))
+
+
+# ---------------------------------------------------------------- crypto market
+
+def crypto_seed(coins):
+    """Registers the coin list once. Existing rows are left exactly as they are, so a
+    restart never resets a live price back to its base - only genuinely new coins are
+    inserted. Same discipline as every other init_db write."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        for symbol, name, base, vol in coins:
+            c.execute('INSERT INTO crypto_prices (symbol, name, price, prev_price, '
+                      'base_price, volatility) VALUES (%s, %s, %s, %s, %s, %s) '
+                      'ON CONFLICT (symbol) DO UPDATE SET name = EXCLUDED.name, '
+                      'base_price = EXCLUDED.base_price, volatility = EXCLUDED.volatility',
+                      (symbol, name, base, base, base, vol))
+
+
+def crypto_all():
+    """(symbol, name, price, prev_price, base_price, volatility) for the whole market."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT symbol, name, price, prev_price, base_price, volatility '
+                  'FROM crypto_prices ORDER BY base_price DESC, symbol')
+        return c.fetchall()
+
+
+def crypto_set_prices(pairs):
+    """Writes one tick for the whole market in a SINGLE statement.
+
+    `prev_price` is taken from the row's own current price inside that statement, so the
+    arrow a player sees always describes the move that just happened. One round trip
+    matters here in a way it doesn't elsewhere: this runs every minute forever, and a
+    per-coin loop would be ten Supabase round trips a minute for the life of the bot."""
+    pairs = [(sym, float(px)) for sym, px in pairs if px and px > 0]
+    if not pairs:
+        return
+    values = ','.join(['(%s, %s::double precision)'] * len(pairs))
+    args = [x for pair in pairs for x in pair]
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE crypto_prices AS cp SET prev_price = cp.price, price = v.price, '
+                  'updated_at = NOW() '
+                  f'FROM (VALUES {values}) AS v(symbol, price) '
+                  'WHERE cp.symbol = v.symbol', args)
+
+
+def crypto_holdings_of(user_id, chat_id):
+    """(symbol, amount, avg_cost) for everything this player holds in this group."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT symbol, amount, avg_cost FROM crypto_holdings '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(amount,0) > 0 '
+                  'ORDER BY symbol', (user_id, chat_id))
+        return c.fetchall()
+
+
+def crypto_buy(user_id, chat_id, symbol, units, price, fee_ratio, today_str, daily_cap):
+    """Buys `units` at `price`, wallet -> treasury, in ONE transaction.
+
+    The treasury is the counterparty, exactly like the spectator book's house: the size
+    a buyer spends is not destroyed, it is held against the position and paid back out
+    on a sale. Only the FEE is income, and it is the only part logged as 'treasury_in'.
+
+    Returns (True, spent, fee, new_amount, new_avg) or (False, reason, remaining_cap)."""
+    gross = round(units * price, 2)
+    fee = round(gross * fee_ratio, 2)
+    total = round(gross + fee, 2)
+    if units <= 0 or gross <= 0:
+        return (False, 'amount', 0.0)
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO crypto_holdings (user_id, chat_id, symbol) VALUES (%s,%s,%s) '
+                  'ON CONFLICT (user_id, chat_id, symbol) DO NOTHING',
+                  (user_id, chat_id, symbol))
+        # Roll the day's allowance over first, so a stale stamp can't block today. The
+        # cap counts GROSS spend for the same reason the deposit cap does: otherwise
+        # buy -> sell -> buy refills it and the whole wallet goes in behind one day's
+        # allowance.
+        c.execute('UPDATE crypto_holdings SET bought_date = %s, bought_today = 0 '
+                  'WHERE user_id = %s AND chat_id = %s '
+                  '  AND COALESCE(bought_date,%s) <> %s',
+                  (today_str, user_id, chat_id, '', today_str))
+        c.execute('SELECT COALESCE(SUM(bought_today),0) FROM crypto_holdings '
+                  'WHERE user_id = %s AND chat_id = %s', (user_id, chat_id))
+        used = float(c.fetchone()[0] or 0.0)
+        remaining = daily_cap - used
+        if remaining <= 0:
+            return (False, 'cap', 0.0)
+        if gross > remaining:
+            return (False, 'cap', remaining)
+
+        c.execute('UPDATE users SET size = COALESCE(size,0) - %s '
+                  'WHERE user_id = %s AND chat_id = %s AND COALESCE(size,0) >= %s RETURNING size',
+                  (total, user_id, chat_id, total))
+        wrow = c.fetchone()
+        if wrow is None:
+            return (False, 'funds', remaining)
+        after = float(wrow[0])
+        # Two ledger rows, and the split is load-bearing: the stake is a transfer between
+        # the player's own pockets and must not read to the nightly handicap as a loss
+        # (see get_recent_net_by_user), while the fee is a real cost and must.
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s,%s,%s,%s,%s,%s)',
+                  (chat_id, user_id, -gross, after + fee, 'crypto_principal', symbol))
+        if fee > 0:
+            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s,%s,%s,%s,%s,%s)',
+                      (chat_id, user_id, -fee, after, 'crypto_fee', symbol))
+
+        c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET '
+                  'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                  (chat_id, total, total))
+        tbal = float(c.fetchone()[0])
+        _bank_log(c, chat_id, user_id, 'crypto_in', gross, tbal, f'خرید {symbol}')
+        if fee > 0:
+            _bank_log(c, chat_id, user_id, 'treasury_in', fee, tbal, 'کارمزد معاملهٔ کریپتو')
+
+        c.execute('SELECT COALESCE(amount,0), COALESCE(avg_cost,0) FROM crypto_holdings '
+                  'WHERE user_id = %s AND chat_id = %s AND symbol = %s FOR UPDATE',
+                  (user_id, chat_id, symbol))
+        hrow = c.fetchone()
+        held, avg = (float(hrow[0]), float(hrow[1])) if hrow else (0.0, 0.0)
+        new_amount = held + units
+        new_avg = ((held * avg) + gross) / new_amount if new_amount > 0 else 0.0
+        c.execute('UPDATE crypto_holdings SET amount = %s, avg_cost = %s, '
+                  'bought_today = COALESCE(bought_today,0) + %s '
+                  'WHERE user_id = %s AND chat_id = %s AND symbol = %s',
+                  (new_amount, new_avg, gross, user_id, chat_id, symbol))
+        return (True, total, fee, new_amount, new_avg)
+
+
+def crypto_sell(user_id, chat_id, symbol, units, price, fee_ratio):
+    """Sells up to `units` at `price`, treasury -> wallet, in ONE transaction.
+
+    PARTIALLY FILLS rather than minting. The treasury is the counterparty, so a sale it
+    cannot cover is a market with no liquidity, not a licence to create size: whatever
+    the vault can actually pay is sold and the rest of the position simply stays put.
+    That is the one rule keeping this feature from becoming a money printer, since a
+    coin that has doubled would otherwise pay out size nobody ever put in.
+
+    Returns (True, sold_units, net, fee, pnl, left) or (False, reason, held)."""
+    if units <= 0:
+        return (False, 'amount', 0.0)
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COALESCE(amount,0), COALESCE(avg_cost,0) FROM crypto_holdings '
+                  'WHERE user_id = %s AND chat_id = %s AND symbol = %s FOR UPDATE',
+                  (user_id, chat_id, symbol))
+        hrow = c.fetchone()
+        if hrow is None or float(hrow[0]) <= 0:
+            return (False, 'none', 0.0)
+        held, avg = float(hrow[0]), float(hrow[1])
+        units = min(units, held)
+
+        c.execute('SELECT COALESCE(balance,0) FROM bank_treasury WHERE chat_id = %s FOR UPDATE',
+                  (chat_id,))
+        trow = c.fetchone()
+        available = float(trow[0]) if trow else 0.0
+        per_unit_net = price * (1.0 - fee_ratio)
+        if per_unit_net <= 0:
+            return (False, 'amount', held)
+        if units * per_unit_net > available:
+            units = available / per_unit_net
+        units = round(min(units, held), 6)
+        if units <= 0:
+            return (False, 'liquidity', held)
+
+        gross = round(units * price, 2)
+        fee = round(gross * fee_ratio, 2)
+        net = round(gross - fee, 2)
+        if net <= 0:
+            return (False, 'liquidity', held)
+        basis = round(units * avg, 2)
+        pnl = round(net - basis, 2)
+
+        c.execute('UPDATE bank_treasury SET balance = COALESCE(balance,0) - %s '
+                  'WHERE chat_id = %s RETURNING balance', (net, chat_id))
+        tbal = float(c.fetchone()[0])
+        # -gross out as a position payout, +fee back in as income: the two sum to the
+        # -net actually debited, and only the fee lands in the window get_treasury_income
+        # reads.
+        _bank_log(c, chat_id, user_id, 'crypto_out', -gross, tbal, f'فروش {symbol}')
+        if fee > 0:
+            _bank_log(c, chat_id, user_id, 'treasury_in', fee, tbal, 'کارمزد معاملهٔ کریپتو')
+
+        c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING size', (net, user_id, chat_id))
+        wrow = c.fetchone()
+        if wrow is None:
+            raise RuntimeError('seller has no users row')
+        after = float(wrow[0])
+        # Same split as the buy, from the other side: the cost basis coming back is not
+        # income, the profit on top of it is. Without this, holding a position over
+        # midnight would read to the handicap as a loss and pay a growth bonus for it.
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s,%s,%s,%s,%s,%s)',
+                  (chat_id, user_id, basis, after - pnl, 'crypto_principal', symbol))
+        c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
+                  'VALUES (%s,%s,%s,%s,%s,%s)',
+                  (chat_id, user_id, pnl, after, 'crypto_pnl', symbol))
+
+        left = round(held - units, 6)
+        if left <= 1e-9:
+            c.execute('UPDATE crypto_holdings SET amount = 0, avg_cost = 0 '
+                      'WHERE user_id = %s AND chat_id = %s AND symbol = %s',
+                      (user_id, chat_id, symbol))
+            left = 0.0
+        else:
+            c.execute('UPDATE crypto_holdings SET amount = %s '
+                      'WHERE user_id = %s AND chat_id = %s AND symbol = %s',
+                      (left, user_id, chat_id, symbol))
+        return (True, units, net, fee, pnl, left)
+
+
+def crypto_market_totals():
+    """(holders, total_units_by_symbol) - what the market as a whole is holding, so
+    /crypto can show how exposed the treasury actually is."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT symbol, COALESCE(SUM(amount),0), COUNT(DISTINCT user_id) '
+                  'FROM crypto_holdings WHERE COALESCE(amount,0) > 0 GROUP BY symbol')
+        return {row[0]: (float(row[1]), int(row[2])) for row in c.fetchall()}
+
+
 def try_start_heist(chat_id, cooldown_seconds):
     """Group-wide heist cooldown, claimed atomically so two simultaneous attempts
     can't both rob the same vault. Returns (True, 0) or (False, seconds_remaining)."""
@@ -2654,11 +2984,17 @@ def count_active_loans(chat_id, user_id, as_lender):
         return c.fetchone()[0]
 
 
-def accept_loan(loan_id, borrower_id, term_days):
+def accept_loan(loan_id, borrower_id, term_days, origination_ratio=0.0):
     """Atomically turns an offer into an active loan and hands over the principal.
 
     Claims the row with a conditional UPDATE first, so two taps on the same button
-    cannot disburse twice. Returns (True, principal, due_amount) or (False, reason)."""
+    cannot disburse twice. Returns (True, principal, due_amount, fee) or (False, reason).
+
+    `origination_ratio` applies to the bank's own /vam only and is withheld from the
+    DISBURSEMENT rather than billed later: the borrower receives principal - fee but
+    still owes the full due_amount. That ordering is the point of the fee - it is the
+    one part of a loan the bank collects even when the loan later defaults, which is
+    what turns lending from a gamble into a business."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute("UPDATE loans SET status = 'active', accepted_at = NOW(), "
@@ -2668,7 +3004,7 @@ def accept_loan(loan_id, borrower_id, term_days):
                   (term_days, ' days', loan_id, borrower_id))
         row = c.fetchone()
         if row is None:
-            return (False, 'gone', 0)
+            return (False, 'gone', 0, 0.0)
         chat_id, lender_id, principal, due_amount = row
 
         if lender_id is None:
@@ -2696,7 +3032,7 @@ def accept_loan(loan_id, borrower_id, term_days):
             if principal > lendable or principal > cash:
                 c.execute("UPDATE loans SET status = 'offered', accepted_at = NULL, due_at = NULL "
                           'WHERE id = %s', (loan_id,))
-                return (False, 'treasury', 0)
+                return (False, 'treasury', 0, 0.0)
             c.execute('UPDATE central_bank SET loans_out = COALESCE(loans_out,0) + %s '
                       'WHERE id = %s RETURNING loans_out', (principal, CB_SINGLETON))
             _bank_log(c, chat_id, borrower_id, 'loan_out', -principal, c.fetchone()[0],
@@ -2711,7 +3047,7 @@ def accept_loan(loan_id, borrower_id, term_days):
             if lrow is None:
                 c.execute("UPDATE loans SET status = 'offered', accepted_at = NULL, due_at = NULL "
                           'WHERE id = %s', (loan_id,))
-                return (False, 'lender_broke', 0)
+                return (False, 'lender_broke', 0, 0.0)
             c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
                       'VALUES (%s, %s, %s, %s, %s, %s)',
                       (chat_id, lender_id, -principal, lrow[0], 'loan_principal', f'نزول #{loan_id}'))
@@ -2723,9 +3059,24 @@ def accept_loan(loan_id, borrower_id, term_days):
         # when they asked - which is what makes the loan large or trivial for them.
         c.execute('UPDATE loans SET size_at_accept = %s WHERE id = %s',
                   (float(brow[0]) if brow else 0.0, loan_id))
-        if _size_move(c, chat_id, borrower_id, principal, 'loan_principal', f'وام #{loan_id}') is None:
+
+        # The bank's origination fee comes out of the money handed over, never out of a
+        # wallet that might be empty - so there is no path where the fee fails to be
+        # collected. A player lender charges nothing of the sort: /nozul is unregulated,
+        # which is half the reason it exists.
+        fee = round(float(principal) * origination_ratio, 2) if lender_id is None else 0.0
+        fee = max(0.0, min(fee, float(principal)))
+        handed = round(float(principal) - fee, 2)
+        if _size_move(c, chat_id, borrower_id, handed, 'loan_principal', f'وام #{loan_id}') is None:
             raise RuntimeError('borrower has no users row')
-        return (True, float(principal), float(due_amount))
+        if fee > 0:
+            c.execute('INSERT INTO bank_treasury (chat_id, balance) VALUES (%s, %s) '
+                      'ON CONFLICT (chat_id) DO UPDATE SET '
+                      'balance = COALESCE(bank_treasury.balance,0) + %s RETURNING balance',
+                      (chat_id, fee, fee))
+            _bank_log(c, chat_id, borrower_id, 'treasury_in', fee, c.fetchone()[0],
+                      f'کارمزد صدور وام #{loan_id}')
+        return (True, float(principal), float(due_amount), fee)
 
 
 def _collect(c, chat_id, borrower_id, principal, interest, loan_id):
