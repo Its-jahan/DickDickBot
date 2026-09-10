@@ -330,12 +330,63 @@ circulation and keeps `/dozdi` worth typing.
 
 ## The heist is a real game, not a hidden dice roll, and losing has consequences
 
-`/sarghat` used to be a single `random.random() < chance` check. It's now a genuine
-vault-cracking mini-game, and it is deliberately tuned to be *nearly impossible* — the
-bank is supposed to be safe, and a heist is the rare exception that proves it. One wrong
-tap is an instant loss (`advance_heist_attempt` flips the row to `'lost'` right there) —
-there is no partial credit for getting most of the way through. `heist_take` itself
-(treasury + a slice of every depositor) is unchanged and still only runs on a win.
+`/sarghat` used to be a single `random.random() < chance` check, then a single memory
+game. It is now a **three-stage job that two people have to pull off together**, and it
+is deliberately tuned to be *nearly impossible* — the bank is supposed to be safe, and a
+heist is the rare exception that proves it. A pure guesser is at about **1 in 21
+billion**, and there is a test asserting that number stays past one in a billion.
+
+```
+stage 0  the offer      the named accomplice has to actually accept
+stage 1  the alarm      the ACCOMPLICE cuts the wire, on an unpredictable cue
+stage 2  the vault      the THIEF plays the symbol-memory game
+stage 3  the getaway    BOTH have to tap out before the clock runs
+```
+
+One wrong tap at any stage is an instant loss — there is no partial credit for getting
+most of the way through, and `advance_heist_attempt` / `cut_heist_wire` flip the row to
+`'lost'` right there.
+
+### The partner is mandatory by construction, not by rule
+
+Stage 1 is tapped by the accomplice and stage 3 needs both, so **one player physically
+cannot finish the job**. That is a far stronger guarantee than a rule saying they may
+not, and it is why the whole feature is built around the split rather than bolting a
+partner onto the end.
+
+Three things follow from it, and all three are load-bearing:
+
+- **The accomplice accepts; they are never merely named.** Losing jails *both*, so being
+  volunteered into four days of prison by somebody else's tap would be the worst button
+  in the game. `create_heist_offer` opens at `status='offered'` and nothing runs until
+  `accept_heist_offer` flips it.
+- **The group's cooldown slot is claimed before the invitation goes out and released if
+  it is declined or expires.** Claiming up front is what stops two players both opening a
+  heist; releasing is what stops a player burning the group's five days by @-ing someone
+  who was asleep. Same claim/release shape as `claim_war_day`/`release_war_day` — copy it,
+  don't reinvent it. A declined offer is `'cancelled'`, deliberately **not** `'lost'`:
+  nobody tried to rob anything, so nobody goes to prison.
+- **Neither conspirator is robbed.** `heist_take` skips the thief *and* the partner when
+  taking its slice of every depositor — taking a cut off your own accomplice and then
+  handing most of it back to them is not a bug so much as an insult.
+
+The take is split `HEIST_PARTNER_SHARE` to the accomplice, and the **partner's cut is
+rounded first with the thief taking the remainder**, so the two payouts sum to the total
+exactly. Two independent roundings is how you mint a centimetre out of nowhere, and a
+heist has to stay as zero-sum as it was when one person carried the whole bag. On a loss
+both are sentenced on their **own** share of the would-be take, so the partner's bail and
+labour are scaled to what they stood to gain.
+
+### Each stage has its own clock, and its timeout must claim on the stage
+
+Every stage schedules its own timeout job, which means a pair who cleared the alarm with
+a second to spare has a stage-1 timeout still in flight. `db.claim_heist_stage_timeout`
+therefore puts the stage **in the `WHERE` clause** — checking it in Python first and then
+settling leaves exactly the race it is there to close. There is a regression test that
+clears the alarm and then fires the stale stage-1 timeout at it.
+
+The row's `expires_at` stays the *whole-run* deadline the startup sweep reads, so a
+process that died between stages is still swept exactly as before.
 
 ### The sequence is never shown all at once — that is the anti-cheat
 
@@ -362,9 +413,16 @@ Three more things make guessing or half-remembering useless, and all three matte
 - `HEIST_RECALL_SECONDS` is tight enough that reassembling the answer from screenshots
   on a second device loses to the clock.
 
-A pure guesser is at `(1/9)^8` ≈ 1 in 43 million. The dials to retune if it ever needs
-to be easier or harder, in order of effect: `HEIST_SEQUENCE_LENGTH`,
+A pure guesser is at `(1/6) × (1/9)^10` ≈ **1 in 21 billion**. The dials to retune if it
+ever needs to be easier or harder, in order of effect: `HEIST_SEQUENCE_LENGTH`,
 `HEIST_REVEAL_STEP_SECONDS`, then `HEIST_RECALL_SECONDS`.
+
+**Stage 1 is memory too, not just reaction.** The wire colour is named exactly once, when
+the accomplice accepts, and never shown again — by the time the six buttons appear it has
+to be in their head. The cue lands at a random `HEIST_ALARM_MIN..MAX_SECONDS` so nobody
+can pre-aim, and `HEIST_CUT_SECONDS` is short. Tapping *before* the cue is refused rather
+than treated as a loss (`cut_heist_wire` returns `'early'`): there is no button to press
+yet, so a stray tap is a client glitch, not a decision.
 
 One operational note: the reveal is a chain of ~10 edits to one message in ~13 seconds.
 `heist_reveal_step_job` therefore schedules the next step **whether or not its own edit
@@ -374,18 +432,27 @@ timeout.
 
 ### It's a persisted attempt, not in-memory state — same lesson as `pvp_matches`
 
-`heist_attempts` holds the in-progress game (the memorized `sequence`, `progress`,
-`expires_at`). `resolve_heist_attempt` is the single settlement function, called from
-three places: a winning/losing tap, the scheduled `heist_timeout_job`, and the startup
-sweep `recover_stuck_heist_attempts` (a `run_once(..., when=14)`, alongside the other
-recovery jobs). `db.claim_expired_heist_attempt` atomically flips `pending -> lost` only
-when nothing has already resolved it, which is what stops the timeout job and a
-last-instant winning tap from ever settling the same attempt twice — copy the
-`pvp_matches` pattern here, don't reinvent it, if this ever needs another mini-game.
+`heist_attempts` holds the whole job: both conspirators, the wire, the memorized
+`sequence`, `progress`, which `stage` is live, and both getaway flags. **The wire and the
+sequence are rolled once, at `create_heist_offer`, not per stage** — a job that survived a
+restart would otherwise have to re-roll, and a re-rolled answer is a different game from
+the one the player was shown.
 
-### Losing sentences the thief; winning doesn't touch prison at all
+`resolve_heist_attempt` is the single settlement function, called from a losing tap, each
+stage's timeout job, and the startup sweep `recover_stuck_heist_attempts` (a
+`run_once(..., when=14)`, alongside the other recovery jobs). Three atomic claims keep
+those from ever settling the same attempt twice — `claim_heist_stage_timeout` (stage
+scoped), `claim_expired_heist_attempt` (whole run), and `cancel_heist_offer` — so copy
+the `pvp_matches` pattern here, don't reinvent it, if this ever needs another mini-game.
 
-A bust used to just cost a fine. Now `db.send_to_heist_prison` sets two separate
+`get_heist_attempt` returns a **dict**, not a tuple. There are eighteen columns now and a
+positional unpack of that many is a bug waiting to happen every time one is added.
+
+### Losing sentences both of them; winning doesn't touch prison at all
+
+A bust used to just cost a fine, and used to fall on one person. Both conspirators now
+serve it — that shared risk is exactly what the accomplice agreed to, and it is what stops
+a heist from being a costless favour you do for a friend. `db.send_to_heist_prison` sets two separate
 timestamps: `heist_prison_until` (a hard `HEIST_PRISON_DAYS`-day lockout — `db.is_in_heist_prison`
 gates `/d`, `/c` on both the challenger and acceptor side, `/dozdi`, and `/sarghat`
 itself) and `heist_labor_until`, which runs `HEIST_PRISON_DAYS` + a scaled

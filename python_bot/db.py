@@ -691,6 +691,18 @@ def init_db():
         ''')
         c.execute("CREATE INDEX IF NOT EXISTS heist_attempts_pending_idx "
                   "ON heist_attempts (status, expires_at)")
+        # A heist is a THREE-STAGE job needing TWO people, so the row carries the
+        # accomplice and which stage is live. `stage_deadline` is per stage; the row's
+        # `expires_at` stays the whole-run deadline the recovery sweep reads, so a
+        # process that dies between stages is still swept exactly as before.
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS partner_id BIGINT")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS partner_name TEXT")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS stage INTEGER DEFAULT 2")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS stage_deadline TIMESTAMPTZ")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS wire INTEGER")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS alarm_armed BOOLEAN DEFAULT FALSE")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS escape_thief BOOLEAN DEFAULT FALSE")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS escape_partner BOOLEAN DEFAULT FALSE")
 
         # One-time: charge the deposit fee on money that was banked before the fee
         # existed. Everyone who deposited in that window got in free, which is both
@@ -2996,15 +3008,34 @@ def try_start_heist(chat_id, cooldown_seconds):
         return (False, int(row[0]) if row and row[0] and row[0] > 0 else 0)
 
 
-def heist_take(chat_id, thief_id, treasury_ratio, deposit_ratio):
-    """Drains the vault for a successful heist: `treasury_ratio` of the treasury plus
-    `deposit_ratio` of every depositor's balance, all in one transaction.
+def release_heist_slot(chat_id):
+    """Hands the group's cooldown slot back when a heist never actually happened - the
+    accomplice declined, or the invitation expired unanswered. Without this a player
+    could burn the group's three days by @-ing someone who was asleep, which is both a
+    grief vector and the same "one bad draw silently burns the day" bug release_war_day
+    exists to prevent."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE bank_treasury SET last_heist_at = NULL WHERE chat_id = %s',
+                  (chat_id,))
 
-    Strictly zero-sum - every centimetre handed to the thief is one taken from the
-    treasury or from a named depositor, and the per-victim amounts are returned so the
-    group can be told exactly who paid for it.
 
-    Returns (total_loot, treasury_part, [(user_id, name, amount), ...])."""
+def heist_take(chat_id, thief_id, partner_id, treasury_ratio, deposit_ratio,
+               partner_share):
+    """Drains the vault for a successful heist: `treasury_ratio` of the group's claim on
+    the treasury plus `deposit_ratio` of every OTHER depositor's balance, split between
+    the two conspirators, all in one transaction.
+
+    Strictly zero-sum - every centimetre handed out is one taken from the treasury or
+    from a named depositor, and the per-victim amounts are returned so the group can be
+    told exactly who paid for it.
+
+    Neither conspirator is robbed: you don't rob your own deposit, and you don't rob
+    your accomplice's either. Skipping only the thief would have quietly taken a slice
+    off the partner and handed most of it back to them, which is not a bug so much as an
+    insult.
+
+    Returns (total_loot, treasury_part, victims, thief_cut, partner_cut)."""
     with get_connection() as conn:
         c = conn.cursor()
         # `treasury_ratio` of what this GROUP could claim, not of the whole bot's
@@ -3025,8 +3056,8 @@ def heist_take(chat_id, thief_id, treasury_ratio, deposit_ratio):
         victims = []
         deposit_part = 0.0
         for uid, name, bal in c.fetchall():
-            if uid == thief_id:
-                continue  # you don't rob your own deposit
+            if uid == thief_id or uid == partner_id:
+                continue  # neither conspirator robs their own deposit
             cut = round(float(bal) * deposit_ratio, 2)
             if cut <= 0:
                 continue
@@ -3040,59 +3071,208 @@ def heist_take(chat_id, thief_id, treasury_ratio, deposit_ratio):
             deposit_part += cut
 
         total = round(treasury_part + deposit_part, 2)
+        # Split the take. The partner's cut is rounded first and the thief gets the
+        # remainder, so the two payouts sum to `total` EXACTLY - a heist has to stay as
+        # zero-sum as it was when one person carried the whole bag, and splitting by two
+        # independent roundings is how you mint a centimetre out of nowhere.
+        partner_cut = round(total * partner_share, 2) if partner_id else 0.0
+        thief_cut = round(total - partner_cut, 2)
         if total > 0:
-            c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
-                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
-                      (total, thief_id, chat_id))
-            wrow = c.fetchone()
-            if wrow is None:
-                raise RuntimeError('thief has no users row')
-            c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, source, note) '
-                      'VALUES (%s, %s, %s, %s, %s, %s)',
-                      (chat_id, thief_id, total, wrow[0], 'bank_heist', 'سرقت از بانک'))
-        return (total, treasury_part, victims)
+            for uid, cut, note in ((thief_id, thief_cut, 'سرقت از بانک'),
+                                   (partner_id, partner_cut, 'سهم شریک سرقت')):
+                if not uid or cut <= 0:
+                    continue
+                c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                          'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                          (cut, uid, chat_id))
+                wrow = c.fetchone()
+                if wrow is None:
+                    raise RuntimeError(f'heist payee {uid} has no users row')
+                c.execute('INSERT INTO size_log (chat_id, user_id, delta, balance_after, '
+                          'source, note) VALUES (%s, %s, %s, %s, %s, %s)',
+                          (chat_id, uid, cut, wrow[0], 'bank_heist', note))
+        return (total, treasury_part, victims, thief_cut, partner_cut)
 
 
 # ---------------------------------------------------------------- heist mini-game
-# /sarghat used to be a single hidden dice roll. It's now a real vault-cracking game
-# (memorize a sequence, then tap it back under a shared deadline) settled from a
-# persisted attempt row rather than in-process state, so the same restart-survives-a-
-# window lesson from pvp_matches applies here too.
+# /sarghat used to be a single hidden dice roll, then a single memory game. It is now a
+# THREE-STAGE job that TWO people have to pull off together, settled from a persisted
+# attempt row rather than in-process state - the same restart-survives-a-window lesson
+# from pvp_matches applies here too.
+#
+#   stage 0  the offer      the named accomplice has to actually accept
+#   stage 1  the alarm      the ACCOMPLICE cuts the right wire, on an unpredictable cue
+#   stage 2  the vault      the THIEF plays the symbol-memory game
+#   stage 3  the getaway    BOTH have to tap out before the clock runs
+#
+# The partner is structurally mandatory, not a courtesy: stage 1 is tapped by the
+# accomplice and stage 3 needs both. One player literally cannot complete the job, which
+# is a stronger guarantee than a rule saying they may not - and it means a heist now
+# costs a conspiracy, since losing jails both of them.
+#
+# One ordering rule, copied from claim_war_day/release_war_day rather than reinvented:
+# the group's cooldown slot is claimed BEFORE the offer is posted, so two players can
+# never both open a heist, and released again if the offer is declined or expires. A
+# refused invitation must not silently burn the group's three days.
 
-def create_heist_attempt(attempt_id, chat_id, thief_id, thief_name, sequence, would_be,
-                          message_chat_id, message_id, expires_at):
+HEIST_FIELDS = ('chat_id', 'thief_id', 'thief_name', 'partner_id', 'partner_name',
+                'sequence', 'progress', 'would_be', 'message_chat_id', 'message_id',
+                'status', 'stage', 'stage_deadline', 'wire', 'alarm_armed',
+                'escape_thief', 'escape_partner', 'expires_at')
+
+
+def create_heist_offer(attempt_id, chat_id, thief_id, thief_name, partner_id,
+                       partner_name, sequence, wire, would_be, message_chat_id,
+                       message_id, expires_at):
+    """Opens a heist at stage 0: everything is decided up front (the wire, the sequence)
+    but nothing runs until the accomplice accepts. Rolling both here rather than at each
+    stage keeps the whole run reproducible from one row, which is what lets the recovery
+    sweep settle a half-finished job without having to re-roll anything."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
-            'INSERT INTO heist_attempts (id, chat_id, thief_id, thief_name, sequence, '
-            'would_be, message_chat_id, message_id, expires_at) '
-            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)',
-            (attempt_id, chat_id, thief_id, thief_name, sequence, would_be,
-             message_chat_id, message_id, expires_at)
+            'INSERT INTO heist_attempts (id, chat_id, thief_id, thief_name, partner_id, '
+            'partner_name, sequence, wire, would_be, message_chat_id, message_id, '
+            "status, stage, expires_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'offered',0,%s)",
+            (attempt_id, chat_id, thief_id, thief_name, partner_id, partner_name,
+             sequence, wire, would_be, message_chat_id, message_id, expires_at)
         )
 
 
 def get_heist_attempt(attempt_id):
+    """A dict, not a tuple. There are eighteen columns now and a positional unpack of
+    that many is a bug waiting to happen every time one is added."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute(
-            'SELECT chat_id, thief_id, thief_name, sequence, progress, would_be, '
-            'message_chat_id, message_id, status, expires_at '
-            'FROM heist_attempts WHERE id = %s', (attempt_id,)
-        )
-        return c.fetchone()
+        c.execute('SELECT ' + ', '.join(HEIST_FIELDS) +
+                  ' FROM heist_attempts WHERE id = %s', (attempt_id,))
+        row = c.fetchone()
+        return dict(zip(HEIST_FIELDS, row)) if row else None
+
+
+def accept_heist_offer(attempt_id, partner_id, stage_deadline):
+    """The accomplice signs up: 'offered' -> 'pending' at stage 1, atomically, so a
+    double-tap or two clients racing can only ever start the job once."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE heist_attempts SET status = 'pending', stage = 1, "
+                  'stage_deadline = %s '
+                  "WHERE id = %s AND status = 'offered' AND partner_id = %s "
+                  'RETURNING id', (stage_deadline, attempt_id, partner_id))
+        return c.fetchone() is not None
+
+
+def cancel_heist_offer(attempt_id):
+    """A declined or expired invitation. Deliberately 'cancelled', NOT 'lost': nobody
+    tried to rob anything, so nobody goes to prison - and the caller releases the
+    group's cooldown slot afterwards. Same shape as a /hokm-cancelled consensus vote."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE heist_attempts SET status = 'cancelled' "
+                  "WHERE id = %s AND status = 'offered' RETURNING id", (attempt_id,))
+        return c.fetchone() is not None
+
+
+def arm_heist_alarm(attempt_id, stage_deadline):
+    """The cue lands: the wire buttons go up and the accomplice's short window opens."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE heist_attempts SET alarm_armed = TRUE, stage_deadline = %s '
+                  "WHERE id = %s AND status = 'pending' AND stage = 1 RETURNING id",
+                  (stage_deadline, attempt_id))
+        return c.fetchone() is not None
+
+
+def cut_heist_wire(attempt_id, user_id, wire_index):
+    """The accomplice's one tap at stage 1.
+
+    Returns 'done' (right wire, on to the vault), 'wrong' (busted - already flipped to
+    'lost' here, exactly like a wrong symbol tap), 'early' (the cue hasn't landed yet),
+    'late' (the window closed), or None if the attempt is gone or not theirs."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT partner_id, wire, alarm_armed, stage_deadline '
+                  "FROM heist_attempts WHERE id = %s AND status = 'pending' AND stage = 1 "
+                  'FOR UPDATE', (attempt_id,))
+        row = c.fetchone()
+        if row is None:
+            return None
+        partner_id, wire, armed, deadline = row
+        if user_id != partner_id:
+            return None
+        if not armed:
+            return 'early'
+        c.execute('SELECT now() > %s', (deadline,))
+        if c.fetchone()[0]:
+            return 'late'
+        if wire_index != wire:
+            c.execute("UPDATE heist_attempts SET status = 'lost' WHERE id = %s",
+                      (attempt_id,))
+            return 'wrong'
+        c.execute('UPDATE heist_attempts SET stage = 2, alarm_armed = FALSE, '
+                  'stage_deadline = NULL WHERE id = %s', (attempt_id,))
+        return 'done'
+
+
+def start_heist_escape(attempt_id, stage_deadline):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE heist_attempts SET stage = 3, stage_deadline = %s '
+                  "WHERE id = %s AND status = 'pending' AND stage = 2 RETURNING id",
+                  (stage_deadline, attempt_id))
+        return c.fetchone() is not None
+
+
+def tap_heist_escape(attempt_id, user_id):
+    """Stage 3. Either conspirator may tap, in either order, but the vault only opens
+    when BOTH are out - which is the moment the partnership stops being decorative.
+
+    Returns 'waiting' (you're out, they aren't), 'done' (both out - won, already flipped
+    here), 'again' (you already tapped), or None if it isn't yours or isn't live."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT thief_id, partner_id, escape_thief, escape_partner '
+                  "FROM heist_attempts WHERE id = %s AND status = 'pending' AND stage = 3 "
+                  'FOR UPDATE', (attempt_id,))
+        row = c.fetchone()
+        if row is None:
+            return None
+        thief_id, partner_id, out_thief, out_partner = row
+        if user_id == thief_id:
+            if out_thief:
+                return 'again'
+            out_thief = True
+            c.execute('UPDATE heist_attempts SET escape_thief = TRUE WHERE id = %s',
+                      (attempt_id,))
+        elif user_id == partner_id:
+            if out_partner:
+                return 'again'
+            out_partner = True
+            c.execute('UPDATE heist_attempts SET escape_partner = TRUE WHERE id = %s',
+                      (attempt_id,))
+        else:
+            return None
+        if out_thief and out_partner:
+            c.execute("UPDATE heist_attempts SET status = 'won' WHERE id = %s",
+                      (attempt_id,))
+            return 'done'
+        return 'waiting'
 
 
 def advance_heist_attempt(attempt_id, tapped_index):
-    """Checks one tap against the next expected symbol, atomically. Returns 'correct'
-    (more remain), 'done' (full sequence completed - the vault opens), 'wrong' (busted -
-    already flipped to 'lost' by this call), or None if the attempt is gone or was
-    already resolved (e.g. it timed out a moment before this tap landed)."""
+    """Stage 2: checks one tap against the next expected symbol, atomically. Returns
+    'correct' (more remain), 'done' (the vault is open - but the job is NOT won yet,
+    stage 3 still has to be survived), 'wrong' (busted - already flipped to 'lost' by
+    this call), or None if the attempt is gone, already resolved, or not at stage 2.
+
+    'done' deliberately no longer sets status='won'. The getaway is a real stage: a pair
+    who cracked the vault and then failed to run still go to prison."""
     with get_connection() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT sequence, progress FROM heist_attempts "
-            "WHERE id = %s AND status = 'pending' FOR UPDATE", (attempt_id,)
+            "WHERE id = %s AND status = 'pending' AND stage = 2 FOR UPDATE", (attempt_id,)
         )
         row = c.fetchone()
         if row is None:
@@ -3103,12 +3283,8 @@ def advance_heist_attempt(attempt_id, tapped_index):
             c.execute("UPDATE heist_attempts SET status = 'lost' WHERE id = %s", (attempt_id,))
             return 'wrong'
         progress += 1
-        if progress >= len(sequence):
-            c.execute("UPDATE heist_attempts SET status = 'won', progress = %s WHERE id = %s",
-                      (progress, attempt_id))
-            return 'done'
         c.execute("UPDATE heist_attempts SET progress = %s WHERE id = %s", (progress, attempt_id))
-        return 'correct'
+        return 'done' if progress >= len(sequence) else 'correct'
 
 
 def claim_expired_heist_attempt(attempt_id):
@@ -3124,13 +3300,32 @@ def claim_expired_heist_attempt(attempt_id):
         return c.fetchone() is not None
 
 
-def get_expired_heist_attempt_ids():
-    """Still-'pending' attempts whose deadline has already passed - the startup recovery
-    sweep's input, same role get_stale_pending_pvp_matches plays for challenges."""
+def claim_heist_stage_timeout(attempt_id, stage):
+    """Atomically flips an attempt to 'lost' ONLY if it is still sitting at `stage`.
+
+    The stage is part of the WHERE clause on purpose. Each stage schedules its own
+    timeout job, so a pair who cleared the alarm with a second to spare has a stage-1
+    timeout still in flight; without the stage check that job would happily kill them in
+    the middle of the vault. Read-then-act in Python would leave the same race - this
+    has to be one statement."""
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute("SELECT id FROM heist_attempts WHERE status = 'pending' AND expires_at <= now()")
-        return [r[0] for r in c.fetchall()]
+        c.execute("UPDATE heist_attempts SET status = 'lost' "
+                  "WHERE id = %s AND status = 'pending' AND stage = %s RETURNING id",
+                  (attempt_id, stage))
+        return c.fetchone() is not None
+
+
+def get_expired_heist_attempts():
+    """(id, status, chat_id) for anything still live past its whole-run deadline - the
+    startup recovery sweep's input, same role get_stale_pending_pvp_matches plays for
+    challenges. Unanswered OFFERS come back too: they are cancelled rather than settled
+    as a bust, and the caller hands the group's cooldown slot back."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, status, chat_id FROM heist_attempts "
+                  "WHERE status IN ('pending', 'offered') AND expires_at <= now()")
+        return c.fetchall()
 
 
 # ---------------------------------------------------------------- heist prison & labor

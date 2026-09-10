@@ -2527,10 +2527,11 @@ BANK_MIN_DEPOSIT = 5
 # guaranteed hiding place. Win/loss isn't a hidden dice roll: the thief has to actually
 # crack a vault-cracking memory game under a shared deadline (see heist_cmd below).
 # Succeeding is meant to be close to impossible; the bank is supposed to be safe.
-HEIST_COOLDOWN_SECONDS = 72 * 3600  # one attempt per group per three days
-HEIST_MIN_VAULT = 400              # not worth cracking anything but a genuinely fat vault
-HEIST_TREASURY_RATIO = 0.50        # of the treasury on success
+HEIST_COOLDOWN_SECONDS = 120 * 3600  # one attempt per group per FIVE days
+HEIST_MIN_VAULT = 800              # not worth cracking anything but a genuinely fat vault
+HEIST_TREASURY_RATIO = 0.50        # of the group's claim on the treasury, on success
 HEIST_DEPOSIT_RATIO = 0.15         # of every other depositor's balance on success
+HEIST_PARTNER_SHARE = 0.35         # the accomplice's cut of whatever the pair walks off with
 
 # The vault-cracking mini-game. The sequence is NEVER shown all at once: it is revealed
 # one symbol at a time, each frame replacing the last by editing the same message, so at
@@ -2541,17 +2542,43 @@ HEIST_DEPOSIT_RATIO = 0.15         # of every other depositor's balance on succe
 # Drawn WITH replacement from a 9-symbol pool, so repeats are possible: that kills the
 # old "each symbol appears exactly once, so eliminate as you go" shortcut and makes every
 # step a genuine 1-in-9 choice for anyone who didn't actually memorize it.
+# ---- stage 0: the offer. A heist takes two, and the accomplice has to actually agree -
+# losing puts them in prison too, so this can never be something done TO somebody.
+HEIST_OFFER_SECONDS = 90
+
+# ---- stage 1: the alarm, tapped by the ACCOMPLICE. The wire colour is named ONCE at the
+# start and never repeated; the cue lands at an unpredictable moment and the window to
+# act is short. Memory, then reaction, then a 1-in-6 choice if they forgot.
+HEIST_WIRES = ["🟥", "🟦", "🟩", "🟨", "🟪", "🟫"]
+HEIST_ALARM_MIN_SECONDS = 4.0
+HEIST_ALARM_MAX_SECONDS = 11.0
+HEIST_CUT_SECONDS = 2.5
+
+# ---- stage 2: the vault, played by the THIEF. Ten symbols out of nine, drawn with
+# replacement, revealed one at a time and never twice: (1/9)^10 is about 1 in 3.5
+# BILLION for a pure guesser, and remembering ten in order at 1.2s each is the wall this
+# whole feature is built around.
 HEIST_SYMBOLS = ["🔵", "🟢", "🔴", "🟡", "🟣", "⚪", "🟠", "🟤", "⚫"]
-HEIST_SEQUENCE_LENGTH = 8           # (1/9)^8 ≈ 1 in 43 million for a pure guesser
-HEIST_REVEAL_STEP_SECONDS = 1.5     # how long each single symbol stays on screen
+HEIST_SEQUENCE_LENGTH = 10
+HEIST_REVEAL_STEP_SECONDS = 1.2     # how long each single symbol stays on screen
 HEIST_BLANK_SECONDS = 1.2           # blank beat that wipes the last symbol off the screen
-HEIST_RECALL_SECONDS = 15           # to tap all HEIST_SEQUENCE_LENGTH back, reshuffling
-HEIST_TOTAL_SECONDS = (HEIST_SEQUENCE_LENGTH * HEIST_REVEAL_STEP_SECONDS
-                       + HEIST_BLANK_SECONDS + HEIST_RECALL_SECONDS)
+HEIST_RECALL_SECONDS = 12           # to tap all HEIST_SEQUENCE_LENGTH back, reshuffling
+
+# ---- stage 3: the getaway. BOTH have to tap out. Cracking the vault and then leaving
+# your partner in the building is not a successful robbery.
+HEIST_ESCAPE_SECONDS = 10
+
+# The whole-run deadline the recovery sweep reads. Generous on purpose: every stage
+# already has its own tight clock, and this one only exists so a process that died
+# mid-job can't leave a row pending forever.
+HEIST_TOTAL_SECONDS = (HEIST_ALARM_MAX_SECONDS + HEIST_CUT_SECONDS
+                       + HEIST_SEQUENCE_LENGTH * HEIST_REVEAL_STEP_SECONDS
+                       + HEIST_BLANK_SECONDS + HEIST_RECALL_SECONDS
+                       + HEIST_ESCAPE_SECONDS + 30)
 
 # What a busted attempt costs: prison first (locked out of grow/challenge/theft/heist
 # entirely), then a longer stretch just paying tribute to the king out of daily growth.
-HEIST_PRISON_DAYS = 3
+HEIST_PRISON_DAYS = 4
 HEIST_LABOR_MIN_DAYS = 2
 HEIST_LABOR_MAX_DAYS = 7
 HEIST_LABOR_SCALE_VAULT = 2000      # an attempt at/above this size earns the full 7 days
@@ -3437,11 +3464,19 @@ def _heist_prison_reply(prison_until, labor_until, bail_amount, now):
 
 
 async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/sarghat` - crack the group vault by actually playing a vault-cracking memory
-    game (memorize a shuffled symbol order, then tap it back before the clock runs out).
-    Hits the treasury AND everyone's deposits on a win, which is what stops the bank
-    being a risk-free hiding place; a loss lands the thief in heist prison and then
-    working off a debt to the king. One attempt per group per cooldown, not per player."""
+    """`/sarghat @شریک` - a three-stage bank job that takes two people.
+
+        stage 1  the alarm    the ACCOMPLICE cuts the wire they were told about once
+        stage 2  the vault    the THIEF plays the symbol-memory game
+        stage 3  the getaway  BOTH have to tap out before the clock runs
+
+    The partner is structurally mandatory rather than merely required by a rule: one
+    player cannot tap stage 1 and stage 3 for two people, so a lone thief physically
+    cannot finish the job. Losing jails both of them, which is why the accomplice has to
+    accept rather than simply being named.
+
+    On a win it hits the treasury AND everyone else's deposits, which is what stops the
+    bank being a risk-free hiding place. One attempt per group per cooldown."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
@@ -3473,13 +3508,44 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اول امروز /d بزن بعد برو سراغ بانک! 🥷")
         return
 
+    partner_id, partner_name = get_target_user(update, update.message.text, chat_id)
+    if not partner_id:
+        await update.message.reply_text(
+            "🥷 سرقت از بانک تک‌نفره نیست!\n\n"
+            "یکی رو به‌عنوان شریک انتخاب کن: <code>/sarghat @username</code> "
+            "(یا روی پیامش ریپلای کن)\n\n"
+            "شریکت دزدگیر رو قطع می‌کنه و تو گاوصندوق رو باز می‌کنی — و آخرش هر دو باید "
+            "با هم فرار کنید. اگه بگیرنتون، <b>هر دو</b> می‌رید زندان.",
+            parse_mode="HTML"
+        )
+        return
+    if partner_id == user.id:
+        await update.message.reply_text("با خودت که نمی‌تونی شریک بشی! 🙄")
+        return
+    if kingdom and kingdom[0] == partner_id:
+        await update.message.reply_text(
+            "👑 پادشاه شریک دزدی از خزانهٔ خودش نمی‌شه!"
+        )
+        return
+
+    _psize, partner_last_grown, _pperk = db.get_user(partner_id, chat_id, None, partner_name)
+    if db.is_in_heist_prison(partner_id, chat_id):
+        await update.message.reply_text(f"{partner_name} الان تو زندان بانکه — شریک دیگه‌ای پیدا کن.")
+        return
+    if partner_last_grown != tehran_today_str():
+        await update.message.reply_text(
+            f"{partner_name} امروز هنوز /d نزده — یه شریک که تو بازی نیست به چه دردت می‌خوره؟"
+        )
+        return
+
     # What's actually stealable. The treasury is one pot shared with every other group,
     # so a heist reaches this group's CLAIM on it (bounded by the group's weight in the
     # bot - see db._group_weight), never the whole thing: one lucky memory game must not
     # be able to empty the vault backing every player in every group.
     treasury = db.group_reserve_claim(chat_id)
     total_dep, holders = db.get_bank_totals(chat_id)
-    others = max(0.0, total_dep - db.get_bank(user.id, chat_id)[0])
+    mine = db.get_bank(user.id, chat_id)[0] + db.get_bank(partner_id, chat_id)[0]
+    others = max(0.0, total_dep - mine)
     vault = treasury + others
     if vault < HEIST_MIN_VAULT:
         await update.message.reply_text(
@@ -3488,6 +3554,10 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Claimed BEFORE the invitation goes out, so two players can never both open a
+    # heist - and released again by cancel_heist_offer's callers if the invitation is
+    # declined or expires, so a sleeping accomplice can't burn the group's five days.
+    # Same claim/release shape as claim_war_day.
     ok, remaining = db.try_start_heist(chat_id, HEIST_COOLDOWN_SECONDS)
     if not ok:
         left = _fmt_days_hours(datetime.timedelta(seconds=remaining))
@@ -3498,81 +3568,269 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     would_be = vault * (HEIST_TREASURY_RATIO if treasury else HEIST_DEPOSIT_RATIO)
 
-    # Drawn with replacement on purpose - see HEIST_SYMBOLS. Repeats mean a player can't
-    # narrow the answer down by crossing off symbols they've already used.
+    # Everything is rolled here, once, and stored: the wire for stage 1 and the sequence
+    # for stage 2. Rolling per stage would mean a job that survived a restart had to
+    # re-roll, and a re-rolled answer is a different game from the one the player was
+    # shown. Symbols are drawn WITH replacement - repeats are possible on purpose, which
+    # kills the "cross off what you've already used" shortcut.
+    wire = random.randrange(len(HEIST_WIRES))
     sequence = [random.randrange(len(HEIST_SYMBOLS)) for _ in range(HEIST_SEQUENCE_LENGTH)]
     sequence_str = ",".join(str(i) for i in sequence)
     attempt_id = str(uuid4())
-    expires_at = now + datetime.timedelta(seconds=HEIST_TOTAL_SECONDS)
+    expires_at = now + datetime.timedelta(seconds=HEIST_OFFER_SECONDS + HEIST_TOTAL_SECONDS)
 
     sent = await update.message.reply_text(
-        f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
-        f"الان {HEIST_SEQUENCE_LENGTH} تا نماد، یکی‌یکی و هرکدوم فقط یک لحظه نشونت می‌دم.\n"
-        f"هیچ‌وقت همه‌شون با هم رو صفحه نیستن — پس چیزی برای کپی‌کردن وجود نداره.\n\n"
-        f"👀 حاضر شو...",
-        parse_mode="HTML"
+        f"🥷 <b>پیشنهاد سرقت از بانک</b>\n\n"
+        f"{_esc(user.first_name)} می‌خواد بانک رو بزنه و {_esc(partner_name)} رو "
+        f"به‌عنوان <b>شریک</b> انتخاب کرده.\n\n"
+        f"💰 چیزی که تو صندوقه: حدود {int(vault)} سانت\n"
+        f"🧮 سهم شریک: {int(HEIST_PARTNER_SHARE*100)}٪ از غنیمت\n\n"
+        f"⚠️ اگه گیر بیفتین <b>هر دو</b> {HEIST_PRISON_DAYS} روز می‌رید زندان بانک.\n\n"
+        f"{_esc(partner_name)}، هستی؟ ({HEIST_OFFER_SECONDS} ثانیه وقت داری)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🤝 هستم", callback_data=f"heistjoin_{attempt_id}_y"),
+            InlineKeyboardButton("🙅 نه بابا", callback_data=f"heistjoin_{attempt_id}_n"),
+        ]])
     )
 
-    db.create_heist_attempt(attempt_id, chat_id, user.id, user.first_name, sequence_str,
-                            would_be, chat_id, sent.message_id, expires_at)
+    db.create_heist_offer(attempt_id, chat_id, user.id, user.first_name, partner_id,
+                          partner_name, sequence_str, wire, would_be, chat_id,
+                          sent.message_id, expires_at)
 
+    context.job_queue.run_once(
+        heist_offer_timeout_job, when=HEIST_OFFER_SECONDS,
+        data={"attempt_id": attempt_id}, name=f"heist_offer_{attempt_id}"
+    )
+
+
+async def heist_offer_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    """Nobody answered. Cancel the offer and hand the group's cooldown slot back - an
+    unanswered invitation is not an attempted robbery and must not cost the group its
+    five days."""
+    attempt_id = context.job.data["attempt_id"]
+    row = db.get_heist_attempt(attempt_id)
+    if not row or row['status'] != 'offered':
+        return
+    if not db.cancel_heist_offer(attempt_id):
+        return
+    db.release_heist_slot(row['chat_id'])
+    await deliver_pvp_message(
+        context, row['message_chat_id'], row['message_id'],
+        f"🥷 {row['partner_name']} جواب نداد — سرقت منتفی شد.\n"
+        f"(بانک هنوز آماده‌باشه نیست، می‌تونین دوباره امتحان کنین)"
+    )
+
+
+async def heist_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The accomplice's answer. Only they may press it: being volunteered into four days
+    of prison by somebody else's tap would be the worst button in the game."""
+    query = update.callback_query
+    data = query.data.split('_')
+    if len(data) != 3 or data[0] != 'heistjoin':
+        return
+    attempt_id, answer = data[1], data[2]
+
+    row = db.get_heist_attempt(attempt_id)
+    if not row:
+        await query.answer("این پیشنهاد دیگه معتبر نیست!", show_alert=True)
+        return
+    if query.from_user.id != row['partner_id']:
+        await query.answer("این پیشنهاد مال تو نیست!", show_alert=True)
+        return
+    if row['status'] != 'offered':
+        await query.answer("این پیشنهاد قبلاً تموم شده!", show_alert=True)
+        return
+
+    if answer == 'n':
+        if db.cancel_heist_offer(attempt_id):
+            db.release_heist_slot(row['chat_id'])
+            await query.answer("رد کردی.")
+            await deliver_pvp_message(
+                context, row['message_chat_id'], row['message_id'],
+                f"🙅 {row['partner_name']} شریکِ {row['thief_name']} نشد — سرقت منتفی شد."
+            )
+        return
+
+    wait = random.uniform(HEIST_ALARM_MIN_SECONDS, HEIST_ALARM_MAX_SECONDS)
+    deadline = (datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(seconds=wait + HEIST_CUT_SECONDS + 5))
+    if not db.accept_heist_offer(attempt_id, query.from_user.id, deadline):
+        await query.answer("این پیشنهاد قبلاً تموم شده!", show_alert=True)
+        return
+    await query.answer("🤝 قبول کردی!")
+
+    # The wire colour is named exactly ONCE, here, and never shown again. By the time
+    # the buttons appear it has to be in the accomplice's head.
+    try:
+        await context.bot.edit_message_text(
+            chat_id=row['message_chat_id'], message_id=row['message_id'],
+            text=(f"🔌 <b>مرحلهٔ ۱ از ۳ — دزدگیر</b>\n\n"
+                  f"{_esc(row['partner_name'])}، نقشه اینه: باید سیم "
+                  f"<b>{HEIST_WIRES[row['wire']]}</b> رو بِبُری.\n\n"
+                  f"خوب نگاش کن — دیگه بهت یادآوری نمی‌شه.\n"
+                  f"وقتی علامت دادم فقط {HEIST_CUT_SECONDS:g} ثانیه وقت داری.\n\n"
+                  f"🤫 صبر کن..."),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Failed to open heist alarm stage for {attempt_id}: {e}")
+
+    context.job_queue.run_once(
+        heist_alarm_arm_job, when=wait,
+        data={"attempt_id": attempt_id}, name=f"heist_arm_{attempt_id}"
+    )
+    context.job_queue.run_once(
+        heist_stage_timeout_job, when=wait + HEIST_CUT_SECONDS,
+        data={"attempt_id": attempt_id, "stage": 1}, name=f"heist_alarm_to_{attempt_id}"
+    )
+
+
+def build_wire_keypad(attempt_id):
+    """All six wires, shuffled. Same rule as the vault keypad: callback_data carries the
+    wire index and never the position, so shuffling is purely cosmetic to correctness."""
+    order = list(range(len(HEIST_WIRES)))
+    random.shuffle(order)
+    buttons = [InlineKeyboardButton(HEIST_WIRES[i], callback_data=f"heistcut_{attempt_id}_{i}")
+               for i in order]
+    return InlineKeyboardMarkup([buttons[i:i + 3] for i in range(0, len(buttons), 3)])
+
+
+async def heist_alarm_arm_job(context: ContextTypes.DEFAULT_TYPE):
+    """The cue. Lands at an unpredictable moment so the accomplice cannot pre-aim."""
+    attempt_id = context.job.data["attempt_id"]
+    row = db.get_heist_attempt(attempt_id)
+    if not row or row['status'] != 'pending' or row['stage'] != 1:
+        return
+    deadline = (datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(seconds=HEIST_CUT_SECONDS))
+    if not db.arm_heist_alarm(attempt_id, deadline):
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=row['message_chat_id'], message_id=row['message_id'],
+            text=("✂️ <b>الان! سیمو بِبُر!</b>\n\n"
+                  "کدوم بود؟"),
+            parse_mode="HTML", reply_markup=build_wire_keypad(attempt_id)
+        )
+    except Exception as e:
+        logging.error(f"Failed to arm heist alarm for {attempt_id}: {e}")
+
+
+async def heist_cut_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data.split('_')
+    if len(data) != 3 or data[0] != 'heistcut':
+        return
+    attempt_id, wire_index = data[1], int(data[2])
+
+    result = db.cut_heist_wire(attempt_id, query.from_user.id, wire_index)
+    if result is None:
+        await query.answer("این بازی مال تو نیست یا دیگه معتبر نیست!", show_alert=True)
+        return
+    if result == 'early':
+        await query.answer("هنوز علامت ندادم!", show_alert=True)
+        return
+    if result == 'late':
+        await query.answer("⏰ دیر شد!")
+        await resolve_heist_attempt(context, attempt_id, outcome='lost', reason='alarm')
+        return
+    if result == 'wrong':
+        await query.answer("💥 سیم اشتباهی!")
+        await resolve_heist_attempt(context, attempt_id, outcome='lost', reason='alarm')
+        return
+
+    await query.answer("🔌 دزدگیر خوابید!")
+    await start_heist_vault(context, attempt_id)
+
+
+async def start_heist_vault(context: ContextTypes.DEFAULT_TYPE, attempt_id):
+    """Stage 2 - the thief's turn. Kicks off the one-symbol-at-a-time reveal chain."""
+    row = db.get_heist_attempt(attempt_id)
+    if not row or row['status'] != 'pending' or row['stage'] != 2:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=row['message_chat_id'], message_id=row['message_id'],
+            text=(f"🔓 <b>مرحلهٔ ۲ از ۳ — گاوصندوق</b>\n\n"
+                  f"{_esc(row['thief_name'])}، نوبت توئه.\n"
+                  f"الان {HEIST_SEQUENCE_LENGTH} تا نماد، یکی‌یکی و هرکدوم فقط یک لحظه نشونت می‌دم.\n"
+                  f"هیچ‌وقت همه‌شون با هم رو صفحه نیستن — پس چیزی برای کپی‌کردن وجود نداره.\n\n"
+                  f"👀 حاضر شو..."),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Failed to open heist vault stage for {attempt_id}: {e}")
+
+    vault_seconds = (HEIST_SEQUENCE_LENGTH * HEIST_REVEAL_STEP_SECONDS
+                     + HEIST_BLANK_SECONDS + HEIST_RECALL_SECONDS)
     context.job_queue.run_once(
         heist_reveal_step_job, when=HEIST_REVEAL_STEP_SECONDS,
         data={"attempt_id": attempt_id, "step": 0}, name=f"heist_reveal_{attempt_id}_0"
     )
     context.job_queue.run_once(
-        heist_timeout_job, when=HEIST_TOTAL_SECONDS,
-        data={"attempt_id": attempt_id}, name=f"heist_timeout_{attempt_id}"
+        heist_stage_timeout_job, when=vault_seconds,
+        data={"attempt_id": attempt_id, "stage": 2}, name=f"heist_vault_to_{attempt_id}"
     )
+
+
+async def heist_stage_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    """One stage's clock ran out.
+
+    The claim is gated on the attempt still being AT that stage (see
+    db.claim_heist_stage_timeout), so a pair who cleared the alarm a second before its
+    clock expired can never be killed mid-vault by the previous stage's job. Checking
+    the stage in Python first would leave exactly that race - it has to be in the same
+    statement that settles."""
+    attempt_id = context.job.data["attempt_id"]
+    stage = context.job.data["stage"]
+    await resolve_heist_attempt(
+        context, attempt_id, outcome=None, expect_stage=stage,
+        reason={1: 'alarm', 2: 'vault', 3: 'escape'}.get(stage))
 
 
 async def heist_reveal_step_job(context: ContextTypes.DEFAULT_TYPE):
     """Shows exactly one symbol of the sequence, then schedules the next step.
 
-    This is the anti-cheat: the sequence only ever exists on screen one symbol at a time,
-    each frame overwriting the last, so copying the message text or grabbing a single
-    screenshot yields one symbol out of HEIST_SEQUENCE_LENGTH and nothing more.
+    Each frame OVERWRITES the previous one, so at no instant does the message, a
+    copy-paste or a single screenshot hold more than one symbol - which is the entire
+    anti-cheat. The first version printed the whole order at once and players simply
+    read it back off their own screen.
 
-    The next step is scheduled whether or not this frame's edit succeeded - a dropped
-    frame (flood control, a deleted message) must not stall the chain and leave the
-    keypad never appearing; the attempt would then only resolve via the timeout."""
+    The next step is scheduled whether or not this edit succeeded: a dropped frame
+    (flood control, a deleted message) must never stall the chain and leave the keypad
+    never appearing, which would strand the attempt until the timeout."""
     attempt_id = context.job.data["attempt_id"]
     step = context.job.data["step"]
     row = db.get_heist_attempt(attempt_id)
-    if not row:
+    if not row or row['status'] != 'pending' or row['stage'] != 2:
         return
-    (chat_id, thief_id, thief_name, sequence, progress, would_be,
-     message_chat_id, message_id, status, expires_at) = row
-    if status != 'pending':
-        return
-    symbols = [int(x) for x in sequence.split(',')]
 
-    if step < len(symbols):
-        text = (f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
-                f"نماد {step + 1} از {len(symbols)}:\n\n"
-                f"{HEIST_SYMBOLS[symbols[step]]}")
-        next_job, next_when, next_data = (
-            heist_reveal_step_job, HEIST_REVEAL_STEP_SECONDS,
-            {"attempt_id": attempt_id, "step": step + 1}
-        )
-    else:
-        # The blank beat exists to wipe the LAST symbol off the screen before the keypad
-        # appears - without it the final symbol would still be readable while tapping.
-        text = (f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
-                f"🔒 تمام! حالا همون ترتیب رو بزن...")
-        next_job, next_when, next_data = (
-            heist_keypad_job, HEIST_BLANK_SECONDS, {"attempt_id": attempt_id}
-        )
-
+    symbols = [int(x) for x in row['sequence'].split(',')]
     try:
-        await context.bot.edit_message_text(
-            chat_id=message_chat_id, message_id=message_id, text=text, parse_mode="HTML"
-        )
+        if step < len(symbols):
+            await context.bot.edit_message_text(
+                chat_id=row['message_chat_id'], message_id=row['message_id'],
+                text=(f"🔓 نماد {step + 1} از {len(symbols)}\n\n"
+                      f"{HEIST_SYMBOLS[symbols[step]]}")
+            )
+        else:
+            # The deliberate blank beat: wipes the LAST symbol off the screen before the
+            # keypad appears, so the final one can't simply be read back.
+            await context.bot.edit_message_text(
+                chat_id=row['message_chat_id'], message_id=row['message_id'],
+                text="🔓 ‌\n\n⬛\n\nحالا بزنش..."
+            )
+            context.job_queue.run_once(
+                heist_keypad_job, HEIST_BLANK_SECONDS, {"attempt_id": attempt_id}
+            )
+            return
     except Exception as e:
         logging.error(f"Failed to show heist reveal step {step} for {attempt_id}: {e}")
 
     context.job_queue.run_once(
-        next_job, when=next_when, data=next_data,
+        heist_reveal_step_job, HEIST_REVEAL_STEP_SECONDS,
+        {"attempt_id": attempt_id, "step": step + 1},
         name=f"heist_reveal_{attempt_id}_{step + 1}"
     )
 
@@ -3594,20 +3852,16 @@ async def heist_keypad_job(context: ContextTypes.DEFAULT_TYPE):
     """Flips the finished reveal into the tappable keypad and starts the recall clock."""
     attempt_id = context.job.data["attempt_id"]
     row = db.get_heist_attempt(attempt_id)
-    if not row:
-        return
-    (chat_id, thief_id, thief_name, sequence, progress, would_be,
-     message_chat_id, message_id, status, expires_at) = row
-    if status != 'pending':
+    if not row or row['status'] != 'pending' or row['stage'] != 2:
         return
 
-    total = len(sequence.split(','))
+    total = len(row['sequence'].split(','))
     try:
         await context.bot.edit_message_text(
-            chat_id=message_chat_id, message_id=message_id,
+            chat_id=row['message_chat_id'], message_id=row['message_id'],
             # Deliberately no countdown in the text: the keypad is reshuffled on every
             # tap, and a live countdown would mean a second edit per tap on top of that.
-            text=(f"🔓 <b>بازکردن گاوصندوق</b>\n\n"
+            text=(f"🔓 <b>مرحلهٔ ۲ از ۳ — گاوصندوق</b>\n\n"
                   f"هر {total} تا نماد رو به همون ترتیب بزن. یه اشتباه = باخت.\n"
                   f"⏳ {int(HEIST_RECALL_SECONDS)} ثانیه فرصت داری."),
             parse_mode="HTML", reply_markup=build_heist_keypad(attempt_id)
@@ -3627,12 +3881,10 @@ async def heist_tap_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not row:
         await query.answer("این بازی دیگه معتبر نیست!", show_alert=True)
         return
-    (chat_id, thief_id, thief_name, sequence, progress, would_be,
-     message_chat_id, message_id, status, expires_at) = row
-    if query.from_user.id != thief_id:
-        await query.answer("این بازی مال تو نیست!", show_alert=True)
+    if query.from_user.id != row['thief_id']:
+        await query.answer("گاوصندوق کارِ سردستهٔ سرقته، نه شریک!", show_alert=True)
         return
-    if status != 'pending':
+    if row['status'] != 'pending' or row['stage'] != 2:
         await query.answer("این بازی قبلاً تموم شده!", show_alert=True)
         return
 
@@ -3642,19 +3894,19 @@ async def heist_tap_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if result == 'wrong':
         await query.answer("❌ اشتباه زدی!")
-        await resolve_heist_attempt(context, attempt_id, outcome='lost')
+        await resolve_heist_attempt(context, attempt_id, outcome='lost', reason='vault')
         return
     if result == 'done':
-        await query.answer("🎉 گاوصندوق باز شد!")
-        await resolve_heist_attempt(context, attempt_id, outcome='won')
+        await query.answer("🎉 گاوصندوق باز شد! حالا فرار کنین!")
+        await start_heist_escape(context, attempt_id)
         return
 
     # 'correct' but the sequence isn't finished. Every symbol stays on the keypad -
     # removing the tapped one would be flatly wrong now that the sequence is drawn with
     # replacement, and it used to hand the player a free elimination hint besides.
     # Reshuffle instead, so position memory is worth nothing from one tap to the next.
-    total = len(sequence.split(','))
-    await query.answer(f"✅ درسته! ({progress + 1}/{total})")
+    total = len(row['sequence'].split(','))
+    await query.answer(f"✅ درسته! ({row['progress'] + 1}/{total})")
     try:
         # Only the markup changes - progress is reported through the callback toast, so a
         # fast player never triggers a text edit per tap on top of the reshuffle.
@@ -3663,37 +3915,124 @@ async def heist_tap_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pass
 
 
-async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id, outcome=None):
-    """Single settlement point for a heist attempt - called by the winning/losing tap,
-    the scheduled timeout job, and the startup recovery sweep, mirroring the role
-    resolve_pvp_match plays for challenges.
+def escape_roster(row):
+    marks = []
+    for label, done in ((row['thief_name'], row['escape_thief']),
+                        (row['partner_name'], row['escape_partner'])):
+        marks.append(f"{'✅' if done else '⬜️'} {label}")
+    return marks
 
-    `outcome` is 'won'/'lost' when called right after a tap already decided it (the DB
-    row is already updated by advance_heist_attempt in that case). It's None for the
-    timeout path, which has to claim the row itself first - db.claim_expired_heist_attempt
-    is what stops the timeout job and a last-second tap from ever both settling the same
-    attempt."""
+
+async def start_heist_escape(context: ContextTypes.DEFAULT_TYPE, attempt_id):
+    """Stage 3 - the getaway. BOTH conspirators have to tap out.
+
+    This is the stage that makes the partnership real rather than decorative: a thief
+    who talked somebody into the job and then let them get caught inside does not get
+    to keep the money."""
+    deadline = (datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(seconds=HEIST_ESCAPE_SECONDS))
+    if not db.start_heist_escape(attempt_id, deadline):
+        return
+    row = db.get_heist_attempt(attempt_id)
+    if not row:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=row['message_chat_id'], message_id=row['message_id'],
+            text=(f"🏃 <b>مرحلهٔ ۳ از ۳ — فرار</b>\n\n"
+                  f"گاوصندوق بازه و آژیر داره میاد. <b>هر دوتون</b> باید بزنین بیرون!\n\n"
+                  + "\n".join(escape_roster(row)) +
+                  f"\n\n⏳ {HEIST_ESCAPE_SECONDS} ثانیه — اگه یکیتون جا بمونه، هر دو می‌رید زندان."),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏃‍♂️ فرار!", callback_data=f"heistrun_{attempt_id}")
+            ]])
+        )
+    except Exception as e:
+        logging.error(f"Failed to open heist escape stage for {attempt_id}: {e}")
+
+    context.job_queue.run_once(
+        heist_stage_timeout_job, when=HEIST_ESCAPE_SECONDS,
+        data={"attempt_id": attempt_id, "stage": 3}, name=f"heist_escape_to_{attempt_id}"
+    )
+
+
+async def heist_escape_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data.split('_')
+    if len(data) != 2 or data[0] != 'heistrun':
+        return
+    attempt_id = data[1]
+
+    result = db.tap_heist_escape(attempt_id, query.from_user.id)
+    if result is None:
+        await query.answer("این سرقت مال تو نیست یا دیگه معتبر نیست!", show_alert=True)
+        return
+    if result == 'again':
+        await query.answer("تو که زدی بیرون! منتظر شریکت بمون.")
+        return
+    if result == 'done':
+        await query.answer("🏃 در رفتین!")
+        await resolve_heist_attempt(context, attempt_id, outcome='won')
+        return
+
+    await query.answer("🏃 تو در رفتی — منتظر شریکت!")
+    row = db.get_heist_attempt(attempt_id)
+    if not row:
+        return
+    try:
+        await query.edit_message_text(
+            text=(f"🏃 <b>مرحلهٔ ۳ از ۳ — فرار</b>\n\n"
+                  f"گاوصندوق بازه و آژیر داره میاد. <b>هر دوتون</b> باید بزنین بیرون!\n\n"
+                  + "\n".join(escape_roster(row)) +
+                  f"\n\n⏳ زود باش!"),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏃‍♂️ فرار!", callback_data=f"heistrun_{attempt_id}")
+            ]])
+        )
+    except Exception:
+        pass
+
+
+async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id,
+                                outcome=None, reason=None, expect_stage=None):
+    """Single settlement point for a heist - called by a losing tap, each stage's
+    timeout job, and the startup recovery sweep, mirroring the role resolve_pvp_match
+    plays for challenges.
+
+    `outcome` is 'won'/'lost' when a tap already decided it (the row is already updated
+    in that case). It's None for the timeout paths, which have to claim the row
+    themselves first - and a STAGE timeout claims on the stage as well, so a pair who
+    cleared the alarm a moment before its clock expired can never be killed by the
+    previous stage's job."""
     if outcome is None:
-        if not db.claim_expired_heist_attempt(attempt_id):
-            return  # a tap already resolved this one
+        claimed = (db.claim_heist_stage_timeout(attempt_id, expect_stage)
+                   if expect_stage is not None
+                   else db.claim_expired_heist_attempt(attempt_id))
+        if not claimed:
+            return  # a tap, or another job, already resolved this one
         outcome = 'lost'
 
     row = db.get_heist_attempt(attempt_id)
     if not row:
         return
-    (chat_id, thief_id, thief_name, sequence, progress, would_be,
-     message_chat_id, message_id, status, expires_at) = row
+    chat_id = row['chat_id']
+    thief_id, thief_name = row['thief_id'], row['thief_name']
+    partner_id, partner_name = row['partner_id'], row['partner_name']
 
     if outcome == 'won':
-        total, treasury_part, victims = db.heist_take(
-            chat_id, thief_id, HEIST_TREASURY_RATIO, HEIST_DEPOSIT_RATIO
+        total, treasury_part, victims, thief_cut, partner_cut = db.heist_take(
+            chat_id, thief_id, partner_id,
+            HEIST_TREASURY_RATIO, HEIST_DEPOSIT_RATIO, HEIST_PARTNER_SHARE
         )
         if total <= 0:
-            text = "🏦 گاوصندوق رو باز کردی ولی خالی بود! دست خالی برگشتی."
+            text = "🏦 گاوصندوق رو باز کردین ولی خالی بود! دست خالی برگشتین."
         else:
             lines = [
                 f"🚨💰 سرقت از بانک!\n",
-                f"{thief_name} گاوصندوق رو باز کرد و {int(total)} سانت بالا کشید!\n",
+                f"{thief_name} و {partner_name} گاوصندوق رو باز کردن و "
+                f"{int(total)} سانت بالا کشیدن!\n",
                 f"🏛 از خزانه: {int(treasury_part)} سانت",
             ]
             if victims:
@@ -3702,43 +4041,66 @@ async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id, 
                     lines.append(f"   • {name}: −{int(amount)} سانت")
                 if len(victims) > 8:
                     lines.append(f"   • و {len(victims) - 8} نفر دیگه")
+            lines.append(f"\n🥷 تقسیم غنیمت:")
+            lines.append(f"   • {thief_name}: +{int(thief_cut)} سانت")
+            lines.append(f"   • {partner_name}: +{int(partner_cut)} سانت (شریک)")
             lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 86400} روز دیگه بانک آماده‌باشه‌ست)")
             text = "\n".join(lines)
         # deliver_pvp_message sends plain text (no parse_mode), so the message is built
         # without HTML tags and without _esc() - there's nothing to escape for.
-        await deliver_pvp_message(context, message_chat_id, message_id, text)
+        await deliver_pvp_message(context, row['message_chat_id'], row['message_id'], text)
         if total > 0:
-            await announce_achievements(context, chat_id, thief_name,
-                                        award(thief_id, chat_id, 'thief'))
+            for uid, name in ((thief_id, thief_name), (partner_id, partner_name)):
+                if uid:
+                    await announce_achievements(context, chat_id, name,
+                                                award(uid, chat_id, 'thief'))
         return
 
-    # Lost - either a wrong tap or the clock ran out. Prison first, then labor; bail only
-    # ever buys out the prison half.
-    labor_days = _heist_labor_days(would_be)
-    bail_amount = priced(would_be * HEIST_BAIL_RATIO, chat_id)
-    prison_until, labor_until = db.send_to_heist_prison(
-        thief_id, chat_id, HEIST_PRISON_DAYS, labor_days, bail_amount
-    )
-    text = (
-        f"🚔 دزدگیر بانک زد!\n\n"
-        f"{thief_name} گیر افتاد و {HEIST_PRISON_DAYS} روز میره زندان بانک "
-        f"(بعدش هم تا {int(labor_days)} روز دیگه برای پادشاه کار می‌کنه).\n\n"
-        f"💰 وثیقه برای آزادی زودتر: {int(bail_amount)} سانت (/vasighe)\n"
-        f"👑 یا پادشاه می‌تونه با /afv کلاً ببخشدش."
-    )
-    await deliver_pvp_message(context, message_chat_id, message_id, text)
+    # Lost. BOTH conspirators go down - that shared risk is what the accomplice agreed
+    # to, and it is what stops a heist from being a favour you do for a friend. Each is
+    # sentenced on their OWN share of the take, so the partner's bail and labour are
+    # scaled to what they stood to gain rather than to the whole bag.
+    would_be = row['would_be'] or 0.0
+    shares = [(thief_id, thief_name, would_be * (1.0 - HEIST_PARTNER_SHARE))]
+    if partner_id:
+        shares.append((partner_id, partner_name, would_be * HEIST_PARTNER_SHARE))
 
+    sentences = []
+    for uid, name, own_share in shares:
+        labor_days = _heist_labor_days(own_share)
+        bail_amount = priced(own_share * HEIST_BAIL_RATIO, chat_id)
+        db.send_to_heist_prison(uid, chat_id, HEIST_PRISON_DAYS, labor_days, bail_amount)
+        sentences.append((name, labor_days, bail_amount))
 
-async def heist_timeout_job(context: ContextTypes.DEFAULT_TYPE):
-    await resolve_heist_attempt(context, context.job.data["attempt_id"], outcome=None)
+    blew_it = {
+        'alarm': "دزدگیر رو خراب کردن",
+        'vault': "پشت گاوصندوق گیر افتادن",
+        'escape': "موقع فرار جا موندن",
+    }.get(reason, "گیر افتادن")
+
+    lines = [f"🚔 دزدگیر بانک زد!\n", f"{thief_name} و {partner_name} {blew_it}.\n"]
+    for name, labor_days, bail_amount in sentences:
+        lines.append(f"   • {name}: {HEIST_PRISON_DAYS} روز زندان + {int(labor_days)} روز "
+                     f"کار برای پادشاه | وثیقه: {int(bail_amount)} سانت")
+    lines.append(f"\n💰 با /vasighe می‌تونن زودتر آزاد شن، یا پادشاه با /afv ببخشدشون.")
+    await deliver_pvp_message(context, row['message_chat_id'], row['message_id'],
+                              "\n".join(lines))
 
 
 async def recover_stuck_heist_attempts(context: ContextTypes.DEFAULT_TYPE):
-    """Runs once shortly after startup: settles any heist attempt whose window had
-    already closed before the process died mid-game, so a restart can never leave the
-    keypad stuck forever with the group's one heist slot on cooldown."""
-    for attempt_id in db.get_expired_heist_attempt_ids():
+    """Runs once shortly after startup: settles any heist whose whole-run window had
+    already closed before the process died mid-job, so a restart can never leave a stage
+    stuck forever with the group's heist slot on cooldown.
+
+    An offer nobody ever answered is CANCELLED rather than settled as a bust, and hands
+    the group's slot back - the same distinction heist_offer_timeout_job draws. Nobody
+    goes to prison for an invitation that was never accepted."""
+    for attempt_id, status, chat_id in db.get_expired_heist_attempts():
         try:
+            if status == 'offered':
+                if db.cancel_heist_offer(attempt_id):
+                    db.release_heist_slot(chat_id)
+                continue
             await resolve_heist_attempt(context, attempt_id, outcome=None)
         except Exception as e:
             logging.error(f"Failed to recover stuck heist attempt {attempt_id}: {e}")
@@ -6263,7 +6625,10 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(use_item_callback, pattern=r'^useitem_'))
     app.add_handler(CallbackQueryHandler(consensus_vote_callback, pattern=r'^ejmavote_'))
     app.add_handler(CallbackQueryHandler(place_bet_callback, pattern=r'^bet_'))
+    app.add_handler(CallbackQueryHandler(heist_join_callback, pattern=r'^heistjoin_'))
+    app.add_handler(CallbackQueryHandler(heist_cut_callback, pattern=r'^heistcut_'))
     app.add_handler(CallbackQueryHandler(heist_tap_callback, pattern=r'^heisttap_'))
+    app.add_handler(CallbackQueryHandler(heist_escape_callback, pattern=r'^heistrun_'))
     app.add_handler(CallbackQueryHandler(use_direct_item_inline_callback, pattern=r'^udi_'))
     app.add_handler(CallbackQueryHandler(show_top_callback, pattern=r'^showtop_'))
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))
