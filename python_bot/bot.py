@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import html
@@ -691,6 +692,15 @@ HELP_TEXT = (
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # "/start app" is where the group's deep-link button lands. This is a private chat
+    # by construction, which is the only place a web_app button is allowed.
+    parts = (update.message.text or '').split()
+    if len(parts) > 1 and parts[1] == 'app':
+        await update.message.reply_text(
+            f"🎮 <b>نسخهٔ وب دودول</b>\n\n{WEBAPP_BLURB}",
+            reply_markup=webapp_keyboard(update.effective_chat.id), parse_mode="HTML"
+        )
+        return
     await update.message.reply_text(HELP_TEXT)
 
 async def dick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3945,18 +3955,32 @@ def crypto_display_price(mid, base_price, net_units):
     return max(0.0001, float(mid) * (1.0 + impact))
 
 
+def _crypto_tick_sync():
+    """The tick's two database round trips, off the event loop. See crypto_tick_job."""
+    rows = db.crypto_all()
+    if not rows:
+        return
+    db.crypto_set_prices([
+        (sym, crypto_next_price(mid, base, vol))
+        for sym, _name, mid, _prev, base, vol, _net in rows
+    ])
+
+
 async def crypto_tick_job(context: ContextTypes.DEFAULT_TYPE):
     """Moves every price, once a minute, silently. Deliberately posts nothing: at one
     tick a minute any announcement would be pure spam, and /crypto is where the board
-    lives."""
+    lives.
+
+    The database work runs in a THREAD, and that is not a micro-optimisation. psycopg2
+    is synchronous, so calling it straight from an async job blocks the whole asyncio
+    loop - no Telegram updates are processed for as long as it takes. Production showed
+    this tick taking SEVEN SECONDS against Supabase, every single minute, which starved
+    the loop badly enough that apscheduler logged missed runs and ordinary commands
+    timed out. Everything else here does its database work inside a handler, where one
+    slow query delays one user; this is the only thing that runs on a timer forever.
+    """
     try:
-        rows = db.crypto_all()
-        if not rows:
-            return
-        db.crypto_set_prices([
-            (sym, crypto_next_price(mid, base, vol))
-            for sym, _name, mid, _prev, base, vol, _net in rows
-        ])
+        await asyncio.to_thread(_crypto_tick_sync)
     except Exception:
         logging.exception("crypto tick failed")
 
@@ -4482,23 +4506,37 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 WEBAPP_URL = "https://app.inddex.app/"
+BOT_HANDLE = "dickchallengerbot"
+
+WEBAPP_BLURB = ("سایز، جدول، بانک، بازار کریپتو، فروشگاه و کوله‌ت — همه با تصویر.\n"
+                "کارهای گروهی (چالش، دزدی، اجماع، سرقت) همچنان توی گروه انجام می‌شن.")
+
+
+def webapp_keyboard(chat_id):
+    """The button that opens the Mini App, in the only form the chat allows.
+
+    A web_app button is PRIVATE CHATS ONLY - Telegram rejects the whole sendMessage
+    with BUTTON_TYPE_INVALID if one appears in a group, which surfaced as the generic
+    "یه مشکل موقت پیش اومد" from on_error. So a group gets a plain url button that
+    deep-links into the bot's private chat with a `start` payload, and the private chat
+    then offers the real thing."""
+    if chat_id < 0:
+        return InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🎮 باز کردن بازی", url=f"https://t.me/{BOT_HANDLE}?start=app")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🎮 باز کردن بازی", web_app=WebAppInfo(url=WEBAPP_URL))]])
 
 
 async def webapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/app` - open the Mini App.
-
-    A WebApp button only works on a button attached to a message, and Telegram refuses
-    web_app buttons in inline mode, so this is a plain command rather than something
-    bolted onto an existing keyboard."""
+    """`/app` - open the Mini App."""
     chat_id = update.effective_chat.id
     if chat_id < 0:
         db.track_chat(chat_id, update.effective_chat.title)
-    keyboard = [[InlineKeyboardButton("🎮 باز کردن بازی", web_app=WebAppInfo(url=WEBAPP_URL))]]
+    tail = ("\n\nروی دکمه بزن تا توی چت خصوصی بات باز شه."
+            if chat_id < 0 else "")
     await update.message.reply_text(
-        "🎮 <b>نسخهٔ وب دودول</b>\n\n"
-        "سایز، جدول، بانک، بازار کریپتو، فروشگاه و کوله‌ت — همه با تصویر.\n"
-        "کارهای گروهی (چالش، دزدی، اجماع، سرقت) همچنان همین‌جا توی گروه انجام می‌شن.",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+        f"🎮 <b>نسخهٔ وب دودول</b>\n\n{WEBAPP_BLURB}{tail}",
+        reply_markup=webapp_keyboard(chat_id), parse_mode="HTML"
     )
 
 
@@ -6124,7 +6162,16 @@ if __name__ == '__main__':
     # is and only inserts genuinely new symbols, so a deploy mid-rally doesn't hand
     # everyone's position back at the base price.
     db.crypto_seed(CRYPTO_COINS)
-    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(setup_commands).build()
+    # The defaults are tuned for a well-connected host. This one is not: the journal is
+    # full of httpcore.ConnectTimeout reaching api.telegram.org, surfacing to players as
+    # the generic "یه مشکل موقت پیش اومد" from on_error. Longer timeouts and a wider
+    # pool turn a slow request into a slow reply instead of a failed one.
+    app = (ApplicationBuilder().token(TOKEN)
+           .concurrent_updates(True)
+           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
+           .get_updates_connect_timeout(30).get_updates_read_timeout(60)
+           .connection_pool_size(64)
+           .post_init(setup_commands).build())
 
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(spawn_daily_bosses, time=time(hour=BOSS_SPAWN_HOUR, minute=0, second=0, tzinfo=IRAN_TZ))
