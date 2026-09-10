@@ -883,6 +883,60 @@ and `CREDIT_DAILY_GAIN_CAP` bounds a day's total. Penalties are deliberately uns
 credit should be slow to build and quick to lose, and a cheap practice default should
 still hurt.
 
+## Connections are pooled, and that is why the game feels fast
+
+`get_connection()` used to open a brand-new connection per call. Against Supabase that
+is a TCP handshake plus a TLS handshake every time, and measured against production it
+cost **~0.8–1.0s per call** — on a database whose largest table is under 2 MB, so
+essentially none of it was query time. It compounded everywhere at once, which is why
+the bot and the website felt slow together:
+
+| | db calls | old cost |
+|---|---|---|
+| Mini App home screen | ~12 | ~10s |
+| `crypto_tick_job` | 2 | ~7s, every minute, blocking the event loop |
+| any bot command | several | seconds |
+
+The measurement that settled it: `/healthz` (0 db calls) answered in ~0.3–1.0s while
+`/api/groups` (2 db calls) took 2.0–3.0s. The difference is per-call and constant, not
+proportional to any query.
+
+`db.py` now keeps a `ThreadedConnectionPool` per process, created lazily and keyed on the
+PID (gunicorn forks its workers, and a pool created before the fork would hand one socket
+to two processes). Two rules make it safe, and both have tests:
+
+- **A broken connection is never handed back.** `OperationalError`/`InterfaceError` mean
+  the socket is gone, so the connection is closed rather than returned; a plain SQL error
+  (a constraint violation, say) rolls back and the connection is reused, because it is
+  perfectly good. `_retry_transient` already re-runs every public function once on
+  exactly those two errors, so a connection that died while idle in the pool costs one
+  silent retry instead of a failed command.
+- **Saturation degrades, it never fails.** `getconn()` *raises* `PoolError` the instant
+  all `DB_POOL_MAX` are checked out — it does not queue — and `PoolError` is neither of
+  the two errors `_retry_transient` catches, so a burst of concurrent handlers would have
+  surfaced as the generic "temporary problem". `_acquire` waits `DB_POOL_WAIT_SECONDS`
+  for one to come back and then opens a **private** connection it closes afterwards. The
+  worst case is exactly the old behaviour, never an error.
+
+Sizing is per process, so the total against Postgres is roughly `DB_POOL_MAX` × (bot +
+panel workers + Mini App workers). Keep that product well under `max_connections`.
+
+### The other half: never block the event loop
+
+`psycopg2` is synchronous, so calling it straight from an async job freezes the whole
+asyncio loop — no Telegram updates processed at all for the duration. Handlers get away
+with it because each one delays only its own user, but `crypto_tick_job` runs on a timer
+forever, for everyone: production showed it holding the loop for **seven seconds every
+minute**, which was enough for apscheduler to log missed runs and for ordinary commands
+to time out against `api.telegram.org`. Its database work goes through
+`asyncio.to_thread` now, and there is a test that slows the tick artificially and
+measures the longest gap a 10 ms heartbeat coroutine sees.
+
+The Telegram-side timeouts in the `ApplicationBuilder` call are widened for the same
+reason: this host's link to `api.telegram.org` is not fast, and the library's defaults
+turned a slow request into `telegram.error.TimedOut`, which `on_error` shows as the
+generic "temporary problem".
+
 ## The Mini App is a third service, and it imports `bot.py` on purpose
 
 `python_bot/webapp.py` is the browser face of the game: a Flask/gunicorn service

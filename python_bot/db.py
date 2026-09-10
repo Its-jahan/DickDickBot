@@ -2,12 +2,14 @@ import datetime
 import functools
 import os
 import sys
+import threading
 import time
 import types
 from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 
 import psycopg2
+import psycopg2.pool
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -51,37 +53,137 @@ CREDIT_MIN_HOLD_RATIO = 0.25   # of the term, before an early repayment counts a
 CREDIT_DAILY_GAIN_CAP = 12
 
 
+# Connections are POOLED, and this is the single biggest thing standing between the
+# game and feeling slow.
+#
+# This used to open a brand-new connection per call. Against Supabase that is a TCP
+# handshake plus a TLS handshake every time, and measured from production that cost
+# ~0.8-1.0s PER CALL - on a database whose largest table is under 2 MB, so essentially
+# none of it was query time. It compounded badly: one Mini App home screen makes about a
+# dozen db calls (~10s to load), the crypto tick made two (7s, every minute, and it was
+# blocking the event loop while it did), and every bot command makes several.
+#
+# Sizing: each process gets its own pool, so the total against Postgres is roughly
+# DB_POOL_MAX x (bot + gunicorn workers for the panel + workers for the Mini App).
+# Keep the product comfortably under the server's max_connections.
+DB_POOL_MIN = int(os.environ.get('DB_POOL_MIN', '1'))
+DB_POOL_MAX = int(os.environ.get('DB_POOL_MAX', '8'))
+
+_POOL = None
+_POOL_PID = None
+_POOL_LOCK = threading.Lock()
+
+_CONNECT_KWARGS = dict(
+    connect_timeout=10,
+    # TCP keepalives so a connection silently dropped by the Supabase pooler (the
+    # recurring "SSL connection has been closed unexpectedly" in production) is
+    # detected instead of hanging.
+    keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+)
+
+
+def _get_pool():
+    """The process's connection pool, created lazily.
+
+    Keyed on the PID as well: gunicorn forks its workers, and a pool created before the
+    fork would hand the same socket to two processes, which corrupts both. Nothing in
+    this repo touches the database at import time, so in practice the pool is always
+    born after the fork - the check is here so that stays true if that ever changes.
+    """
+    global _POOL, _POOL_PID
+    pid = os.getpid()
+    if _POOL is not None and _POOL_PID == pid:
+        return _POOL
+    with _POOL_LOCK:
+        if _POOL is None or _POOL_PID != pid:
+            _POOL = psycopg2.pool.ThreadedConnectionPool(
+                DB_POOL_MIN, DB_POOL_MAX, DB_URL, **_CONNECT_KWARGS)
+            _POOL_PID = pid
+    return _POOL
+
+
+# How long to wait for a pooled connection before giving up and opening a private one.
+DB_POOL_WAIT_SECONDS = float(os.environ.get('DB_POOL_WAIT_SECONDS', '2.0'))
+
+
+def _acquire(pool):
+    """(connection, is_pooled) - wait briefly for a pooled connection, then fall back.
+
+    ThreadedConnectionPool.getconn() RAISES PoolError the moment all DB_POOL_MAX
+    connections are checked out; it does not queue. That matters here because the bot
+    runs with concurrent_updates(True), so a burst of handlers can easily want more at
+    once - and PoolError is neither OperationalError nor InterfaceError, so
+    _retry_transient would not catch it and the player would just see the generic
+    "temporary problem". Pooling must never be able to fail a command that the old
+    connect-every-time code would have served.
+
+    So: wait a little for one to come back, and if the pool is still saturated, open a
+    private connection and close it at the end instead of pooling it. The worst case
+    degrades to exactly the old behaviour rather than to an error.
+    """
+    deadline = time.monotonic() + DB_POOL_WAIT_SECONDS
+    while True:
+        try:
+            return pool.getconn(), True
+        except psycopg2.pool.PoolError:
+            if time.monotonic() >= deadline:
+                return psycopg2.connect(DB_URL, **_CONNECT_KWARGS), False
+            time.sleep(0.02)
+
+
 @contextmanager
 def get_connection():
-    """Open a short-lived connection to Supabase, commit on success and always close."""
+    """Borrow a pooled connection, commit on success, and always hand it back.
+
+    A connection is returned to the pool for reuse UNLESS it looks broken, in which case
+    it is closed and the pool opens a fresh one next time. That distinction is what makes
+    pooling safe here: a plain SQL error (a constraint violation, say) rolls back and the
+    connection is perfectly good, while an OperationalError/InterfaceError means the
+    socket is gone and handing it back would poison the next caller.
+
+    _retry_transient already re-runs every public function once on exactly those two
+    errors, so a connection that died while idle in the pool costs one silent retry
+    rather than a failed command.
+    """
     if not DB_URL:
         raise RuntimeError(
             "Supabase connection string is not configured. "
             "Set the SUPABASE_DB_URL (or DATABASE_URL) environment variable to your "
             "Supabase Postgres connection string."
         )
-    # TCP keepalives so a connection silently dropped by the Supabase pooler (the
-    # recurring "SSL connection has been closed unexpectedly" in production) is
-    # detected instead of hanging, and a connect_timeout so a network blip can't
-    # freeze a handler forever.
-    conn = psycopg2.connect(
-        DB_URL, connect_timeout=10,
-        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
-    )
+    pool = _get_pool()
+    conn, pooled = _acquire(pool)
+    broken = False
     try:
+        if conn.closed:
+            # Handed back a dead one. Raise the error _retry_transient already knows how
+            # to recover from rather than inventing a new failure mode.
+            broken = True
+            raise psycopg2.InterfaceError("pooled connection was closed")
         yield conn
         conn.commit()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        broken = True
+        raise
     except Exception:
         try:
             conn.rollback()
         except Exception:
-            pass  # connection already dead - let the original error propagate, not this one
+            # Rollback itself failing means the socket is gone, whatever the original
+            # error was. Let the original propagate, but don't reuse this connection.
+            broken = True
         raise
     finally:
         try:
-            conn.close()
+            if pooled:
+                pool.putconn(conn, close=broken)
+            else:
+                conn.close()
         except Exception:
-            pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def init_db():
