@@ -5851,7 +5851,7 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔁 <b>انتقال انجام شد</b>\n\n"
             f"{_esc(user.first_name)} <b>{amount}</b> سانت از این گروه فرستاد به "
             f"<b>{_esc(dest_title)}</b>.\n"
-            f"🧾 کارمزد: {int(fee)} سانت رفت تو خزانهٔ همین گروه\n"
+            f"🧾 کارمزد: {int(fee)} سانت رفت تو خزانهٔ بانک مرکزی\n"
             f"📦 رسید: {int(delivered)} سانت",
             parse_mode="HTML"
         )

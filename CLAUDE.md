@@ -1219,6 +1219,32 @@ Two details worth keeping:
 The UI is a sheet off the home screen rather than a seventh nav tab — six is already a lot
 at phone width, and this is something you do occasionally rather than a screen you live on.
 
+#### A transfer is announced in both groups, and that is not optional
+
+Every other thing the app does touches only the player's own state. A transfer moves size
+**out of a group other people are playing in**, so it cannot be a silent browser-only
+action — the group that lost the size has to see it exactly as it would have seen
+`/enteghal`. `_announce_transfer` in `webapp.py` therefore posts to the source group and
+the destination group, copying `transfer_callback`'s wording rather than rewording it:
+nobody should be able to tell from the message which surface was used.
+
+Three implementation details, in order of how easy they are to get wrong:
+
+- **`webapp.py` has no `context.bot`**, and `requirements.txt` has no HTTP client. `_tg_send`
+  is a single form-encoded `POST` to `api.telegram.org` through stdlib `urllib.request`,
+  returning a bool instead of raising — adding `requests` for one POST would be a new
+  production dependency for nothing.
+- **It runs after the transfer has committed, and off the request.** `_run_bg` hands it to
+  a daemon thread, so a slow or dead `api.telegram.org` costs the announcement and nothing
+  else: not the money (already moved), not the player's response, not the worker. The
+  guard lives in `_guarded_call` rather than inline in `_run_bg` specifically so a test can
+  drive the *shipped* guard inline instead of racing a thread.
+- **The source message is a fresh message here and an edit in the chat.** `transfer_callback`
+  edits the message the button was on; there is no such message from the browser, so the
+  same text is sent as a new one. If that wording ever changes, change it in both — there
+  is a regression test asserting the distinctive phrases appear in `transfer_callback`'s
+  source as well as in what the endpoint sends.
+
 ### What is deliberately not in it
 
 Challenges, theft, `/ejma`, heists, decrees and the crown's powers are absent by design,

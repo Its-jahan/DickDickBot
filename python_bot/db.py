@@ -4178,8 +4178,8 @@ def cross_group_transfer(user_id, from_chat, to_chat, amount, fee_ratio):
     """Moves one player's own size from one group to another, minus a heavy fee.
 
     One transaction across both groups, so the size can never exist in both at once or
-    in neither. The fee stays in the *source* group's treasury: that group is the one
-    losing the wealth, so it is the one that keeps a cut of it.
+    in neither. The fee goes to the one central reserve like every other fee - it is
+    logged against the *source* group, because that is the group the size left.
 
     The principal is logged as 'xfer_principal' on both sides - it is the same player's
     money moving between leagues, not winnings, so the nightly handicap ignores it the

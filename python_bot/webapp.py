@@ -34,8 +34,10 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.parse
+import urllib.request
 
 from flask import Flask, jsonify, request, Response
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -58,6 +60,76 @@ INIT_DATA_MAX_AGE_SECONDS = 24 * 3600
 LOGIN_MAX_AGE_SECONDS = 30 * 24 * 3600
 # Shown to the page so the widget can be rendered without hardcoding it in two places.
 BOT_USERNAME = os.environ.get('BOT_USERNAME', 'dickchallengerbot')
+
+# How long a single announcement may hold a socket. The money has already moved by the
+# time any of this runs, so the only thing a slow api.telegram.org can cost is the
+# announcement itself - never the transfer, and never the player's HTTP response.
+TG_TIMEOUT_SECONDS = 8
+
+
+def _tg_send(chat_id, text):
+    """POST one sendMessage. Stdlib only, and every failure is swallowed.
+
+    requirements.txt has no HTTP client and this is not worth adding one for: it is a
+    single form-encoded POST. It deliberately returns a bool instead of raising, because
+    every caller is in the "already committed" half of a transfer.
+    """
+    try:
+        data = urllib.parse.urlencode({
+            'chat_id': chat_id, 'text': text,
+            'parse_mode': 'HTML', 'disable_web_page_preview': 'true',
+        }).encode()
+        req = urllib.request.Request(
+            f'https://api.telegram.org/bot{bot.TOKEN}/sendMessage', data=data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        with urllib.request.urlopen(req, timeout=TG_TIMEOUT_SECONDS):
+            return True
+    except Exception:
+        return False
+
+
+def _guarded_call(fn, args):
+    """Call fn and swallow anything it throws.
+
+    Separate from _run_bg so a test can drive the same guard inline instead of racing a
+    thread - a stub that only *looked* like this one would be testing itself.
+    """
+    try:
+        return fn(*args)
+    except Exception:
+        return None
+
+
+def _run_bg(fn, *args):
+    """Run something whose failure must not reach the request.
+
+    The two announcements are two blocking HTTPS calls, and this is a synchronous WSGI
+    worker - doing them inline would hand the player's transfer the latency (and the
+    worst case, the hang) of a service that has nothing to do with whether it succeeded.
+    It is a named seam rather than an inline Thread(...) so tests can run it inline.
+    """
+    threading.Thread(target=_guarded_call, args=(fn, args), daemon=True).start()
+
+
+def _announce_transfer(user_name, amount, delivered, fee, src_chat, dest_chat,
+                       dest_title):
+    """Post a UI transfer to both groups, wording identical to transfer_callback.
+
+    A transfer is the one thing in the app that moves size out of a group other people
+    are playing in, so it cannot be a silent, browser-only action - the group that lost
+    the size has to see it exactly as it would have seen /enteghal. Nobody should be
+    able to tell from the message which surface was used, so the text is copied from the
+    handler rather than reworded.
+    """
+    name = bot._esc(user_name)
+    _tg_send(src_chat,
+             f"🔁 <b>انتقال انجام شد</b>\n\n"
+             f"{name} <b>{int(amount)}</b> سانت از این گروه فرستاد به "
+             f"<b>{bot._esc(dest_title)}</b>.\n"
+             f"🧾 کارمزد: {int(fee)} سانت رفت تو خزانهٔ بانک مرکزی\n"
+             f"📦 رسید: {int(delivered)} سانت")
+    _tg_send(dest_chat,
+             f"🔁 {name} <b>{int(delivered)}</b> سانت از یه گروه دیگه آورد اینجا!")
 
 
 def _verify_init_data(raw):
@@ -728,6 +800,13 @@ def api_transfer():
 
     titles = db.get_chat_titles([dest_chat])
     dest_title = titles.get(dest_chat) or f'گروه {str(dest_chat)[-6:]}'
+
+    # Both groups hear about it, exactly as they would have from /enteghal. Dispatched
+    # after the transfer has committed and off the request, so a failed announcement
+    # can neither undo it nor change what the player is told.
+    _run_bg(_announce_transfer, name, amount, delivered, fee, chat_id, dest_chat,
+            dest_title)
+
     return jsonify({
         'ok': True, 'delivered': float(delivered), 'fee': float(fee),
         'message': f'{int(delivered)} سانت رسید به {dest_title} (کارمزد {int(fee)})',
