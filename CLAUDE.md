@@ -149,6 +149,39 @@ whole report, not just its own line — that is why the escaping is at the bound
 `night_report_prune` keeps a week. The report is a display artefact; nothing reads an old
 one.
 
+### One tap, not two: `/d` grows on the first message
+
+`/d` used to post *"X is about to grow…"* with a button X then had to press — two
+messages and two taps for a thing X had already asked for by typing the command. In a
+group the chat is known from the command itself, so the button resolved nothing and
+confirmed nothing.
+
+`perform_growth(user, chat_id)` is the roll, and it deliberately **touches no Telegram
+object**: it returns `(True, text)` or `(False, why not)`. `dick()` replies with the
+text, `grow_callback` edits its message into it. Two copies of the dice is the drift this
+repo keeps getting bitten by, so there is a test asserting neither handler calls
+`roll_nonzero` itself.
+
+**Inline still needs its button, and that is not an oversight.** Telegram never says
+which group an inline query was typed in, so the chat can only be resolved from the
+concretely-sent message the button is attached to (`resolve_chat_id`). That is the same
+reason the tap-to-reveal fallback exists for ambiguous multi-group users.
+
+Two more things the tests pin, because both were easy to lose in the split:
+
+- **The refusals stay cheap and the success stays permanent.** "You already grew today"
+  is chatter and gets `reply_temp`; the roll moved size, so it is the record and gets a
+  plain `reply_text`.
+- **A refused roll must not burn the day.** `claim_daily_growth_with_streak` is what
+  stamps it, and it runs *after* the prison check, so a jailed player still has their `/d`
+  tomorrow.
+
+The rest of the buttons in the bot are not this pattern and were left alone: a shop,
+inventory, lottery or decree keyboard is a **menu** (the tap chooses something), and a
+challenge, heist, `/ejma` or loan button is tapped by **somebody else**. `/vam` is the
+one self-confirm that stays: the button is where the origination fee and the repayment
+total are first shown, so signing it is real consent to a price rather than a second ask.
+
 ### Throwaway chatter is swept; the record is not
 
 The other half of the noise is the chatter around the game: the command somebody typed,

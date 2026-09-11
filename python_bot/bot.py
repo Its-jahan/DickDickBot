@@ -879,28 +879,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
 async def dick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/d grows on the first message.
+
+    It used to post "X is about to grow..." with a button that X then had to tap - two
+    messages and two taps for one thing the player had already asked for. In a group the
+    chat is known from the command itself, so there is nothing for the button to resolve
+    and nothing for it to confirm. Only the inline path still needs one, because there
+    the chat can only come from the sent message (see grow_callback).
+    """
     user = update.effective_user
     chat_id = update.effective_chat.id
     db.track_chat(chat_id)
-    
-    current_size, last_grown, current_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
-    
-    today_str = tehran_today_str()
-    if last_grown == today_str:
-        await reply_temp(update, context, "شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.")
-        return
 
-    if db.is_in_heist_prison(user.id, chat_id):
-        await reply_temp(update, context, "⛓ تو زندان بانکی، نمی‌تونی دودولت رو بمالی! با /vasighe می‌تونی زودتر آزاد شی.")
+    ok, msg = await perform_growth(user, chat_id)
+    if not ok:
+        await reply_temp(update, context, msg)
         return
-
-    keyboard = [[InlineKeyboardButton("بمالش تا بزرگ شه 💦", callback_data=f"grow_self_{user.id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        f"🌱 {user.first_name} می‌خواد دودولش رو بماله...",
-        reply_markup=reply_markup
-    )
+    # Permanent: the roll moved size, so it is part of the record like any other.
+    await update.message.reply_text(msg)
 
 async def inventory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2124,44 +2120,71 @@ async def rematch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pvp_resolve_job, when=REMATCH_ROLL_SECONDS, data={"match_id": match_id}, name=f"pvp_resolve_{match_id}"
     )
 
+GROWN_TODAY = "شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید."
+IN_PRISON = "⛓ تو زندان بانکی، نمی‌تونی دودولت رو بمالی! با /vasighe می‌تونی زودتر آزاد شی."
+
+
 async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The INLINE path only, now that /d grows on the first message.
+
+    Inline mode is the one place the button is unavoidable: Telegram never tells the bot
+    which group the query was typed in, so the chat can only be resolved from the
+    concretely-sent message the button is attached to. In a group /d does the work
+    itself - see dick().
+    """
     query = update.callback_query
     user = query.from_user
-    
+
     chat_id = resolve_chat_id(query)
     if not chat_id:
         await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه، بعد اینلاین کار می‌کنه!", show_alert=True)
         return
-        
+
     data = query.data.split('_')
     if len(data) != 3 or data[0] != 'grow' or data[1] != 'self':
         return
-        
+
     target_id = int(data[2])
     if user.id != target_id:
         await query.answer("شما فقط می‌توانید دودول خودتان را رشد دهید!", show_alert=True)
         return
-        
+
+    ok, msg = await perform_growth(user, chat_id)
+    if not ok:
+        await query.answer(msg, show_alert=True)
+        return
+
+    await query.answer("سایزت تغییر کرد!")
+    try:
+        await query.edit_message_text(msg)
+    except Exception:
+        pass
+
+
+async def perform_growth(user, chat_id):
+    """The daily roll itself, shared by /d and the inline button.
+
+    Returns (True, the message to show) or (False, why not). It deliberately does not
+    touch Telegram: /d replies with the text and the inline button edits its message
+    into it, and neither should be able to drift from the other on what the roll did.
+    """
     current_size, last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     today_str = tehran_today_str()
     if last_grown == today_str:
-        await query.answer("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.", show_alert=True)
-        return
+        return False, GROWN_TODAY
 
-    # Re-checked here too: the button can still be sitting in an old message from
+    # Re-checked on the button path too: it can still be sitting in an old message from
     # before a heist sentence started.
     if db.is_in_heist_prison(user.id, chat_id):
-        await query.answer("⛓ تو زندان بانکی، نمی‌تونی دودولت رو بمالی!", show_alert=True)
-        return
+        return False, IN_PRISON
 
-    # Atomically stamp today's date first: a rapid double-tap (or the same button in
-    # two clients) would otherwise pass the check above twice and grow twice. The same
-    # statement rolls the daily streak forward (or resets it if yesterday was missed).
+    # Atomically stamp today's date first: a rapid double-tap (or /d twice in a row)
+    # would otherwise pass the check above twice and grow twice. The same statement
+    # rolls the daily streak forward (or resets it if yesterday was missed).
     yesterday_str = (datetime.datetime.now(IRAN_TZ).date() - datetime.timedelta(days=1)).isoformat()
     streak = db.claim_daily_growth_with_streak(user.id, chat_id, today_str, yesterday_str)
     if streak is None:
-        await query.answer("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.", show_alert=True)
-        return
+        return False, GROWN_TODAY
 
     if current_size < 50:
         low, high = -5, 20
@@ -2292,12 +2315,7 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_size < 0:
         earned += award(user.id, chat_id, 'rock_bottom')
     msg += badge_lines(user.first_name, earned, html=False)
-
-    await query.answer(f"{d_name} شما تغییر کرد!")
-    try:
-        await query.edit_message_text(msg)
-    except:
-        pass
+    return True, msg
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.inline_query.from_user
