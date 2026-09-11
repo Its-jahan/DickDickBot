@@ -1124,60 +1124,65 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ برد: {wins}\n❌ باخت: {losses}\n📊 وین‌ریت: {win_rate}٪ (از {total} چالش)"
     )
 
-async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    db.track_chat(chat_id)
-    text = update.message.text
-    
-    db.get_user(user.id, chat_id, user.username, user.first_name)
+DONATE_REFUSED, DONATE_RESULT = 'refused', 'result'
 
-    wait_remaining = db.get_donation_wait_remaining(user.id, chat_id)
+
+def perform_donation(actor_id, actor_name, actor_username, chat_id, target_id,
+                     target_name, amount):
+    """A donation, with no Telegram in it. Returns (kind, text). Shared by /dd and the app."""
+    db.track_chat(chat_id)
+    db.get_user(actor_id, chat_id, actor_username, actor_name)
+
+    wait_remaining = db.get_donation_wait_remaining(actor_id, chat_id)
     if wait_remaining is not None:
         days = max(1, int(wait_remaining.total_seconds() // 86400) + 1)
-        await reply_temp(update, context,
-            f"تازه به این گروه پیوسته‌اید! تا {days} روز دیگر می‌توانید سایز اهدا کنید."
-        )
-        return
+        return DONATE_REFUSED, f"تازه به این گروه پیوسته‌اید! تا {days} روز دیگر می‌توانید سایز اهدا کنید."
 
-    target_user_id, target_first_name = get_target_user(update, text, chat_id)
-
-    if not target_user_id:
-        await reply_temp(update, context, "استفاده صحیح:\n/dd @username <مقدار>\nیا ریپلای کردن روی پیام شخص و تایپ /dd <مقدار>")
-        return
-
-    if target_user_id == user.id:
-        await reply_temp(update, context, "نمی‌توانید به خودتان اهدا کنید!")
-        return
+    if not target_id:
+        return DONATE_REFUSED, "استفاده صحیح:\n/dd @username <مقدار>\nیا ریپلای کردن روی پیام شخص و تایپ /dd <مقدار>"
+    if target_id == actor_id:
+        return DONATE_REFUSED, "نمی‌توانید به خودتان اهدا کنید!"
 
     # The waiting period applies to receiving as well as giving. Gating only the giver
     # left the obvious hole open: make a fresh account, have an established one feed it.
-    target_wait = db.get_donation_wait_remaining(target_user_id, chat_id)
+    target_wait = db.get_donation_wait_remaining(target_id, chat_id)
     if target_wait is not None:
         days = max(1, int(target_wait.total_seconds() // 86400) + 1)
-        await reply_temp(update, context,
-            f"{target_first_name} تازه به این گروه پیوسته! تا {days} روز دیگر نمی‌شود به او سایز اهدا کرد."
-        )
-        return
+        return DONATE_REFUSED, (f"{target_name} تازه به این گروه پیوسته! تا {days} روز دیگر "
+                                f"نمی‌شود به او سایز اهدا کرد.")
 
-    parts = text.split()
-    amount_str = parts[-1] if len(parts) > 1 else ""
     try:
-        amount = float(amount_str)
-        # isfinite blocks "nan" (which passes every <= comparison and would poison
-        # both users' sizes into NaN forever) and "inf".
-        if not math.isfinite(amount) or amount <= 0: raise ValueError
-    except ValueError:
-        await reply_temp(update, context, "لطفا یک مقدار معتبر وارد کنید.")
-        return
+        amount = float(amount)
+        # isfinite blocks "nan" (which passes every <= comparison and would poison both
+        # users' sizes into NaN forever) and "inf".
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return DONATE_REFUSED, "لطفا یک مقدار معتبر وارد کنید."
 
-    if not db.try_deduct_size(user.id, chat_id, amount):
-        await reply_temp(update, context, "شما به اندازه کافی سانتی‌متر برای اهدا در این گروه ندارید!")
-        return
-    db.update_size(target_user_id, chat_id, amount)
-    
-    new_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    await update.message.reply_text(f"شما {int(amount)} سانتی‌متر به {target_first_name} اهدا کردید!\nسایز جدید شما: {int(new_size)} سانتی‌متر.")
+    if not db.try_deduct_size(actor_id, chat_id, amount):
+        return DONATE_REFUSED, "شما به اندازه کافی سانتی‌متر برای اهدا در این گروه ندارید!"
+    db.update_size(target_id, chat_id, amount)
+
+    new_size, _, _ = db.get_user(actor_id, chat_id, actor_username, actor_name)
+    return DONATE_RESULT, (f"شما {int(amount)} سانتی‌متر به {target_name} اهدا کردید!\n"
+                           f"سایز جدید شما: {int(new_size)} سانتی‌متر.")
+
+
+async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    text = update.message.text
+    target_id, target_name = get_target_user(update, text, chat_id)
+    parts = text.split()
+    kind, msg = perform_donation(user.id, user.first_name, user.username, chat_id,
+                                 target_id, target_name,
+                                 parts[-1] if len(parts) > 1 else "")
+    if kind == DONATE_REFUSED:
+        await reply_temp(update, context, msg)
+    else:
+        await update.message.reply_text(msg)
+
 
 MIN_CONSENSUS_PLAYERS = 3
 CONSENSUS_STEAL_RATIO = 0.30
@@ -3180,58 +3185,51 @@ async def collect_king_tax(context: ContextTypes.DEFAULT_TYPE, chat_id, today_st
         logging.error(f"Failed to announce king tax in {chat_id}: {e}")
 
 
-async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/dozdi @username` - attempt to rob someone. Robbing a bigger player is harder,
-    a failed attempt pays a fine to the victim, and the whole thing is zero-sum."""
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    if chat_id >= 0:
-        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
-        return
-    db.track_chat(chat_id)
-    thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
+# A theft either happened or it did not. REFUSED means nothing moved and the message is
+# private noise; RESULT means size changed and the group is entitled to see it. Every
+# surface that can steal decides presentation from this, and nothing else.
+THEFT_REFUSED, THEFT_RESULT = 'refused', 'result'
 
-    if db.is_in_heist_prison(user.id, chat_id):
-        await reply_temp(update, context, "⛓ تو زندان بانکی، نمی‌تونی دزدی کنی!")
-        return
+
+def perform_theft(actor_id, actor_name, actor_username, chat_id, target_id, target_name):
+    """The whole theft, with no Telegram in it. Returns (kind, text).
+
+    Extracted so /dozdi and the Mini App share ONE implementation. Two copies of odds
+    this fiddly - the size-gap curve, both players' perks, the armed item, the luck dial,
+    the alarm and the lock - would drift within a week, and the drifted one would quietly
+    rob real players by the wrong amount.
+    """
+    db.track_chat(chat_id)
+    thief_size, thief_last_grown, thief_perk = db.get_user(actor_id, chat_id, actor_username, actor_name)
+
+    if db.is_in_heist_prison(actor_id, chat_id):
+        return THEFT_REFUSED, "⛓ تو زندان بانکی، نمی‌تونی دزدی کنی!"
 
     # Same gate /ejma uses: only people actually playing today can move other people's
     # size around, so a throwaway account can't be spun up purely to rob someone.
     if thief_last_grown != tehran_today_str():
-        await reply_temp(update, context, "اول باید امروز دودولت رو بمالی (/d) بعد بری دزدی! 🥷")
-        return
+        return THEFT_REFUSED, "اول باید امروز دودولت رو بمالی (/d) بعد بری دزدی! 🥷"
 
-    target_id, target_name = get_target_user(update, update.message.text, chat_id)
     if not target_id:
-        await reply_temp(update, context, "از کی می‌خوای بدزدی؟\n/dozdi @username\nیا ریپلای روی پیامش و تایپ /dozdi")
-        return
-    if target_id == user.id:
-        await reply_temp(update, context, "از جیب خودت؟ 😐")
-        return
+        return THEFT_REFUSED, "از کی می‌خوای بدزدی؟\n/dozdi @username\nیا ریپلای روی پیامش و تایپ /dozdi"
+    if target_id == actor_id:
+        return THEFT_REFUSED, "از جیب خودت؟ 😐"
 
     target_info = db.get_user_info(target_id, chat_id)
     target_size = (target_info[1] if target_info else 0) or 0
     if target_size < THEFT_MIN_TARGET_SIZE:
-        await reply_temp(update, context,
-            f"{target_name} فقیرتر از اونیه که ازش بدزدی! (حداقل {THEFT_MIN_TARGET_SIZE} سانت لازمه)"
-        )
-        return
+        return THEFT_REFUSED, (f"{target_name} فقیرتر از اونیه که ازش بدزدی! "
+                               f"(حداقل {THEFT_MIN_TARGET_SIZE} سانت لازمه)")
 
     kingdom, _ = refresh_king(chat_id)
     if kingdom and kingdom[2] == target_id:
-        await reply_temp(update, context,
-            f"🛡️ {target_name} همسر پادشاهه و گارد سلطنتی نمی‌ذاره بهش دست بزنی!"
-        )
-        return
+        return THEFT_REFUSED, f"🛡️ {target_name} همسر پادشاهه و گارد سلطنتی نمی‌ذاره بهش دست بزنی!"
 
     cooldown = THEFT_COOLDOWN_SECONDS // 2 if thief_perk == "شب‌رو" else THEFT_COOLDOWN_SECONDS
-    ok, remaining = db.try_start_theft(user.id, chat_id, cooldown)
+    ok, remaining = db.try_start_theft(actor_id, chat_id, cooldown)
     if not ok:
         hours, minutes = remaining // 3600, (remaining % 3600) // 60
-        await reply_temp(update, context,
-            f"تازه دزدی کردی! تا {hours} ساعت و {minutes} دقیقهٔ دیگه دستت بستس 🥷"
-        )
-        return
+        return THEFT_REFUSED, f"تازه دزدی کردی! تا {hours} ساعت و {minutes} دقیقهٔ دیگه دستت بستس 🥷"
 
     # Robbing up is meant to be a long shot and robbing down easy money, so the odds
     # follow the size gap rather than being a flat coin flip.
@@ -3255,10 +3253,10 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # An armed theft item, consumed on this attempt whether or not it lands - same
     # bargain as a challenge item.
-    theft_item = db.get_user_active_theft_item(user.id, chat_id)
+    theft_item = db.get_user_active_theft_item(actor_id, chat_id)
     item_note = ""
     if theft_item:
-        db.clear_user_active_theft_item(user.id, chat_id)
+        db.clear_user_active_theft_item(actor_id, chat_id)
         if theft_item == "دستکش":
             chance += THEFT_ITEM_CHANCE_BONUS
             item_note = "\n🧤 دستکش دستت بود."
@@ -3274,7 +3272,7 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # can disagree with reality, which is both honest and a better throttle than a
     # quoted number would be - a published percentage is exactly the thing a player can
     # check their own win/loss record against.
-    theft_luck, _ = db.get_modifiers(user.id, chat_id)
+    theft_luck, _ = db.get_modifiers(actor_id, chat_id)
     if theft_luck != 1.0:
         chance = min(max(chance * theft_luck, 0.0), 0.95)
 
@@ -3285,59 +3283,70 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # failed anyway - the thief still burns their cooldown either way.
     if db.use_inventory(target_id, chat_id, "آژیر"):
         fine = max(1, int(loot * ALARM_FINE_RATIO))
-        if db.try_deduct_size(user.id, chat_id, fine):
+        if db.try_deduct_size(actor_id, chat_id, fine):
             db.update_size(target_id, chat_id, fine)
-            await update.message.reply_text(
-                f"🚨 آژیر {target_name} به صدا در اومد!\n{user.first_name} فرار کرد ولی "
-                f"{int(fine)} سانت جا گذاشت.\n(آژیر {target_name} مصرف شد){item_note}"
-            )
-        else:
-            await update.message.reply_text(
-                f"🚨 آژیر {target_name} به صدا در اومد و {user.first_name} دست خالی فرار کرد!\n"
-                f"(آژیر {target_name} مصرف شد){item_note}"
-            )
-        return
+            return THEFT_RESULT, (
+                f"🚨 آژیر {target_name} به صدا در اومد!\n{actor_name} فرار کرد ولی "
+                f"{int(fine)} سانت جا گذاشت.\n(آژیر {target_name} مصرف شد){item_note}")
+        return THEFT_RESULT, (
+            f"🚨 آژیر {target_name} به صدا در اومد و {actor_name} دست خالی فرار کرد!\n"
+            f"(آژیر {target_name} مصرف شد){item_note}")
 
     if db.use_inventory(target_id, chat_id, "قفل"):
-        await reply_temp(update, context,
-            f"🔒 {target_name} قفل داشت!\n{user.first_name} به در بسته خورد و دست خالی برگشت.\n"
-            f"(قفل {target_name} مصرف شد){item_note}"
-        )
-        return
+        return THEFT_REFUSED, (
+            f"🔒 {target_name} قفل داشت!\n{actor_name} به در بسته خورد و دست خالی برگشت.\n"
+            f"(قفل {target_name} مصرف شد){item_note}")
 
     if random.random() < chance:
         if not db.try_deduct_size(target_id, chat_id, loot):
-            await reply_temp(update, context, f"{target_name} همین الان سایزش کم شد؛ دزدی بی‌نتیجه موند!")
-            return
+            return THEFT_REFUSED, f"{target_name} همین الان سایزش کم شد؛ دزدی بی‌نتیجه موند!"
         # The vault takes its cut. Stolen size stays inside the group either way, but a
         # slice of it now funds everyone's deposit interest instead of all landing on
         # the thief.
         theft_fee = int(loot * fee_of(chat_id, THEFT_FEE_RATIO))
-        db.update_size(user.id, chat_id, loot - theft_fee)
+        db.update_size(actor_id, chat_id, loot - theft_fee)
         if theft_fee > 0:
             db.treasury_add(chat_id, theft_fee, note="کارمزد دزدی")
         # Both badges ride along in the theft's own message; they were two more.
-        await update.message.reply_text(
-            f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!{item_note}"
+        return THEFT_RESULT, (
+            f"🥷 دزدی موفق!\n\n{actor_name} زد و {int(loot)} سانت از {target_name} بالا کشید!{item_note}"
             + (f"\n🧾 کارمزد دزدی ({int(THEFT_FEE_RATIO*100)}٪): {theft_fee} سانت رفت تو خزانه."
                if theft_fee > 0 else "")
-            + badge_lines(user.first_name, award(user.id, chat_id, 'thief'), html=False)
-            + badge_lines(target_name, award(target_id, chat_id, 'robbed'), html=False)
-        )
+            + badge_lines(actor_name, award(actor_id, chat_id, 'thief'), html=False)
+            + badge_lines(target_name, award(target_id, chat_id, 'robbed'), html=False))
+
+    fine = max(1, loot // 2)
+    if thief_perk == "دست‌کج":
+        fine *= 2
+    if db.try_deduct_size(actor_id, chat_id, fine):
+        db.update_size(target_id, chat_id, fine)
+        return THEFT_RESULT, (
+            f"🚨 مچ‌گیری!\n\n{actor_name} می‌خواست از {target_name} بدزده ولی گیر افتاد "
+            f"و {int(fine)} سانت غرامت داد!{item_note}")
+    return THEFT_RESULT, (
+        f"🚨 {actor_name} گیر افتاد ولی اونقدر فقیره که غرامتی هم نداشت بده 😂{item_note}")
+
+
+async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/dozdi @username` - attempt to rob someone. Robbing a bigger player is harder,
+    a failed attempt pays a fine to the victim, and the whole thing is zero-sum.
+
+    The logic is in perform_theft, shared with the Mini App.
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        return
+
+    target_id, target_name = get_target_user(update, update.message.text, chat_id)
+    kind, text = perform_theft(user.id, user.first_name, user.username,
+                               chat_id, target_id, target_name)
+    if kind == THEFT_REFUSED:
+        await reply_temp(update, context, text)
     else:
-        fine = max(1, loot // 2)
-        if thief_perk == "دست‌کج":
-            fine *= 2
-        if db.try_deduct_size(user.id, chat_id, fine):
-            db.update_size(target_id, chat_id, fine)
-            await update.message.reply_text(
-                f"🚨 مچ‌گیری!\n\n{user.first_name} می‌خواست از {target_name} بدزده ولی گیر افتاد "
-                f"و {int(fine)} سانت غرامت داد!{item_note}"
-            )
-        else:
-            await update.message.reply_text(
-                f"🚨 {user.first_name} گیر افتاد ولی اونقدر فقیره که غرامتی هم نداشت بده 😂{item_note}"
-            )
+        # Size moved, so it is the record and stays.
+        await update.message.reply_text(text)
 
 
 

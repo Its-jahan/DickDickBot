@@ -14,6 +14,7 @@ import { Bank } from '@/screens/Bank'
 import { Shop } from '@/screens/Shop'
 import { Bag } from '@/screens/Bag'
 import { Transfer } from '@/screens/Transfer'
+import { ActionSheet, type ActionKind } from '@/screens/Actions'
 import { Login } from '@/screens/Login'
 
 const ENDPOINT: Record<TabKey, string> = {
@@ -37,6 +38,7 @@ export default function App() {
   const reqRef = useRef(0)
   const [loading, setLoading] = useState(false)
   const [xfer, setXfer] = useState(false)
+  const [action, setAction] = useState<ActionKind | null>(null)
   const toast = useToast()
 
   const logout = useCallback(() => {
@@ -196,7 +198,8 @@ export default function App() {
             </div>
           )
         ) : tab === 'home' ? (
-          <Home d={d} onPickGroup={() => setPhase('groups')} onTransfer={() => setXfer(true)} onLogout={logout} />
+          <Home d={d} onPickGroup={() => setPhase('groups')} onTransfer={() => setXfer(true)}
+                onLogout={logout} onAction={setAction} />
         ) : tab === 'top' ? <Top d={d} />
           : tab === 'crypto' ? <Crypto d={d} chat={chat!} reload={reload} />
           : tab === 'bank' ? <Bank d={d} chat={chat!} reload={reload} />
@@ -204,6 +207,7 @@ export default function App() {
           : <Bag d={d} chat={chat!} reload={reload} />}
       </Wrap>
       <Transfer chat={chat!} open={xfer} onClose={() => setXfer(false)} reload={reload} />
+      <ActionSheet kind={action} chat={chat!} onClose={() => setAction(null)} reload={reload} />
       <BottomNav tab={tab} onTab={setTab} />
     </>
   )

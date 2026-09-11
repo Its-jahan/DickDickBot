@@ -67,6 +67,14 @@ BOT_USERNAME = os.environ.get('BOT_USERNAME', 'dickchallengerbot')
 TG_TIMEOUT_SECONDS = 8
 
 
+def _esc_plain(text):
+    """These handlers build PLAIN text carrying player names verbatim, and _tg_send
+    posts as HTML. A name with a '<' in it would break the whole message, so escaping
+    happens at the boundary - same rule as the nightly report."""
+    import html as _html
+    return _html.escape(str(text), quote=False)
+
+
 def _tg_send(chat_id, text):
     """POST one sendMessage. Stdlib only, and every failure is swallowed.
 
@@ -859,6 +867,93 @@ def api_transfer():
         'ok': True, 'delivered': float(delivered), 'fee': float(fee),
         'message': f'{int(delivered)} سانت رسید به {dest_title} (کارمزد {int(fee)})',
     })
+
+
+def _announce(chat_id, text):
+    """Post a group action's outcome to the group it happened in.
+
+    The whole reason theft and a donation live in a chat is that other people see them.
+    Doing one from a browser must not make it invisible, so the app posts exactly the
+    text the chat handler would have replied with - nobody can tell which surface was
+    used. Dispatched off the request like the transfer announcement: the size has
+    already moved, so a slow api.telegram.org costs the announcement and nothing else.
+    """
+    _run_bg(_tg_send, chat_id, text)
+
+
+@app.get('/api/players')
+def api_players():
+    """Everyone in this group, for the target pickers. Same rows the leaderboard uses."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    db.get_user(uid, chat_id, username, name)
+    crown, _changed = bot.refresh_king(chat_id)
+    king_id = crown[0] if crown else None
+    consort_id = crown[2] if crown else None
+    return jsonify({'ok': True, 'me': uid, 'players': [
+        {'user_id': r[0], 'name': r[1], 'size': float(r[2] or 0),
+         'king': r[0] == king_id, 'consort': r[0] == consort_id}
+        for r in db.get_top_users_full(chat_id)
+    ]})
+
+
+@app.post('/api/steal')
+def api_steal():
+    """/dozdi from the app. perform_theft is the SAME function the chat handler calls -
+    the odds here are not a second implementation of the odds there."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    try:
+        target_id = int(body.get('target'))
+    except (TypeError, ValueError):
+        return _fail('از کی می‌خوای بدزدی؟')
+
+    target = db.get_user_info(target_id, chat_id)
+    if not target:
+        return _fail('این بازیکن تو این گروه نیست')
+    target_name = target[0] or '؟'
+
+    kind, text = bot.perform_theft(uid, name, username, chat_id, target_id, target_name)
+    if kind == bot.THEFT_REFUSED:
+        return _fail(text)
+    _announce(chat_id, _esc_plain(text))
+    return jsonify({'ok': True, 'message': text})
+
+
+@app.post('/api/donate')
+def api_donate():
+    """/dd from the app, through the same perform_donation the chat handler uses."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    try:
+        target_id = int(body.get('target'))
+    except (TypeError, ValueError):
+        return _fail('به کی می‌خوای اهدا کنی؟')
+    amount = _amount(body)
+    if amount is None:
+        return _fail('مقدار نامعتبره')
+
+    target = db.get_user_info(target_id, chat_id)
+    if not target:
+        return _fail('این بازیکن تو این گروه نیست')
+    target_name = target[0] or '؟'
+
+    kind, text = bot.perform_donation(uid, name, username, chat_id, target_id,
+                                      target_name, amount)
+    if kind == bot.DONATE_REFUSED:
+        return _fail(text)
+    # The giver's own message is written in the second person; the group gets the fact.
+    _announce(chat_id, _esc_plain(
+        f"🎁 {name} {int(amount)} سانت به {target_name} اهدا کرد."))
+    return jsonify({'ok': True, 'message': text})
 
 
 @app.get('/api/config')

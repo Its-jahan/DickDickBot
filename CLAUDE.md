@@ -1536,14 +1536,44 @@ Three implementation details, in order of how easy they are to get wrong:
   is a regression test asserting the distinctive phrases appear in `transfer_callback`'s
   source as well as in what the endpoint sends.
 
-### What is deliberately not in it
+### Group actions in the app, and the line between them and the chat
 
-Challenges, theft, `/ejma`, heists, decrees and the crown's powers are absent by design,
-not by omission. Their entire point is a message landing in the chat for other people to
-react to, and a browser tab has nobody to post to. The home screen links back to the chat
-for those instead. Item use follows the same line: theft items and the golden ticket can
-be armed from the web because they only touch the player's own state, while anything
-needing a target (`DIRECT_ITEMS`) is pushed back to the group.
+**Theft and donation are in the app**, and the bot announces the outcome in the group.
+The line is not "does it touch other people" — it is **does it need somebody else to
+tap something**:
+
+- `/dozdi` and `/dd` are one target, one outcome, one announcement. Nobody else has to
+  do anything, so a browser can drive them and `_announce` posts the result to the group.
+- A challenge, an `/ejma`, a heist, a loan offer or a decree all wait on *another
+  player's* button. A browser tab has nobody to show that button to, so they stay in the
+  chat and the home screen links back to them.
+
+**The shared `perform_*` function is the whole design.** `perform_theft` and
+`perform_donation` contain the logic and touch no Telegram object at all; `steal_cmd` and
+`donate` are thin wrappers, and the endpoints call the same functions. Theft's odds — the
+size-gap curve, both players' perks, the armed item, the luck dial, the alarm and the
+lock — would drift within a week if copied, and the drifted copy would rob real players
+by the wrong amount. There is a test asserting neither handler rolls its own dice and
+neither `perform_*` mentions Telegram.
+
+They return `(kind, text)` where kind is REFUSED or RESULT, and that single distinction
+drives everything downstream: a refusal is private noise (`reply_temp` in chat, a plain
+error in the app, **never announced**), a result is the record (permanent in chat,
+announced to the group from the app). There is a test that a refused theft posts nothing.
+
+The announcement is dispatched through `_run_bg` like the transfer one, so a dead
+`api.telegram.org` costs the announcement and nothing else — the size has already moved.
+A test makes `_tg_send` throw and asserts the donation still lands and still reports
+success.
+
+`/api/players` is the shared target picker, scoped like everything else.
+
+### What is still deliberately not in it
+
+Challenges, `/ejma`, heists, decrees and the crown's powers are absent by design, not by
+omission — see the line above. Item use follows the same rule: theft items and the golden
+ticket can be armed from the web because they only touch the player's own state, while
+anything needing a target (`DIRECT_ITEMS`) is pushed back to the group.
 
 `chats.title` is recorded opportunistically in `log_incoming` — every delivered message
 carries the group name and that handler already sees all of them — purely so the group

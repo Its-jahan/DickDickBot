@@ -3,12 +3,16 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { fa, num } from '@/lib/format'
 import { TG } from '@/lib/tg'
-import { ArrowLeftRight, Users, LogOut } from 'lucide-react'
+import { ArrowLeftRight, Users, LogOut, VenetianMask, Gift } from 'lucide-react'
+import type { ActionKind } from '@/screens/Actions'
 import { useToast } from '@/components/Toast'
 
+// Still chat-only, and deliberately: each one's whole point is other people reacting to
+// a message, and half of them need somebody ELSE to tap a button that does not exist in
+// a browser tab.
 const GROUP_ONLY: [string, string][] = [
-  ['d', 'رشد روزانه'], ['c', 'چالش'], ['dozdi', 'دزدی'],
-  ['ejma', 'اجماع'], ['sarghat', 'سرقت از بانک'], ['farman', 'فرمان'],
+  ['d', 'رشد روزانه'], ['c', 'چالش'], ['ejma', 'اجماع'],
+  ['sarghat', 'سرقت از بانک'], ['farman', 'فرمان'],
 ]
 
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
@@ -21,11 +25,12 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
   )
 }
 
-export function Home({ d, onPickGroup, onTransfer, onLogout }: {
+export function Home({ d, onPickGroup, onTransfer, onLogout, onAction }: {
   d: any
   onPickGroup: () => void
   onTransfer: () => void
   onLogout: () => void
+  onAction: (k: ActionKind) => void
 }) {
   const toast = useToast()
   return (
@@ -65,7 +70,18 @@ export function Home({ d, onPickGroup, onTransfer, onLogout }: {
 
       <Card>
         <CardContent className="space-y-3 pt-4">
-          <div className="flex flex-wrap gap-2">
+          <div className="text-xs text-muted-foreground">
+            اینا رو از همین‌جا بزن — ربات نتیجه رو تو گروه اعلام می‌کنه:
+          </div>
+          <div className="grid grid-cols-2 gap-2.5">
+            <Button variant="secondary" onClick={() => onAction('steal')}>
+              <VenetianMask className="h-4 w-4" /> دزدی
+            </Button>
+            <Button variant="secondary" onClick={() => onAction('donate')}>
+              <Gift className="h-4 w-4" /> اهدای سایز
+            </Button>
+          </div>
+          <div className="flex flex-wrap gap-2 border-t pt-3">
             <Button variant="secondary" size="sm" onClick={onPickGroup}>
               <Users className="h-3.5 w-3.5" /> تعویض گروه
             </Button>
