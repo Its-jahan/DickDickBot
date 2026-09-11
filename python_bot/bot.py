@@ -4,6 +4,7 @@ import hmac
 import html
 import logging
 import random
+import re
 import datetime
 from datetime import time
 from zoneinfo import ZoneInfo
@@ -136,6 +137,83 @@ async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Failed to send reminder to {cid}: {e}")
 
 
+# How long throwaway chatter is left on screen. A refusal is read once and never again;
+# a personal lookup is read by one person; a command is superseded the moment the bot
+# answers it. None of the three is part of the game's record, and in a busy group they
+# are most of what is on screen.
+EPHEMERAL_ERROR_SECONDS = 20
+EPHEMERAL_LOOKUP_SECONDS = 120
+COMMAND_MESSAGE_SECONDS = 30
+
+
+def is_our_command(text):
+    """True only for a command this bot actually answers.
+
+    Groups run more than one bot, and sweeping every message that merely starts with a
+    slash would delete other bots' commands out from under their users.
+    """
+    if not text or not text.startswith('/'):
+        return False
+    word = text[1:].split()[0] if text[1:].split() else ''
+    return word.split('@')[0].lower() in OUR_COMMANDS
+
+
+async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    d = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=d['chat_id'], message_id=d['message_id'])
+    except Exception:
+        # Not an admin, already deleted, or older than the 48h Telegram allows a bot to
+        # delete. Tidying is cosmetic, so every one of those is fine.
+        pass
+
+
+def sweep_later(context, chat_id, message_id, seconds):
+    """Schedule a message to be deleted. Never raises, never blocks the caller.
+
+    Deliberately in-memory (`job_queue.run_once`) rather than persisted: if the process
+    dies before it fires, the message simply stays, which is exactly where the bot was
+    before. Persisting cleanup would put a cosmetic concern in the same class as the
+    money, and the recovery sweeps exist for the money.
+    """
+    if chat_id is None or message_id is None or chat_id >= 0:
+        # Never in a DM: there is no group to keep tidy, and no delete right either.
+        return
+    try:
+        context.job_queue.run_once(
+            _delete_message_job, seconds,
+            data={'chat_id': chat_id, 'message_id': message_id},
+            name=f"del:{chat_id}:{message_id}")
+    except Exception:
+        logging.debug("could not schedule cleanup", exc_info=True)
+
+
+async def reply_lookup(update, context, text, **kwargs):
+    """Reply with a personal lookup - an inventory, a balance, a leaderboard.
+
+    Regenerable by typing the command again, interesting to one person, and in a busy
+    group most of what is on screen. It gets a longer life than a refusal because
+    somebody is actually reading it.
+    """
+    return await reply_temp(update, context, text,
+                            seconds=EPHEMERAL_LOOKUP_SECONDS, **kwargs)
+
+
+async def reply_temp(update, context, text, seconds=EPHEMERAL_ERROR_SECONDS, **kwargs):
+    """Reply with something the group does not need to keep.
+
+    Use it for refusals, cooldown notices and personal lookups - anything that is an
+    answer to one person rather than part of what happened in the game. A challenge
+    result, a theft, a heist or the nightly report is the record and must NOT use this.
+    """
+    msg = await update.message.reply_text(text, **kwargs)
+    try:
+        sweep_later(context, update.effective_chat.id, msg.message_id, seconds)
+    except Exception:
+        pass
+    return msg
+
+
 async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Logs one line per update Telegram actually delivers. Registered in handler group
     -1 so it runs before (and independently of) the real handlers.
@@ -157,6 +235,12 @@ async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          update.message.chat.id,
                          update.message.from_user.id if update.message.from_user else None,
                          (update.message.text or update.message.caption or '')[:64])
+            # The typed command is superseded by the bot's answer, so it is swept a
+            # little after it. This is the one handler that sees every message, which
+            # is why it lives here instead of in ~40 command handlers.
+            if is_our_command(update.message.text) and update.message.chat.id < 0:
+                sweep_later(context, update.message.chat.id, update.message.message_id,
+                            COMMAND_MESSAGE_SECONDS)
         elif update.edited_message is not None:
             logging.info("RX edited_message chat=%s", update.edited_message.chat.id)
         elif update.inline_query is not None:
@@ -176,12 +260,38 @@ async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("failed to log an incoming update")
 
 
+# Every command this bot answers, learned rather than listed a second time. It is what
+# stops the cleanup sweep deleting a message meant for a DIFFERENT bot in the same group
+# - plenty of groups run several, and deleting their commands would be unforgivable.
+#
+# Filled from two places on purpose. cmd() adds every name in every handler pattern, so
+# a command added tomorrow is covered without anyone remembering to; but cmd() only runs
+# when the handlers register, which never happens on import, so _seed_our_commands()
+# reads the menu at import time as well. Neither alone is enough: the menu has no
+# aliases (/grow, /steal), and the patterns are not evaluated when webapp.py imports
+# this module or when a test does.
+OUR_COMMANDS = {'start', 'help'}
+
+
+def _seed_our_commands():
+    for _name, _desc in BOT_COMMANDS:
+        OUR_COMMANDS.add(_name)
+
+
 def cmd(pattern):
     """Filter for a text command. Gating on UpdateType.MESSAGE matters: a bare
     filters.Regex also fires for edited_message/channel_post updates, where
     update.message is None - every one of those crashed its handler mid-flight
     (the recurring "'NoneType' object has no attribute 'text'" in production,
-    which users experienced as the bot ignoring a command)."""
+    which users experienced as the bot ignoring a command).
+
+    It also registers the names into OUR_COMMANDS. Doing it here rather than in a second
+    list is the whole point: a command added tomorrow is swept without anyone
+    remembering to add it, and a list that has to be kept in step is the drift bug this
+    codebase keeps getting bitten by."""
+    m = re.match(r'\^/\(?([^)]*?)\)?\\b', pattern)
+    if m:
+        OUR_COMMANDS.update(n for n in m.group(1).split('|') if n)
     return filters.UpdateType.MESSAGE & filters.Regex(pattern)
 
 
@@ -233,6 +343,8 @@ BOT_COMMANDS = [
     ("wr", "📊 آمار برد و باخت"),
     ("help", "❓ راهنمای کامل بازی"),
 ]
+
+_seed_our_commands()
 
 
 # Telegram resolves the / menu through a precedence chain, and a list registered
@@ -759,7 +871,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # by construction, which is the only place a web_app button is allowed.
     parts = (update.message.text or '').split()
     if len(parts) > 1 and parts[1] == 'app':
-        await update.message.reply_text(
+        await reply_lookup(update, context,
             f"🎮 <b>نسخهٔ وب دودول</b>\n\n{WEBAPP_BLURB}",
             reply_markup=webapp_keyboard(update.effective_chat.id), parse_mode="HTML"
         )
@@ -775,11 +887,11 @@ async def dick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     today_str = tehran_today_str()
     if last_grown == today_str:
-        await update.message.reply_text("شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.")
+        await reply_temp(update, context, "شما امروز دودول خود را در این گروه رشد داده‌اید! تا فردا صبر کنید.")
         return
 
     if db.is_in_heist_prison(user.id, chat_id):
-        await update.message.reply_text("⛓ تو زندان بانکی، نمی‌تونی دودولت رو بمالی! با /vasighe می‌تونی زودتر آزاد شی.")
+        await reply_temp(update, context, "⛓ تو زندان بانکی، نمی‌تونی دودولت رو بمالی! با /vasighe می‌تونی زودتر آزاد شی.")
         return
 
     keyboard = [[InlineKeyboardButton("بمالش تا بزرگ شه 💦", callback_data=f"grow_self_{user.id}")]]
@@ -798,10 +910,10 @@ async def inventory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg, reply_markup = build_inventory_view(user.id, chat_id)
     if not msg:
-        await update.message.reply_text("کیف پول شما در این گروه خالی است!")
+        await reply_lookup(update, context, "کیف پول شما در این گروه خالی است!")
         return
 
-    await update.message.reply_text(msg, reply_markup=reply_markup)
+    await reply_lookup(update, context, msg, reply_markup=reply_markup)
 
 async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -910,13 +1022,13 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.track_chat(chat_id)
     _, _, user_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
     if user_perk == "کون‌سوخته":
-        await update.message.reply_text("شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!")
+        await reply_temp(update, context, "شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!")
         return
 
     text = update.message.text
     parts = text.split()
     if len(parts) < 2:
-        await update.message.reply_text("استفاده: `/use نام_آیتم`\nمثال: `/use کاندوم`")
+        await reply_temp(update, context, "استفاده: `/use نام_آیتم`\nمثال: `/use کاندوم`")
         return
         
     # item name might be multiple words
@@ -935,19 +1047,19 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
             
     if not has_item:
-        await update.message.reply_text(f"شما آیتم '{item_name}' را در این گروه ندارید!")
+        await reply_temp(update, context, f"شما آیتم '{item_name}' را در این گروه ندارید!")
         return
         
     
     if item_name in THEFT_ITEMS or item_name in INSTANT_ITEMS:
         _ok, note = activate_special_item(user.id, chat_id, item_name, user.first_name)
-        await update.message.reply_text(note)
+        await reply_temp(update, context, note)
         return
 
     if item_name in CHALLENGE_ITEMS:
         current_active = db.get_user_active_item(user.id, chat_id)
         if current_active:
-            await update.message.reply_text("شما از قبل یک آیتم چالشی فعال دارید! اول در یک چالش شرکت کنید.")
+            await reply_temp(update, context, "شما از قبل یک آیتم چالشی فعال دارید! اول در یک چالش شرکت کنید.")
             return
         
         db.use_inventory(user.id, chat_id, item_name)
@@ -961,12 +1073,12 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif item_name in DIRECT_ITEMS:
         target_user_id, target_first_name = get_target_user(update, text, chat_id)
         if not target_user_id:
-            await update.message.reply_text("باید روی یک نفر ریپلای کنید یا یوزرنیمش رو منشن کنید!")
+            await reply_temp(update, context, "باید روی یک نفر ریپلای کنید یا یوزرنیمش رو منشن کنید!")
             return
 
         allowed, reason = claim_dose_slot(item_name, target_user_id, target_first_name, chat_id)
         if not allowed:
-            await update.message.reply_text(reason)
+            await reply_temp(update, context, reason)
             return
 
         # Consume the item BEFORE applying its effect - the other order let a race
@@ -974,7 +1086,7 @@ async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db.use_inventory(user.id, chat_id, item_name):
             if item_name in DOSE_LIMITED_ITEMS:
                 db.release_dose(target_user_id, chat_id)
-            await update.message.reply_text(f"شما آیتم '{item_name}' را در این گروه ندارید!")
+            await reply_temp(update, context, f"شما آیتم '{item_name}' را در این گروه ندارید!")
             return
         msg = apply_direct_item(item_name, target_user_id, target_first_name, chat_id)
         await update.message.reply_text(msg)
@@ -985,10 +1097,10 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = build_top_text(chat_id)
 
     if not msg:
-        await update.message.reply_text("هنوز هیچکس در این گروه در بازی شرکت نکرده است!")
+        await reply_lookup(update, context, "هنوز هیچکس در این گروه در بازی شرکت نکرده است!")
         return
 
-    await update.message.reply_text(msg)
+    await reply_lookup(update, context, msg)
 
 async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1004,11 +1116,11 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wins, losses = db.get_win_loss(target_user_id, chat_id)
     total = wins + losses
     if total == 0:
-        await update.message.reply_text(f"{target_first_name} هنوز هیچ چالشی رو تموم نکرده!")
+        await reply_lookup(update, context, f"{target_first_name} هنوز هیچ چالشی رو تموم نکرده!")
         return
 
     win_rate = round(wins / total * 100)
-    await update.message.reply_text(
+    await reply_lookup(update, context,
         f"🎲 آمار چالش‌های {target_first_name} در این گروه:\n"
         f"✅ برد: {wins}\n❌ باخت: {losses}\n📊 وین‌ریت: {win_rate}٪ (از {total} چالش)"
     )
@@ -1024,7 +1136,7 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wait_remaining = db.get_donation_wait_remaining(user.id, chat_id)
     if wait_remaining is not None:
         days = max(1, int(wait_remaining.total_seconds() // 86400) + 1)
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"تازه به این گروه پیوسته‌اید! تا {days} روز دیگر می‌توانید سایز اهدا کنید."
         )
         return
@@ -1032,11 +1144,11 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id, target_first_name = get_target_user(update, text, chat_id)
 
     if not target_user_id:
-        await update.message.reply_text("استفاده صحیح:\n/dd @username <مقدار>\nیا ریپلای کردن روی پیام شخص و تایپ /dd <مقدار>")
+        await reply_temp(update, context, "استفاده صحیح:\n/dd @username <مقدار>\nیا ریپلای کردن روی پیام شخص و تایپ /dd <مقدار>")
         return
 
     if target_user_id == user.id:
-        await update.message.reply_text("نمی‌توانید به خودتان اهدا کنید!")
+        await reply_temp(update, context, "نمی‌توانید به خودتان اهدا کنید!")
         return
 
     # The waiting period applies to receiving as well as giving. Gating only the giver
@@ -1044,7 +1156,7 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_wait = db.get_donation_wait_remaining(target_user_id, chat_id)
     if target_wait is not None:
         days = max(1, int(target_wait.total_seconds() // 86400) + 1)
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"{target_first_name} تازه به این گروه پیوسته! تا {days} روز دیگر نمی‌شود به او سایز اهدا کرد."
         )
         return
@@ -1057,11 +1169,11 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # both users' sizes into NaN forever) and "inf".
         if not math.isfinite(amount) or amount <= 0: raise ValueError
     except ValueError:
-        await update.message.reply_text("لطفا یک مقدار معتبر وارد کنید.")
+        await reply_temp(update, context, "لطفا یک مقدار معتبر وارد کنید.")
         return
 
     if not db.try_deduct_size(user.id, chat_id, amount):
-        await update.message.reply_text("شما به اندازه کافی سانتی‌متر برای اهدا در این گروه ندارید!")
+        await reply_temp(update, context, "شما به اندازه کافی سانتی‌متر برای اهدا در این گروه ندارید!")
         return
     db.update_size(target_user_id, chat_id, amount)
     
@@ -1117,7 +1229,7 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     text = update.message.text
@@ -1125,23 +1237,23 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, initiator_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     today_str = tehran_today_str()
     if initiator_last_grown != today_str:
-        await update.message.reply_text("فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن اجماع راه بندازن!")
+        await reply_temp(update, context, "فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن اجماع راه بندازن!")
         return
 
     target_user_id, target_first_name = get_target_user(update, text, chat_id)
 
     if not target_user_id:
-        await update.message.reply_text("استفاده صحیح:\n/ejma @username\nیا ریپلای کردن روی پیام شخص و تایپ /ejma")
+        await reply_temp(update, context, "استفاده صحیح:\n/ejma @username\nیا ریپلای کردن روی پیام شخص و تایپ /ejma")
         return
 
     if target_user_id == user.id:
-        await update.message.reply_text("نمی‌توانید علیه خودتان اجماع کنید!")
+        await reply_temp(update, context, "نمی‌توانید علیه خودتان اجماع کنید!")
         return
 
     target_info = db.get_user_info(target_user_id, chat_id)
     target_size = target_info[1] if target_info else 0.0
     if target_size <= 0:
-        await update.message.reply_text(f"{target_first_name} سایز کافی برای اجماع ندارد!")
+        await reply_temp(update, context, f"{target_first_name} سایز کافی برای اجماع ندارد!")
         return
 
     # Consensus protection applies to everyone alike, the king included: back-to-back
@@ -1151,7 +1263,7 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remaining = db.get_consensus_protection_remaining(chat_id, target_user_id)
     if remaining is not None:
         hours = max(1, int(remaining.total_seconds() // 3600))
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"{target_first_name} در حال حاضر در برابر اجماع محافظت‌شده است! تا حدود {hours} ساعت دیگر نمی‌شود دوباره علیه او اجماع کرد."
         )
         return
@@ -1161,26 +1273,26 @@ async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, elapsed_seconds = existing_open
         if elapsed_seconds >= CONSENSUS_VOTE_WINDOW_SECONDS:
             db.fail_open_consensus(chat_id, target_user_id, target_first_name)
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 f"اجماع قبلی علیه {target_first_name} به حد نصاب رای نرسیده بود و شکست خورد!\n"
                 f"تا ۳ روز دیگر نمی‌شود علیه او اجماع جدیدی راه انداخت."
             )
         else:
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 f"یک اجماع علیه {target_first_name} هم‌اکنون در حال رای‌گیری است! صبر کنید تا نتیجه‌اش مشخص شود."
             )
         return
 
     player_count = db.get_active_today_count(chat_id, today_str)
     if db.is_jester(user.id, chat_id):
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "🤡 تو دلقک درباری! پادشاه اجماع قبلیت رو منحل کرد.\n"
             "تا وقتی دلقکی نمی‌تونی اجماع راه بندازی."
         )
         return
 
     if player_count < MIN_CONSENSUS_PLAYERS:
-        await update.message.reply_text(f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} نفر که امروز دودولشونو مالیدن نیاز است!")
+        await reply_temp(update, context, f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} نفر که امروز دودولشونو مالیدن نیاز است!")
         return
 
     required_votes = player_count // 2 + 1
@@ -1334,11 +1446,11 @@ async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     user_size, _, user_perk = db.get_user(user.id, chat_id, None, None)
     if user_perk == "حرومزاده":
-        await update.message.reply_text("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش ایجاد کنید.")
+        await reply_temp(update, context, "شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش ایجاد کنید.")
         return
 
     if db.is_in_heist_prison(user.id, chat_id):
-        await update.message.reply_text("⛓ تو زندان بانکی، نمی‌تونی چالش بدی!")
+        await reply_temp(update, context, "⛓ تو زندان بانکی، نمی‌تونی چالش بدی!")
         return
 
     # جقی deliberately does NOT touch the stake here. Its description promises a wild
@@ -1347,7 +1459,7 @@ async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # were warned about did something else entirely - and, because the old roll was
     # randint(bet/2, 2*bet), it quietly inflated the average stake by 25%.
     if user_size < bet:
-        await update.message.reply_text(f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه ندارید! سایز فعلی شما: {int(user_size)}")
+        await reply_temp(update, context, f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه ندارید! سایز فعلی شما: {int(user_size)}")
         return
         
     keyboard = [[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=build_challenge_data(user.id, bet))]]
@@ -2850,7 +2962,7 @@ async def announce_coronation(context, chat_id, new_king, old_king_name):
 async def king_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     before = db.get_kingdom(chat_id)
@@ -2858,7 +2970,7 @@ async def king_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if new_king:
         await announce_coronation(context, chat_id, new_king, before[1] if before else None)
     if not kingdom or not kingdom[0]:
-        await update.message.reply_text("هنوز هیچکس تو این گروه تاج نگرفته! اول یه کم رشد کنید.")
+        await reply_lookup(update, context, "هنوز هیچکس تو این گروه تاج نگرفته! اول یه کم رشد کنید.")
         return
 
     king_id, king_name, consort_id, consort_name, _, _ = kingdom
@@ -2877,7 +2989,7 @@ async def king_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• روزانه {int(KING_TAX_RATIO * 100)}٪ از سایز هر بازیکن به پادشاه می‌رسه\n"
             f"• پادشاه تو چالش دو برابر ضرر می‌کنه\n"
             f"• سپر ۳ روزهٔ اجماع برای پادشاه کار نمی‌کنه")
-    await update.message.reply_text(msg)
+    await reply_lookup(update, context, msg)
 
 
 async def consort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2886,7 +2998,7 @@ async def consort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -2896,23 +3008,23 @@ async def consort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await announce_coronation(context, chat_id, new_king, None)
     if not kingdom or kingdom[0] != user.id:
         king_name = kingdom[1] if kingdom and kingdom[1] else "کسی"
-        await update.message.reply_text(f"فقط پادشاه می‌تونه همسر انتخاب کنه! الان {king_name} پادشاهه 👑")
+        await reply_temp(update, context, f"فقط پادشاه می‌تونه همسر انتخاب کنه! الان {king_name} پادشاهه 👑")
         return
 
     target_id, target_name = get_target_user(update, update.message.text, chat_id)
     if not target_id:
-        await update.message.reply_text("استفاده صحیح:\n/hamsar @username\nیا ریپلای روی پیام شخص و تایپ /hamsar")
+        await reply_temp(update, context, "استفاده صحیح:\n/hamsar @username\nیا ریپلای روی پیام شخص و تایپ /hamsar")
         return
     if target_id == user.id:
-        await update.message.reply_text("نمی‌تونی با خودت ازدواج کنی! 😐")
+        await reply_temp(update, context, "نمی‌تونی با خودت ازدواج کنی! 😐")
         return
     if db.is_traitor(target_id, chat_id):
-        await update.message.reply_text(f"{target_name} خائنه! تا چند روز هیچ پادشاهی قبولش نمی‌کنه 🗡️")
+        await reply_temp(update, context, f"{target_name} خائنه! تا چند روز هیچ پادشاهی قبولش نمی‌کنه 🗡️")
         return
 
     today_str = tehran_today_str()
     if not db.set_consort(chat_id, user.id, target_id, target_name, today_str):
-        await update.message.reply_text("امروز یه بار همسر انتخاب کردی! فردا دوباره می‌تونی.")
+        await reply_temp(update, context, "امروز یه بار همسر انتخاب کردی! فردا دوباره می‌تونی.")
         return
 
     await update.message.reply_text(
@@ -2929,19 +3041,19 @@ async def divorce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     kingdom = db.get_kingdom(chat_id)
     if not kingdom or kingdom[0] != user.id:
-        await update.message.reply_text("فقط پادشاه می‌تونه طلاق بده!")
+        await reply_temp(update, context, "فقط پادشاه می‌تونه طلاق بده!")
         return
     if not kingdom[2]:
-        await update.message.reply_text("تو که همسری نداری 😐")
+        await reply_temp(update, context, "تو که همسری نداری 😐")
         return
     consort_name = kingdom[3]
     if not db.clear_consort(chat_id):
-        await update.message.reply_text("تو که همسری نداری 😐")
+        await reply_temp(update, context, "تو که همسری نداری 😐")
         return
     await update.message.reply_text(
         f"💔 پادشاه {user.first_name} همسرش {consort_name} رو طلاق داد و از قصر انداخت بیرون!"
@@ -2954,26 +3066,26 @@ async def betray_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     db.get_user(user.id, chat_id, user.username, user.first_name)
 
     kingdom = db.get_kingdom(chat_id)
     if not kingdom or kingdom[2] != user.id:
-        await update.message.reply_text("تو همسر پادشاه نیستی که بخوای خیانت کنی! 😏")
+        await reply_temp(update, context, "تو همسر پادشاه نیستی که بخوای خیانت کنی! 😏")
         return
     king_id, king_name = kingdom[0], kingdom[1]
 
     lover_id, lover_name = get_target_user(update, update.message.text, chat_id)
     if not lover_id:
-        await update.message.reply_text("با کی می‌خوای بری؟\n/khianat @username")
+        await reply_temp(update, context, "با کی می‌خوای بری؟\n/khianat @username")
         return
     if lover_id == king_id:
-        await update.message.reply_text("با خودِ پادشاه که نمی‌شه بهش خیانت کرد 😐")
+        await reply_temp(update, context, "با خودِ پادشاه که نمی‌شه بهش خیانت کرد 😐")
         return
     if lover_id == user.id:
-        await update.message.reply_text("با خودت؟ 😐")
+        await reply_temp(update, context, "با خودت؟ 😐")
         return
 
     king_info = db.get_user_info(king_id, chat_id)
@@ -2983,7 +3095,7 @@ async def betray_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.try_deduct_size(king_id, chat_id, loot):
         loot = max(0, int(king_size))
         if loot <= 0 or not db.try_deduct_size(king_id, chat_id, loot):
-            await update.message.reply_text("خزانهٔ پادشاه خالیه! چیزی برای بردن نیست 😂")
+            await reply_temp(update, context, "خزانهٔ پادشاه خالیه! چیزی برای بردن نیست 😂")
             return
 
     traitor_cut = loot // 2
@@ -3053,40 +3165,40 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
 
     if db.is_in_heist_prison(user.id, chat_id):
-        await update.message.reply_text("⛓ تو زندان بانکی، نمی‌تونی دزدی کنی!")
+        await reply_temp(update, context, "⛓ تو زندان بانکی، نمی‌تونی دزدی کنی!")
         return
 
     # Same gate /ejma uses: only people actually playing today can move other people's
     # size around, so a throwaway account can't be spun up purely to rob someone.
     if thief_last_grown != tehran_today_str():
-        await update.message.reply_text("اول باید امروز دودولت رو بمالی (/d) بعد بری دزدی! 🥷")
+        await reply_temp(update, context, "اول باید امروز دودولت رو بمالی (/d) بعد بری دزدی! 🥷")
         return
 
     target_id, target_name = get_target_user(update, update.message.text, chat_id)
     if not target_id:
-        await update.message.reply_text("از کی می‌خوای بدزدی؟\n/dozdi @username\nیا ریپلای روی پیامش و تایپ /dozdi")
+        await reply_temp(update, context, "از کی می‌خوای بدزدی؟\n/dozdi @username\nیا ریپلای روی پیامش و تایپ /dozdi")
         return
     if target_id == user.id:
-        await update.message.reply_text("از جیب خودت؟ 😐")
+        await reply_temp(update, context, "از جیب خودت؟ 😐")
         return
 
     target_info = db.get_user_info(target_id, chat_id)
     target_size = (target_info[1] if target_info else 0) or 0
     if target_size < THEFT_MIN_TARGET_SIZE:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"{target_name} فقیرتر از اونیه که ازش بدزدی! (حداقل {THEFT_MIN_TARGET_SIZE} سانت لازمه)"
         )
         return
 
     kingdom, _ = refresh_king(chat_id)
     if kingdom and kingdom[2] == target_id:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🛡️ {target_name} همسر پادشاهه و گارد سلطنتی نمی‌ذاره بهش دست بزنی!"
         )
         return
@@ -3095,7 +3207,7 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, remaining = db.try_start_theft(user.id, chat_id, cooldown)
     if not ok:
         hours, minutes = remaining // 3600, (remaining % 3600) // 60
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"تازه دزدی کردی! تا {hours} ساعت و {minutes} دقیقهٔ دیگه دستت بستس 🥷"
         )
         return
@@ -3166,7 +3278,7 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if db.use_inventory(target_id, chat_id, "قفل"):
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🔒 {target_name} قفل داشت!\n{user.first_name} به در بسته خورد و دست خالی برگشت.\n"
             f"(قفل {target_name} مصرف شد){item_note}"
         )
@@ -3174,7 +3286,7 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if random.random() < chance:
         if not db.try_deduct_size(target_id, chat_id, loot):
-            await update.message.reply_text(f"{target_name} همین الان سایزش کم شد؛ دزدی بی‌نتیجه موند!")
+            await reply_temp(update, context, f"{target_name} همین الان سایزش کم شد؛ دزدی بی‌نتیجه موند!")
             return
         # The vault takes its cut. Stolen size stays inside the group either way, but a
         # slice of it now funds everyone's deposit interest instead of all landing on
@@ -3318,7 +3430,7 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("بانک فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "بانک فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -3353,7 +3465,7 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🥷 خزانه و سپرده‌ها با /sarghat قابل سرقتن!\n\n"
         f"دستورها: /variz &lt;مقدار&gt; • /bardasht &lt;مقدار&gt; • /sarghat • /markazi"
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await reply_lookup(update, context, msg, parse_mode="HTML")
 
 
 async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3361,7 +3473,7 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("بانک فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "بانک فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -3373,19 +3485,19 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     amount = _parse_amount(update.message.text.split(), wallet, balance, 'deposit')
     if amount is None:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"چقدر می‌خوای بریزی تو بانک؟\n/variz 50\n\n"
             f"💼 جیبت: {int(wallet)} سانت\n📥 امروز تا {remaining} سانت می‌تونی بریزی."
         )
         return
     if amount < BANK_MIN_DEPOSIT:
-        await update.message.reply_text(f"حداقل واریز {BANK_MIN_DEPOSIT} سانته.")
+        await reply_temp(update, context, f"حداقل واریز {BANK_MIN_DEPOSIT} سانته.")
         return
     # Clamp to the allowance instead of rejecting, so "/variz همه" does the sensible thing.
     if amount > remaining:
         amount = remaining
     if amount < BANK_MIN_DEPOSIT:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"سقف واریز امروزت پر شده! 📥\nفردا دوباره تا {cap} سانت می‌تونی بریزی.\n"
             f"(یه‌جا نمی‌شه همه‌چیو ریخت تو بانک — بخشیش باید تو جیبت بمونه.)"
         )
@@ -3395,9 +3507,9 @@ async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                          fee_of(chat_id, BANK_DEPOSIT_FEE_RATIO))
     if not ok:
         if res == 'cap':
-            await update.message.reply_text(f"سقف واریز امروزت پر شده! فردا دوباره تا {cap} سانت.")
+            await reply_temp(update, context, f"سقف واریز امروزت پر شده! فردا دوباره تا {cap} سانت.")
         else:
-            await update.message.reply_text(f"جیبت این‌قدر سانت نداره! 💼 {int(wallet)} سانت داری.")
+            await reply_temp(update, context, f"جیبت این‌قدر سانت نداره! 💼 {int(wallet)} سانت داری.")
         return
     wallet_now, _, _ = db.get_user(user.id, chat_id, None, None)
     await update.message.reply_text(
@@ -3414,7 +3526,7 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("بانک فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "بانک فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -3422,12 +3534,12 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     amount = _parse_amount(update.message.text.split(), wallet, balance, 'withdraw')
     if amount is None:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"چقدر برداریم؟\n/bardasht 50  یا  /bardasht همه\n\n🔒 موجودی بانکت: {int(balance)} سانت"
         )
         return
     if balance <= 0:
-        await update.message.reply_text("چیزی تو بانک نداری! 🏦")
+        await reply_temp(update, context, "چیزی تو بانک نداری! 🏦")
         return
     if amount > balance:
         amount = int(balance)
@@ -3439,7 +3551,7 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # The saver has the balance; the BANK doesn't have the cash, because it is
             # sitting inside somebody's /vam loan. Say so plainly rather than implying
             # they're broke.
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 f"🚨 <b>بانک نقدینگی کافی نداره!</b>\n\n"
                 f"پولت سرجاشه، ولی الان بخش زیادی از سپرده‌ها دست وام‌گیرنده‌هاست.\n"
                 f"💵 حداکثری که همین الان می‌شه برداشت: <b>{int(paid_out)}</b> سانت\n\n"
@@ -3447,7 +3559,7 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
             return
-        await update.message.reply_text("موجودی بانکت کافی نیست!")
+        await reply_temp(update, context, "موجودی بانکت کافی نیست!")
         return
     wallet_now, _, _ = db.get_user(user.id, chat_id, None, None)
     await update.message.reply_text(
@@ -3469,7 +3581,7 @@ async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     see that it isn't."""
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "این دستور فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     cb = db.get_central_bank()
@@ -3520,7 +3632,7 @@ async def central_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"\n🏛 نرخ وام بانکی الان: {bank_loan_rate(chat_id)*100:.0f}٪ "
                  f"(+{int(BANK_LOAN_ORIGINATION_RATIO*100)}٪ کارمزد صدور)")
     lines.append("سود سپرده‌ها رو بهرهٔ وام‌گیرنده‌ها و کارمزدها می‌ده — نه یه صندوق جادویی.")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_lookup(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 def _fmt_days_hours(delta):
@@ -3570,7 +3682,7 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("سرقت از بانک فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "سرقت از بانک فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -3578,10 +3690,10 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(datetime.timezone.utc)
     prison_until, labor_until, bail_amount = db.get_heist_status(user.id, chat_id)
     if prison_until and prison_until > now:
-        await update.message.reply_text(_heist_prison_reply(prison_until, labor_until, bail_amount, now))
+        await reply_temp(update, context, _heist_prison_reply(prison_until, labor_until, bail_amount, now))
         return
     if labor_until and labor_until > now:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🔨 هنوز داری بدهیت به پادشاه رو کار می‌کنی (تا {_fmt_days_hours(labor_until - now)} دیگه) "
             f"— تا اون‌موقع نمی‌تونی دوباره سرقت کنی."
         )
@@ -3590,17 +3702,17 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # The king cannot rob his own kingdom's bank.
     kingdom, _ = refresh_king(chat_id)
     if kingdom and kingdom[0] == user.id:
-        await update.message.reply_text("👑 پادشاه که خودش صاحب کل مملکته، نمی‌تونه از بانک خودش بدزده!")
+        await reply_temp(update, context, "👑 پادشاه که خودش صاحب کل مملکته، نمی‌تونه از بانک خودش بدزده!")
         return
 
     # Same gate as /dozdi: you have to actually be playing today to move other people's size.
     if thief_last_grown != tehran_today_str():
-        await update.message.reply_text("اول امروز /d بزن بعد برو سراغ بانک! 🥷")
+        await reply_temp(update, context, "اول امروز /d بزن بعد برو سراغ بانک! 🥷")
         return
 
     partner_id, partner_name = get_target_user(update, update.message.text, chat_id)
     if not partner_id:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "🥷 سرقت از بانک تک‌نفره نیست!\n\n"
             "یکی رو به‌عنوان شریک انتخاب کن: <code>/sarghat @username</code> "
             "(یا روی پیامش ریپلای کن)\n\n"
@@ -3610,20 +3722,20 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if partner_id == user.id:
-        await update.message.reply_text("با خودت که نمی‌تونی شریک بشی! 🙄")
+        await reply_temp(update, context, "با خودت که نمی‌تونی شریک بشی! 🙄")
         return
     if kingdom and kingdom[0] == partner_id:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "👑 پادشاه شریک دزدی از خزانهٔ خودش نمی‌شه!"
         )
         return
 
     _psize, partner_last_grown, _pperk = db.get_user(partner_id, chat_id, None, partner_name)
     if db.is_in_heist_prison(partner_id, chat_id):
-        await update.message.reply_text(f"{partner_name} الان تو زندان بانکه — شریک دیگه‌ای پیدا کن.")
+        await reply_temp(update, context, f"{partner_name} الان تو زندان بانکه — شریک دیگه‌ای پیدا کن.")
         return
     if partner_last_grown != tehran_today_str():
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"{partner_name} امروز هنوز /d نزده — یه شریک که تو بازی نیست به چه دردت می‌خوره؟"
         )
         return
@@ -3643,7 +3755,7 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # single most confusing message in the game: the treasury IS one pot, but what a
         # heist reaches is this group's weight-bounded claim on it.
         total_reserve = db.get_central_bank()['reserve']
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🏦 اینجا چیزی برای بردن نیست ({int(vault)} سانت).\n\n"
             f"خزانه یکیه و کل بات <b>{int(total_reserve)}</b> سانت توشه — ولی سرقت فقط به "
             f"<b>سهم این گروه</b> می‌رسه، نه به کل خزانه:\n"
@@ -3663,7 +3775,7 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, remaining = db.try_start_heist(chat_id, HEIST_COOLDOWN_SECONDS)
     if not ok:
         left = _fmt_days_hours(datetime.timedelta(seconds=remaining))
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🚨 بانک هنوز تو حالت آماده‌باشه!\nتا {left} دیگه کسی نمی‌تونه بزنه بهش."
         )
         return
@@ -4213,14 +4325,14 @@ async def heist_bail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     ok, result = db.pay_heist_bail(user.id, chat_id)
     if not ok:
         if result == 'funds':
-            await update.message.reply_text("این‌قدر سانت برای وثیقه نداری!")
+            await reply_temp(update, context, "این‌قدر سانت برای وثیقه نداری!")
         else:
-            await update.message.reply_text("تو الان تو زندان بانک نیستی!")
+            await reply_temp(update, context, "تو الان تو زندان بانک نیستی!")
         return
     await update.message.reply_text(
         f"🔓 وثیقهٔ {int(result)} سانتی پرداخت شد و از زندان بانک آزاد شدی!\n"
@@ -4238,7 +4350,7 @@ async def heist_pardon_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -4248,25 +4360,25 @@ async def heist_pardon_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await announce_coronation(context, chat_id, new_king, None)
     if not kingdom or kingdom[0] != user.id:
         king_name = kingdom[1] if kingdom and kingdom[1] else "کسی"
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"فقط پادشاه می‌تونه زندانی بانک رو ببخشه! الان {king_name} پادشاهه 👑"
         )
         return
 
     target_id, target_name = get_target_user(update, update.message.text, chat_id)
     if not target_id:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "استفاده صحیح:\n/afv @username\nیا ریپلای روی پیام شخص و تایپ /afv"
         )
         return
     # A jailed player can still hold the crown (prison stops them growing, not being
     # biggest), so without this a king could simply pardon himself out of his own prison.
     if target_id == user.id:
-        await update.message.reply_text("خودت رو که نمی‌تونی ببخشی! 😐")
+        await reply_temp(update, context, "خودت رو که نمی‌تونی ببخشی! 😐")
         return
 
     if not db.pardon_heist_prisoner(target_id, chat_id):
-        await update.message.reply_text(f"{target_name} الان نه زندانه نه بدهی کاری داره.")
+        await reply_temp(update, context, f"{target_name} الان نه زندانه نه بدهی کاری داره.")
         return
 
     await update.message.reply_text(
@@ -4490,12 +4602,12 @@ async def crypto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/crypto` - the market board: every coin, its price, and the last minute's move."""
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     rows = db.crypto_all()
     if not rows:
-        await update.message.reply_text("بازار هنوز باز نشده!")
+        await reply_lookup(update, context, "بازار هنوز باز نشده!")
         return
     held = {sym: (amt, avg) for sym, amt, avg in
             db.crypto_holdings_of(update.effective_user.id, chat_id)}
@@ -4535,7 +4647,7 @@ async def crypto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 /frush &lt;کوین&gt; &lt;سانت|همه&gt;",
         "📊 /portfo — سبد من",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_lookup(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4543,7 +4655,7 @@ async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -4551,7 +4663,7 @@ async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split()
     cap = _crypto_daily_cap(wallet)
     if len(parts) < 3:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🛒 خرید کریپتو\n\n/kharid <کوین> <مقدار سانت>\n"
             f"مثال: /kharid بیت‌کیر 100\n\n"
             f"سقف خرید امروزت: {cap} سانت\nلیست کوین‌ها: /crypto"
@@ -4559,14 +4671,14 @@ async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     coin = _crypto_find(rows, parts[1])
     if coin is None:
-        await update.message.reply_text("همچین کوینی نداریم! لیست: /crypto")
+        await reply_temp(update, context, "همچین کوینی نداریم! لیست: /crypto")
         return
     try:
         spend = int(float(parts[2]))
     except ValueError:
         spend = 0
     if spend < CRYPTO_MIN_TRADE:
-        await update.message.reply_text(f"حداقل خرید {CRYPTO_MIN_TRADE} سانته.")
+        await reply_temp(update, context, f"حداقل خرید {CRYPTO_MIN_TRADE} سانته.")
         return
 
     sym, name = coin[0], coin[1]
@@ -4578,16 +4690,16 @@ async def crypto_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not res[0]:
         reason, extra = res[1], res[2]
         if reason == 'cap':
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 f"سقف خرید روزانه‌ت پر شده!\nباقی‌مونده: {int(extra)} از {cap} سانت"
             )
         elif reason == 'funds':
             need = int(round(spend * (1 + CRYPTO_FEE_RATIO)))
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 f"سانت کافی نداری! با کارمزد {need} سانت لازمه، تو {int(wallet)} داری."
             )
         else:
-            await update.message.reply_text("مقدار نامعتبره!")
+            await reply_temp(update, context, "مقدار نامعتبره!")
         return
 
     _ok, units, price, total, fee, new_amount, new_avg = res
@@ -4615,27 +4727,27 @@ async def crypto_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     db.get_user(user.id, chat_id, user.username, user.first_name)
     rows = db.crypto_all()
     parts = update.message.text.split()
     if len(parts) < 3:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "💰 فروش کریپتو\n\n/frush <کوین> <مقدار سانت یا «همه»>\n"
             "مثال: /frush بیت‌کیر 100\nمثال: /frush بیت‌کیر همه"
         )
         return
     coin = _crypto_find(rows, parts[1])
     if coin is None:
-        await update.message.reply_text("همچین کوینی نداریم! لیست: /crypto")
+        await reply_temp(update, context, "همچین کوینی نداریم! لیست: /crypto")
         return
     sym, name = coin[0], coin[1]
     price = crypto_display_price(coin[2], coin[4], coin[6])
     holding = dict((s, (a, c)) for s, a, c in db.crypto_holdings_of(user.id, chat_id)).get(sym)
     if not holding or holding[0] <= 0:
-        await update.message.reply_text(f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
+        await reply_temp(update, context, f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
         return
     held_units = float(holding[0])
 
@@ -4646,10 +4758,10 @@ async def crypto_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             want = float(raw)
         except ValueError:
-            await update.message.reply_text("مقدار نامعتبره!")
+            await reply_temp(update, context, "مقدار نامعتبره!")
             return
         if want < CRYPTO_MIN_TRADE:
-            await update.message.reply_text(f"حداقل فروش {CRYPTO_MIN_TRADE} سانته.")
+            await reply_temp(update, context, f"حداقل فروش {CRYPTO_MIN_TRADE} سانته.")
             return
         units = min(held_units, round(want / price, 6))
 
@@ -4657,13 +4769,13 @@ async def crypto_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          CRYPTO_IMPACT_DEPTH, CRYPTO_IMPACT_CAP)
     if not res[0]:
         if res[1] == 'liquidity':
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 "🏜 بازار نقدینگی نداره!\n\n"
                 "خزانهٔ گروه الان اون‌قدر سانت نداره که این فروش رو بخره. "
                 "کمتر بفروش، یا صبر کن خزانه از کارمزدها پر بشه."
             )
         else:
-            await update.message.reply_text(f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
+            await reply_temp(update, context, f"تو اصلاً {_esc(name)} نداری!", parse_mode="HTML")
         return
 
     _ok, sold, fill_price, net, fee, pnl, left = res
@@ -4694,14 +4806,14 @@ async def crypto_portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "بازار کریپتو فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     wallet, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
     prices = {r[0]: (r[1], crypto_display_price(r[2], r[4], r[6])) for r in db.crypto_all()}
     holdings = db.crypto_holdings_of(user.id, chat_id)
     if not holdings:
-        await update.message.reply_text(
+        await reply_lookup(update, context,
             "📊 سبد تو خالیه!\n\nبا /crypto بازار رو ببین و با /kharid بخر."
         )
         return
@@ -4731,7 +4843,7 @@ async def crypto_portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         "",
         "⚠️ ارزش سبد تو لیدربرد و تاج حساب نمی‌شه — تا نفروشیش سایز نیست.",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_lookup(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------- loan commands
@@ -4758,26 +4870,26 @@ async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("نزول فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "نزول فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     lender_size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
 
     target_id, target_name = get_target_user(update, update.message.text, chat_id)
     if not target_id:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "به کی می‌خوای نزول بدی؟\n"
             "/nozul @username <مقدار> <درصد>\n"
             "مثال: /nozul @ali 100 25  →  ۱۰۰ سانت قرض بده، ۱۲۵ پس بگیر"
         )
         return
     if target_id == user.id:
-        await update.message.reply_text("به خودت نزول بدی؟ 😐")
+        await reply_temp(update, context, "به خودت نزول بدی؟ 😐")
         return
 
     nums = [p for p in update.message.text.split()[1:] if p.lstrip('-').replace('.', '', 1).isdigit()]
     if len(nums) < 2:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "مقدار و درصد رو بگو!\n/nozul @username <مقدار> <درصد>\n"
             f"درصد بین {int(NOZUL_MIN_RATE*100)} تا {int(NOZUL_MAX_RATE*100)}."
         )
@@ -4785,20 +4897,20 @@ async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         principal = int(float(nums[0])); rate_pct = float(nums[1])
     except ValueError:
-        await update.message.reply_text("عدد نامعتبره!")
+        await reply_temp(update, context, "عدد نامعتبره!")
         return
 
     if principal < LOAN_MIN_PRINCIPAL:
-        await update.message.reply_text(f"حداقل مبلغ نزول {LOAN_MIN_PRINCIPAL} سانته.")
+        await reply_temp(update, context, f"حداقل مبلغ نزول {LOAN_MIN_PRINCIPAL} سانته.")
         return
     if lender_size < principal:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"خودت این‌قدر سانت نداری! 💼 {int(lender_size)} سانت داری."
         )
         return
     rate = rate_pct / 100.0
     if not (NOZUL_MIN_RATE - 1e-9 <= rate <= NOZUL_MAX_RATE + 1e-9):
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"درصد باید بین {int(NOZUL_MIN_RATE*100)} تا {int(NOZUL_MAX_RATE*100)} باشه."
         )
         return
@@ -4807,7 +4919,7 @@ async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     b_score, b_repaid, b_late, b_defaults = db.get_credit(target_id, chat_id)
     max_principal = _credit_cap(borrower_size, b_score)
     if principal > max_principal:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"بیشتر از توانِ {_esc(target_name)} نمی‌شه بهش قرض داد!\n"
             f"سقف براش الان <b>{max_principal}</b> سانته "
             f"(سایز {int(borrower_size)} × ضریب اعتبار {_credit_factor(b_score):.2f}).\n"
@@ -4816,10 +4928,10 @@ async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if db.count_active_loans(chat_id, target_id, as_lender=False) >= LOAN_MAX_BORROWER_LOANS:
-        await update.message.reply_text(f"{target_name} همین الان بدهی باز داره؛ اول اونا رو تسویه کنه.")
+        await reply_temp(update, context, f"{target_name} همین الان بدهی باز داره؛ اول اونا رو تسویه کنه.")
         return
     if db.count_active_loans(chat_id, user.id, as_lender=True) >= LOAN_MAX_LENDER_LOANS:
-        await update.message.reply_text("تو همین الان کلی نزول باز داری! اول جمعشون کن.")
+        await reply_temp(update, context, "تو همین الان کلی نزول باز داری! اول جمعشون کن.")
         return
 
     loan_id, due_amount = db.create_loan_offer(
@@ -4901,7 +5013,7 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("وام فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "وام فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -4911,7 +5023,7 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # The official bank is the strict lender: bad credit is refused outright rather
     # than priced. Loan sharks are still an option, which is the point.
     if score < BANK_LOAN_MIN_SCORE:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🏛 بانک به تو وام نمی‌ده!\n\n"
             f"📊 امتیاز اعتباریت: <b>{score}</b>/200 — {_credit_grade(score)}\n"
             f"حداقل لازم برای وام بانکی: {BANK_LOAN_MIN_SCORE}\n\n"
@@ -4932,7 +5044,7 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             amount = None
     if amount is None or amount <= 0:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🏛 وام رسمی بانک\n\n"
             f"نرخ: {loan_rate*100:.0f}٪ — سررسید {LOAN_TERM_DAYS} روز\n"
             f"🧾 کارمزد صدور: {int(BANK_LOAN_ORIGINATION_RATIO*100)}٪ (از مبلغ وام کم می‌شه)\n"
@@ -4944,17 +5056,17 @@ async def vam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if amount < LOAN_MIN_PRINCIPAL:
-        await update.message.reply_text(f"حداقل وام {LOAN_MIN_PRINCIPAL} سانته.")
+        await reply_temp(update, context, f"حداقل وام {LOAN_MIN_PRINCIPAL} سانته.")
         return
     if amount > ceiling:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"سقف وام تو الان {ceiling} سانته.\n"
             f"(سایز {int(size)} × ضریب اعتبار {_credit_factor(score):.2f}، "
             f"و ظرفیت وام‌دهی بانک: {int(cb['lendable'])} سانت)"
         )
         return
     if db.count_active_loans(chat_id, user.id, as_lender=False) >= LOAN_MAX_BORROWER_LOANS:
-        await update.message.reply_text("بدهی بازِ زیادی داری! اول تسویه کن.")
+        await reply_temp(update, context, "بدهی بازِ زیادی داری! اول تسویه کن.")
         return
 
     loan_id, due_amount = db.create_loan_offer(
@@ -5014,7 +5126,7 @@ async def debts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "این دستور فقط داخل گروه‌ها کار می‌کند!")
         return
     borrowed, lent = db.get_user_loans(chat_id, user.id)
     score, repaid, late, defaults = db.get_credit(user.id, chat_id)
@@ -5039,7 +5151,7 @@ async def debts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n⚠️ سابقه: {defaults} نکول، {late} تأخیر")
     if borrowed:
         lines.append("\nبرای تسویهٔ زودتر: /pardakht &lt;شماره&gt;")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_lookup(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5048,11 +5160,11 @@ async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "این دستور فقط داخل گروه‌ها کار می‌کند!")
         return
     borrowed, _ = db.get_user_loans(chat_id, user.id)
     if not borrowed:
-        await update.message.reply_text("بدهی‌ای نداری! 😇")
+        await reply_temp(update, context, "بدهی‌ای نداری! 😇")
         return
 
     parts = update.message.text.split()
@@ -5062,17 +5174,17 @@ async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif len(borrowed) == 1:
         loan_id = borrowed[0][0]
     if loan_id is None:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "کدوم بدهی رو تسویه کنم؟ با /bedehi شماره‌ها رو ببین، بعد /pardakht <شماره>"
         )
         return
     if loan_id not in [b[0] for b in borrowed]:
-        await update.message.reply_text("این شماره جزو بدهی‌های باز تو نیست!")
+        await reply_temp(update, context, "این شماره جزو بدهی‌های باز تو نیست!")
         return
 
     result = db.settle_loan(loan_id, forced=False, today_str=tehran_today_str())
     if not result:
-        await update.message.reply_text("این بدهی همین الان تسویه شد!")
+        await reply_temp(update, context, "این بدهی همین الان تسویه شد!")
         return
     who = "بانک" if result['lender_id'] is None else result['lender_name']
     extra = ""
@@ -5179,7 +5291,7 @@ async def credit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("اعتبارسنجی فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "اعتبارسنجی فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -5190,14 +5302,14 @@ async def credit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not db.charge_credit_check(user.id, chat_id, CREDIT_CHECK_FEE):
         size, _, _ = db.get_user(user.id, chat_id, None, None)
-        await update.message.reply_text(
+        await reply_lookup(update, context,
             f"اعتبارسنجی {CREDIT_CHECK_FEE} سانت هزینه داره و تو {int(size)} سانت داری!"
         )
         return
 
     score, repaid, late, defaults = db.get_credit(target_id, chat_id)
     t_size = (db.get_user_info(target_id, chat_id) or (None, 0))[1] or 0
-    await update.message.reply_text(
+    await reply_lookup(update, context,
         _credit_report(target_name, score, repaid, late, defaults, t_size)
         + f"\n\n🧾 هزینهٔ اعتبارسنجی: {CREDIT_CHECK_FEE} سانت → خزانه",
         parse_mode="HTML"
@@ -5346,15 +5458,15 @@ async def decree_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("فرمان سلطنتی فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "فرمان سلطنتی فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     kingdom, _ = refresh_king(chat_id)
     if not kingdom or not kingdom[0]:
-        await update.message.reply_text("این گروه هنوز پادشاه نداره! با /king ببین چطور تاج می‌گیرن.")
+        await reply_temp(update, context, "این گروه هنوز پادشاه نداره! با /king ببین چطور تاج می‌گیرن.")
         return
     if user.id != kingdom[0]:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"فقط پادشاه ({_esc(kingdom[1] or '?')}) می‌تونه فرمان بده! 👑", parse_mode="HTML"
         )
         return
@@ -5370,7 +5482,7 @@ async def decree_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     econ = db.get_economy(chat_id)
     full = db.get_economy_full(chat_id)
     if full and full[6] == today_str:
-        await update.message.reply_text("امروز فرمانت رو امضا کردی! فردا دوباره. 👑")
+        await reply_temp(update, context, "امروز فرمانت رو امضا کردی! فردا دوباره. 👑")
         return
     await update.message.reply_text(
         _render_decree_offer(kingdom[1] or '?', codes, econ),
@@ -5453,7 +5565,7 @@ async def economy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doing to them."""
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "این دستور فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     full = db.get_economy_full(chat_id)
@@ -5497,18 +5609,18 @@ async def economy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif inflation < 0.9:
         lines.append("\n💡 قیمت‌ها پایینه: پس‌انداز می‌ارزه، بدهی سنگین‌تر شده.")
     lines.append("\nتاریخچه: /farmanha")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_lookup(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def decree_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/farmanha` - what past kings actually did, so a record follows them around."""
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "این دستور فقط داخل گروه‌ها کار می‌کند!")
         return
     rows = db.get_decree_history(chat_id, 12)
     if not rows:
-        await update.message.reply_text("هنوز هیچ فرمانی امضا نشده.")
+        await reply_lookup(update, context, "هنوز هیچ فرمانی امضا نشده.")
         return
     lines = ["📜 <b>دفتر فرمان‌ها</b>", ""]
     for date, king_name, title, kind, inf_b, inf_a, king_delta in rows:
@@ -5516,7 +5628,7 @@ async def decree_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         arrow = "📈" if (inf_a or 0) > (inf_b or 0) else ("📉" if (inf_a or 0) < (inf_b or 0) else "➖")
         lines.append(f"{mark} <b>{date}</b> — {_esc(king_name or '?')}: {_esc(title)}")
         lines.append(f"    {arrow} تورم {inf_b:.2f}→{inf_a:.2f} | 👑 {int(king_delta or 0):+d} سانت")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_lookup(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def economy_tick_job(context: ContextTypes.DEFAULT_TYPE):
@@ -5625,16 +5737,16 @@ async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("حکومت نظامی فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "حکومت نظامی فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
 
     kingdom, _ = refresh_king(chat_id)
     if not kingdom or not kingdom[0]:
-        await update.message.reply_text("این گروه پادشاه نداره!")
+        await reply_temp(update, context, "این گروه پادشاه نداره!")
         return
     if user.id != kingdom[0]:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"فقط پادشاه ({_esc(kingdom[1] or '?')}) می‌تونه حکومت نظامی اعلام کنه! 👑",
             parse_mode="HTML")
         return
@@ -5650,26 +5762,26 @@ async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not mine:
         if openv:
             others = "، ".join(_esc(v[2] or '?') for v in openv[:3])
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 f"🪖 حکومت نظامی فقط اجماعی رو منحل می‌کنه که <b>علیه خودت</b> باشه.\n\n"
                 f"الان اجماع‌های باز علیه: {others}\n"
                 f"اونا به تاج ربطی ندارن — بذار مردم کارشون رو بکنن. 🤷",
                 parse_mode="HTML")
         else:
-            await update.message.reply_text(
+            await reply_temp(update, context,
                 "الان هیچ اجماعی علیه تو باز نیست. 🤷\n"
                 "(حکومت نظامی فقط روی رأی‌گیریِ در جریانِ علیه پادشاه کار می‌کنه)")
         return
 
     vote_id, target_id, target_name, initiator_id, amount, _age = mine[0]
     if initiator_id == user.id:
-        await update.message.reply_text("اجماع رو خودت راه انداختی! می‌خوای خودت رو دلقک کنی؟ 🤡")
+        await reply_temp(update, context, "اجماع رو خودت راه انداختی! می‌خوای خودت رو دلقک کنی؟ 🤡")
         return
 
     ok, remaining = db.try_martial_law(chat_id, MARTIAL_COOLDOWN_SECONDS)
     if not ok:
         days, hours = remaining // 86400, (remaining % 86400) // 3600
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"⏳ حکومت نظامی هر ۳ روز یک بار!\nتا {days} روز و {hours} ساعت دیگه نمی‌تونی."
         )
         return
@@ -5677,7 +5789,7 @@ async def martial_law_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancelled = db.cancel_consensus(vote_id, chat_id)
     if not cancelled:
         db.release_martial_law(chat_id)
-        await update.message.reply_text("اون اجماع همین الان بسته شد!")
+        await reply_temp(update, context, "اون اجماع همین الان بسته شد!")
         return
     t_id, t_name, init_id, amt = cancelled
 
@@ -5713,17 +5825,17 @@ async def jesters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/dalghak` - who is currently wearing the motley, and for how much longer."""
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این دستور فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "این دستور فقط داخل گروه‌ها کار می‌کند!")
         return
     rows = db.get_jesters(chat_id)
     if not rows:
-        await update.message.reply_text("الان هیچ دلقکی تو دربار نیست. 🤷")
+        await reply_lookup(update, context, "الان هیچ دلقکی تو دربار نیست. 🤷")
         return
     lines = ["🤡 <b>دلقک‌های دربار</b>", ""]
     for _uid, name, secs in rows:
         h, m = int(secs) // 3600, (int(secs) % 3600) // 60
         lines.append(f"• {_esc(name)} — {h} ساعت و {m} دقیقه دیگه آزاد می‌شه")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await reply_lookup(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 def check_xfer_source(chat_id, user_id):
@@ -5787,13 +5899,13 @@ async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     players farmed size in a low-friction side group and imported it back, and the owner
     now flips it on/off (and sets the fee) from the admin panel, not from a code change."""
     if not db.is_xfer_enabled():
-        await update.message.reply_text("🔒 انتقال سایز بین گروه‌ها الان بسته‌ست.")
+        await reply_temp(update, context, "🔒 انتقال سایز بین گروه‌ها الان بسته‌ست.")
         return
 
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("انتقال بین‌گروهی فقط داخل گروه‌ها کار می‌کند!")
+        await reply_temp(update, context, "انتقال بین‌گروهی فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     size, _, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -5801,7 +5913,7 @@ async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     source_ok, source_reason = check_xfer_source(chat_id, user.id)
     if not source_ok:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"{source_reason}\n\n"
             f"(سایز فقط از یه گروهِ واقعی و فعال می‌تونه خارج بشه — این جلوی "
             f"ساختن گروه الکی و پروارکردن سایز توش رو می‌گیره.)"
@@ -5816,7 +5928,7 @@ async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             amount = None
     if amount is None or amount <= 0:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"🔁 انتقال بین‌گروهی\n\n"
             f"سایزت رو به یکی دیگه از گروه‌هایی که توش بازی می‌کنی بفرست.\n"
             f"⚠️ کارمزدش سنگینه: {int(fee_ratio*100)}٪\n"
@@ -5826,15 +5938,15 @@ async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if amount < XFER_MIN_AMOUNT:
-        await update.message.reply_text(f"حداقل مبلغ انتقال {XFER_MIN_AMOUNT} سانته.")
+        await reply_temp(update, context, f"حداقل مبلغ انتقال {XFER_MIN_AMOUNT} سانته.")
         return
     if size < amount:
-        await update.message.reply_text(f"این‌قدر سانت نداری! 💼 {int(size)} سانت داری.")
+        await reply_temp(update, context, f"این‌قدر سانت نداری! 💼 {int(size)} سانت داری.")
         return
 
     groups = db.get_user_groups(user.id, exclude_chat_id=chat_id)
     if not groups:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "تو هیچ گروه دیگه‌ای بازی نمی‌کنی!\nاول تو یه گروه دیگه /d بزن."
         )
         return
@@ -5955,7 +6067,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = int(parts[1]) if len(parts) > 1 and parts[1].lstrip('-').isdigit() else update.effective_chat.id
     rows = db.get_last_rebalance(chat_id, 25)
     if not rows:
-        await update.message.reply_text("هنوز هیچ تنظیم خودکاری برای این گروه ثبت نشده.")
+        await reply_temp(update, context, "هنوز هیچ تنظیم خودکاری برای این گروه ثبت نشده.")
         return
     lines = [f"⚖️ آخرین تنظیمات خودکار تعادل (chat {chat_id}):", ""]
     for run_date, name, net, median, gb, ga, lb, la in rows:
@@ -6347,7 +6459,7 @@ async def lottery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if chat_id >= 0:
-        await update.message.reply_text("این قابلیت فقط داخل گروه‌ها کار می‌کند!")
+        await reply_lookup(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
         return
     db.track_chat(chat_id)
     db.get_user(user.id, chat_id, user.username, user.first_name)
@@ -6566,7 +6678,7 @@ async def revolt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     parts = update.message.text.split()
     if len(parts) < 2:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "استفاده: <code>/enghelab &lt;chat_id&gt;</code>\n"
             "برای دیدن لیست گروه‌ها: /groups",
             parse_mode="HTML")
@@ -6574,12 +6686,12 @@ async def revolt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = int(parts[1])
     except ValueError:
-        await update.message.reply_text("chat_id باید عدد باشه. /groups رو بزن.")
+        await reply_temp(update, context, "chat_id باید عدد باشه. /groups رو بزن.")
         return
 
     preview = revolt_preview(chat_id)
     if preview is None:
-        await update.message.reply_text(
+        await reply_temp(update, context,
             "تو این گروه شورشی نمی‌شه کرد — یا پادشاه نداره، یا دارایی پادشاه "
             "تقریباً صفره، یا هیچ بازیکن دیگه‌ای نیست که سهم ببره."
         )
@@ -6678,19 +6790,19 @@ async def luck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     parts = update.message.text.split()
     if len(parts) < 2:
-        await update.message.reply_text(
+        await reply_lookup(update, context,
             "استفاده: <code>/luck &lt;chat_id&gt;</code>\nبرای دیدن لیست گروه‌ها: /groups",
             parse_mode="HTML")
         return
     try:
         chat_id = int(parts[1])
     except ValueError:
-        await update.message.reply_text("chat_id باید عدد باشه. /groups رو بزن.")
+        await reply_lookup(update, context, "chat_id باید عدد باشه. /groups رو بزن.")
         return
 
     rows = db.get_group_modifiers(chat_id)
     if not rows:
-        await update.message.reply_text("این گروه بازیکنی نداره یا chat_id اشتباهه.")
+        await reply_lookup(update, context, "این گروه بازیکنی نداره یا chat_id اشتباهه.")
         return
 
     lines = [f"🎛 ضریب‌های گروه <code>{chat_id}</code>", "(۱.۰ = دست‌نخورده)\n"]
@@ -6715,7 +6827,7 @@ async def _set_modifier_cmd(update, context, column, label):
     parts = update.message.text.split()
     if len(parts) < 4:
         name = 'setluck' if column == 'theft_luck' else 'setgrowth'
-        await update.message.reply_text(
+        await reply_temp(update, context,
             f"استفاده: <code>/{name} &lt;chat_id&gt; &lt;user_id&gt; &lt;عدد&gt;</code>",
             parse_mode="HTML")
         return
@@ -6724,14 +6836,14 @@ async def _set_modifier_cmd(update, context, column, label):
         target_id = int(parts[2])
         value = float(parts[3])
     except ValueError:
-        await update.message.reply_text("chat_id و user_id باید عدد باشن و ضریب هم یه عدد اعشاری.")
+        await reply_temp(update, context, "chat_id و user_id باید عدد باشن و ضریب هم یه عدد اعشاری.")
         return
     if not (MOD_LIMITS[0] <= value <= MOD_LIMITS[1]) or value != value:
-        await update.message.reply_text(f"ضریب باید بین {MOD_LIMITS[0]} و {MOD_LIMITS[1]} باشه.")
+        await reply_temp(update, context, f"ضریب باید بین {MOD_LIMITS[0]} و {MOD_LIMITS[1]} باشه.")
         return
 
     if not db.set_modifier(target_id, chat_id, column, value):
-        await update.message.reply_text("این کاربر تو این گروه پیدا نشد. /luck رو چک کن.")
+        await reply_temp(update, context, "این کاربر تو این گروه پیدا نشد. /luck رو چک کن.")
         return
     # Pin it: a hand-set dial is a decision, and the nightly auto-handicap must not
     # quietly walk it back a few hours later. Setting a dial back to exactly 1.0

@@ -149,6 +149,52 @@ whole report, not just its own line — that is why the escaping is at the bound
 `night_report_prune` keeps a week. The report is a display artefact; nothing reads an old
 one.
 
+### Throwaway chatter is swept; the record is not
+
+The other half of the noise is the chatter around the game: the command somebody typed,
+the refusal it got back, and the personal lookup nobody else is reading. None of it is
+part of what *happened*, and in a busy group it is most of what is on screen. All three
+are now scheduled for deletion:
+
+| | lives for | why |
+|---|---|---|
+| the typed `/command` | `COMMAND_MESSAGE_SECONDS` (30s) | superseded the moment the bot answers |
+| a refusal | `EPHEMERAL_ERROR_SECONDS` (20s) | read once, by one person, never again |
+| a personal lookup | `EPHEMERAL_LOOKUP_SECONDS` (120s) | regenerable by typing the command again |
+
+`reply_temp(update, context, text)` and `reply_lookup(...)` are the two helpers;
+`sweep_later(context, chat_id, message_id, seconds)` is what they sit on, and the
+command message is swept from `log_incoming` — the one handler that sees every message,
+which is why it is there rather than in forty command handlers.
+
+Five things are load-bearing:
+
+- **The record must never use them.** A challenge result, a theft, a heist, a trade, a
+  deposit, a decree, the nightly report — anything that moved size or carries the buttons
+  the game runs on — stays forever. There is a regression test naming those handlers and
+  asserting each still has a permanent `reply_text`, in both directions: that the noise
+  is swept *and* that the record is not.
+- **`OUR_COMMANDS` is why another bot's users keep their messages.** Plenty of groups run
+  several bots, and sweeping everything that starts with a slash would delete `/ban` out
+  from under whoever typed it. It is filled twice on purpose: `cmd()` harvests every name
+  in every handler pattern (so a command added tomorrow is covered without anyone
+  remembering), and `_seed_our_commands()` reads `BOT_COMMANDS` at import (because
+  `cmd()` only runs when handlers register, which never happens when `webapp.py` imports
+  this module or when a test does). Neither alone is enough — the menu has no aliases.
+- **Nothing is swept in a DM.** `sweep_later` returns immediately for `chat_id >= 0`:
+  there is no group to keep tidy and no delete right to do it with.
+- **Every failure is swallowed.** The bot may not be an admin, the message may be gone,
+  or it may be past the 48 hours Telegram lets a bot delete. Tidying is cosmetic and must
+  never cost somebody their answer — there is a test that a `job_queue` of `None` still
+  lets the reply go out.
+- **Cleanup is in-memory (`job_queue.run_once`), deliberately.** If the process dies
+  first the message simply stays, which is exactly where the bot was before. Persisting it
+  would put a cosmetic concern in the same class as the money, and the recovery sweeps
+  exist for the money.
+
+When you add a command: a refusal gets `reply_temp`, a read-only answer gets
+`reply_lookup`, and anything that moved size keeps `reply_text`.
+
 ### Badges and coronations ride along
 
 `badge_lines(who, earned)` returns text to **append** to the message that caused the
