@@ -108,6 +108,68 @@ A daily perk is granted alongside a growth roll, so `last_grown` (the growth dat
 - `random_event_job` — every 3h, small per-group chance of an earthquake/viagra-rain/treasure event.
 - `recover_stuck_pvp_matches` — one-shot, 5s after startup; sweeps `pvp_matches` for anything stale.
 
+
+## One event, one message — the bot edits rather than posts again
+
+Groups are noisy, and almost all of the noise was the bot answering itself. The rule now
+is that **a message the bot already owns gets edited; a second message is the exception
+that has to justify itself.**
+
+### The nightly report
+
+Every group used to receive six to eight separate messages between 00:00 and 00:20
+Tehran — the lottery result, the boss that escaped, the king's tax, the growth reminder,
+the price index at 00:05, the bank's interest at 00:10, and one per collected loan at
+00:15. They are all the *same* event, the day turning over, so they are now **one message
+that each job edits**.
+
+`bot.night_report(context, chat_id, key, rank, body)` is the whole interface, backed by
+`night_reports` (the message id for a (chat, day)) and `night_report_sections` (the
+sections). Four things about it are load-bearing:
+
+- **`key` is unique per night**, so a job that runs twice — a restart, a recovery sweep —
+  overwrites its own section rather than printing it again. The nightly claims already
+  make the *money* idempotent; this gives the *text* the same property. Per-loan sections
+  use `loan:<id>` so several collections coexist without colliding.
+- **`rank` fixes the reading order, not arrival.** The reminder is written at 00:00 but
+  reads as the header; loans land at 00:15 and belong at the bottom.
+- **The message id is in the database, not in memory.** The jobs are twenty minutes apart
+  and a deploy lands between them often enough to matter — same lesson as `pvp_matches`.
+- **It degrades to sending, and re-adopts.** If the edit fails (the report was deleted)
+  the whole report is re-posted and the new message becomes the report, so a deletion
+  costs one repost rather than turning the rest of the night back into a message per job.
+  Past `NR_MAX_CHARS` it stops absorbing and the new section goes out alone. Losing the
+  running report is survivable; losing the night's news is not, and a refused edit would
+  do exactly that.
+
+The report is assembled as HTML, so anything not already escaped must be passed with
+`html_safe=False` (or `_esc`'d by the caller). An unescaped player name would break the
+whole report, not just its own line — that is why the escaping is at the boundary.
+
+`night_report_prune` keeps a week. The report is a display artefact; nothing reads an old
+one.
+
+### Badges and coronations ride along
+
+`badge_lines(who, earned)` returns text to **append** to the message that caused the
+badge. There is deliberately no function that posts a badge on its own any more — the old
+`announce_achievements` is gone rather than merely unused, because leaving it there is an
+invitation to send one more message.
+
+The worst offenders it replaced:
+
+- A settled challenge posted the result, the winner's badges, the loser's badges and a
+  coronation — four messages for one event. All four are now the single edit
+  `deliver_pvp_message` was already making. `coronation_text` exists for exactly this:
+  `announce_coronation` is now the thin wrapper for callers that have no message of their
+  own to attach to.
+- A boss killed by five players posted five badge messages and then the rewards. One now.
+- `/d`, theft, the consort, betrayal and the heist each posted one or two extra.
+
+When you add anything that awards a badge: award it **before** you build the message, and
+paste `badge_lines(...)` on the end. `html=False` for a plain-text message
+(`deliver_pvp_message` sends without `parse_mode`), the default for an HTML one.
+
 ## The bank is deliberately outside `users.size`
 
 `bank_accounts.balance` is a second balance per (user, chat) that is **not** part of

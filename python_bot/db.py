@@ -294,6 +294,28 @@ def init_db():
             )
         ''')
 
+        # One message per group per night, edited in place as each nightly job lands its
+        # section, instead of seven separate messages between 00:00 and 00:20.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS night_reports (
+                chat_id BIGINT,
+                day TEXT,
+                message_id BIGINT,
+                PRIMARY KEY (chat_id, day)
+            )
+        ''')
+
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS night_report_sections (
+                chat_id BIGINT,
+                day TEXT,
+                key TEXT,
+                rank INTEGER DEFAULT 0,
+                body TEXT,
+                PRIMARY KEY (chat_id, day, key)
+            )
+        ''')
+
         c.execute('''
             CREATE TABLE IF NOT EXISTS consensus_votes (
                 id SERIAL PRIMARY KEY,
@@ -843,6 +865,52 @@ def get_last_chat(user_id):
         c.execute('SELECT DISTINCT chat_id FROM users WHERE user_id = %s AND chat_id < 0', (user_id,))
         rows = c.fetchall()
         return rows[0][0] if len(rows) == 1 else None
+
+
+def night_report_add(chat_id, day, key, rank, body):
+    """Add (or replace) one section of tonight's single report and return the whole thing.
+
+    Returns (message_id, full_text). `message_id` is None until the report has actually
+    been posted once - the caller posts it then and calls night_report_set_message.
+
+    The key is unique per night, so a job that runs twice (a restart, a recovery sweep)
+    overwrites its own section instead of printing it again. That is the same
+    idempotence the nightly claims already give the money; this gives it to the text.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO night_reports (chat_id, day) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id, day) DO NOTHING', (chat_id, day))
+        c.execute('INSERT INTO night_report_sections (chat_id, day, key, rank, body) '
+                  'VALUES (%s, %s, %s, %s, %s) '
+                  'ON CONFLICT (chat_id, day, key) DO UPDATE SET '
+                  'rank = EXCLUDED.rank, body = EXCLUDED.body',
+                  (chat_id, day, key, rank, body))
+        c.execute('SELECT body FROM night_report_sections WHERE chat_id = %s AND day = %s '
+                  'ORDER BY rank, key', (chat_id, day))
+        parts = [r[0] for r in c.fetchall()]
+        c.execute('SELECT message_id FROM night_reports WHERE chat_id = %s AND day = %s',
+                  (chat_id, day))
+        row = c.fetchone()
+    return (row[0] if row else None), "\n\n".join(parts)
+
+
+def night_report_set_message(chat_id, day, message_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO night_reports (chat_id, day, message_id) VALUES (%s, %s, %s) '
+                  'ON CONFLICT (chat_id, day) DO UPDATE SET message_id = EXCLUDED.message_id',
+                  (chat_id, day, message_id))
+
+
+def night_report_prune(keep_days=7):
+    """The report is a display artefact, not a ledger - nothing reads an old one."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        for table in ('night_report_sections', 'night_reports'):
+            c.execute(f"DELETE FROM {table} WHERE day < %s",
+                      ((datetime.datetime.now(IRAN_TZ).date()
+                        - datetime.timedelta(days=keep_days)).isoformat(),))
 
 
 def track_chat(chat_id, title=None):

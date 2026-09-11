@@ -57,14 +57,77 @@ async def midnight_tasks(context: ContextTypes.DEFAULT_TYPE):
             logging.exception(f"king tax failed for {chat_id}")
 
     await midnight_reminder(context)
+    try:
+        # The report is a display artefact, not a ledger; keep a week for debugging.
+        db.night_report_prune()
+    except Exception:
+        logging.exception("pruning night reports failed")
+
+
+# Section ordering for the nightly report. The jobs land out of order (the reminder is
+# written at 00:00 but reads as the header; loans are collected at 00:15), so the rank
+# is what makes the report read the same way every night regardless of arrival.
+NR_REMINDER, NR_LOTTERY, NR_BOSS, NR_TAX = 10, 20, 30, 40
+NR_INFLATION, NR_BANK, NR_LOAN = 50, 60, 70
+# A Telegram message caps at 4096 characters. Past this the report stops absorbing and
+# the section goes out on its own - a truncated report would lose real information,
+# and a refused edit would lose the section entirely.
+NR_MAX_CHARS = 3600
+
+
+async def night_report(context, chat_id, key, rank, body, html_safe=True):
+    """Fold one nightly announcement into this group's single report message.
+
+    Every group used to get six to eight separate messages between 00:00 and 00:20 -
+    lottery, boss, tax, reminder, price index, bank interest, one per collected loan.
+    They are all the same event (the day turning over), so they are now one message that
+    each job EDITS rather than one message each job sends.
+
+    `key` is unique per night, so a job that runs twice replaces its own section instead
+    of repeating it; `rank` fixes the reading order. Pass html_safe=False for text that
+    has not been escaped yet - the report is assembled as HTML, so an unescaped player
+    name would break the whole message rather than just its own line.
+    """
+    if not html_safe:
+        body = _esc(body)
+    try:
+        message_id, full = db.night_report_add(chat_id, tehran_today_str(), key, rank, body)
+    except Exception:
+        logging.exception(f"night report bookkeeping failed for {chat_id}")
+        message_id, full = None, body
+
+    fits = len(full) <= NR_MAX_CHARS
+    if message_id and fits:
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                                text=full, parse_mode="HTML")
+            return
+        except Forbidden:
+            raise
+        except Exception:
+            # Deleted or too old to edit. Losing the running report is survivable;
+            # losing tonight's news is not, so fall through and post.
+            message_id = None
+
+    # A report that still fits is re-posted whole and adopted, so a deleted message costs
+    # one repost rather than turning the rest of the night back into a message per job.
+    # Past the cap it stops absorbing and the new section goes out alone.
+    sent = await context.bot.send_message(chat_id=chat_id,
+                                          text=full if fits else body, parse_mode="HTML")
+    if fits:
+        try:
+            db.night_report_set_message(chat_id, tehran_today_str(), sent.message_id)
+        except Exception:
+            logging.exception(f"could not remember night report message for {chat_id}")
 
 
 async def midnight_reminder(context: ContextTypes.DEFAULT_TYPE):
     chat_ids = db.get_all_chats()
-    msg = "⏰ وقتشه دودولاتون رو بلند کنید!\nروز جدید شروع شده و می‌تونید دوباره سایزتون رو رشد بدید."
+    msg = ("⏰ <b>روز جدید شروع شد!</b>\n"
+           "می‌تونید دوباره با /d سایزتون رو رشد بدید.")
     for cid in chat_ids:
         try:
-            await context.bot.send_message(chat_id=cid, text=msg)
+            await night_report(context, cid, 'reminder', NR_REMINDER, msg)
         except Forbidden as e:
             # Kicked from the group / group deleted: stop trying it every night forever.
             logging.info(f"Dropping unreachable chat {cid} from reminders: {e}")
@@ -1687,15 +1750,19 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
                 if side != correct_side:
                     msg += f"\n❌ {bettor_name}: {int(amount)} گذاشت و از دست داد"
 
-        await deliver_pvp_message(context, chat_id, message_id, msg, inline_message_id=inline_message_id)
-        await announce_achievements(context, chat_id, winner_name, badges)
-        await announce_achievements(context, chat_id, loser_name, loser_badges)
+        # Badges and a coronation are consequences of THIS result, so they are pasted on
+        # the end of it. They used to be up to three further messages in a row.
+        msg += badge_lines(winner_name, badges, html=False)
+        msg += badge_lines(loser_name, loser_badges, html=False)
 
         # A decided match moves size, so the crown may well have changed hands.
         old_king_name = kingdom[1] if kingdom else None
         _, new_king = refresh_king(chat_id)
         if new_king:
-            await announce_coronation(context, chat_id, new_king, old_king_name)
+            msg += coronation_text(chat_id, new_king, old_king_name)
+
+        await deliver_pvp_message(context, chat_id, message_id, msg,
+                                  inline_message_id=inline_message_id)
     except Exception:
         if settled:
             # Money already moved (payout or tie-refund done); refunding again here
@@ -2103,12 +2170,8 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d_name = get_dick_name(current_size)
     msg = f"🍆 {d_name} {user.first_name} {abs(delta)} سانتی‌متر {verb}!\nاندازه فعلی: {int(current_size)} سانتی‌متر.{jester_note}{labor_note}{streak_msg}\n\n✨ پرک امروز: {PERK_DESCRIPTIONS.get(new_perk, '')}{perk_extra_msg}{item_msg}"
 
-    await query.answer(f"{d_name} شما تغییر کرد!")
-    try:
-        await query.edit_message_text(msg)
-    except:
-        pass
-
+    # Awarded before the edit so the badge rides along in the same message the roll
+    # already owns, instead of following it as a second one.
     earned = []
     if streak >= 7:
         earned += award(user.id, chat_id, 'streak_7')
@@ -2116,7 +2179,13 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         earned += award(user.id, chat_id, 'first_1000')
     if current_size < 0:
         earned += award(user.id, chat_id, 'rock_bottom')
-    await announce_achievements(context, chat_id, user.first_name, earned)
+    msg += badge_lines(user.first_name, earned, html=False)
+
+    await query.answer(f"{d_name} شما تغییر کرد!")
+    try:
+        await query.edit_message_text(msg)
+    except:
+        pass
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.inline_query.from_user
@@ -2710,7 +2779,7 @@ ACHIEVEMENTS = {
 
 def award(user_id, chat_id, code):
     """Grants a badge and returns [(emoji, title)] the first time only, [] afterwards.
-    Callers collect these and hand them to announce_achievements."""
+    Callers collect these and hand them to badge_lines."""
     if code not in ACHIEVEMENTS:
         return []
     if not db.grant_achievement(user_id, chat_id, code):
@@ -2719,14 +2788,18 @@ def award(user_id, chat_id, code):
     return [(emoji, title)]
 
 
-async def announce_achievements(context, chat_id, who, earned):
+def badge_lines(who, earned, html=True):
+    """Badges as text to APPEND to the message that caused them, not a message of their own.
+
+    A challenge used to settle into four messages - the result, the winner's badges, the
+    loser's badges, and the coronation - when all four are the same event. Callers that
+    are already writing a message paste this on the end of it instead.
+    """
     if not earned:
-        return
+        return ""
+    name = _esc(who) if html else str(who)
     lines = "\n".join(f"{emoji} {title}" for emoji, title in earned)
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=f"🏅 {who} نشان جدید گرفت:\n{lines}")
-    except Exception as e:
-        logging.error(f"Failed to announce achievements in {chat_id}: {e}")
+    return f"\n\n🏅 {name} نشان جدید گرفت:\n{lines}"
 
 
 def refresh_king(chat_id):
@@ -2748,19 +2821,30 @@ def refresh_king(chat_id):
     return db.get_kingdom(chat_id), (top_id, top_name)
 
 
-async def announce_coronation(context, chat_id, new_king, old_king_name):
+def coronation_text(chat_id, new_king, old_king_name):
+    """The coronation as plain text, king's badge included.
+
+    Split out from announce_coronation so a caller that is ALREADY writing a message
+    about the thing that moved the crown (a settled challenge, a revolt) can paste it on
+    instead of firing a second and third message straight after its own.
+    """
     king_id, king_name = new_king
-    msg = f"👑 تاج جابه‌جا شد!\n{king_name} پادشاه جدید گروهه."
+    msg = f"\n\n👑 تاج جابه‌جا شد!\n{king_name} پادشاه جدید گروهه."
     if old_king_name:
         msg += f"\n{old_king_name} از تخت افتاد و همسرش هم از قصر انداخته شد بیرون."
-    msg += (f"\n\nپادشاه روزانه {int(KING_TAX_RATIO * 100)}٪ از سایز بقیه مالیات می‌گیره،"
-            f"\nولی تو چالش دو برابر ضرر می‌کنه و سپر اجماع براش کار نمی‌کنه."
-            f"\nبا /hamsar می‌تونه برای خودش همسر انتخاب کنه.")
+    msg += (f"\nپادشاه روزانه {int(KING_TAX_RATIO * 100)}٪ مالیات می‌گیره، ولی تو چالش دو "
+            f"برابر ضرر می‌کنه و سپر اجماع براش کار نمی‌کنه. با /hamsar همسر می‌گیره.")
+    return msg + badge_lines(king_name, award(king_id, chat_id, 'king'), html=False)
+
+
+async def announce_coronation(context, chat_id, new_king, old_king_name):
+    """For callers with no message of their own to append the coronation to."""
     try:
-        await context.bot.send_message(chat_id=chat_id, text=msg)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=coronation_text(chat_id, new_king, old_king_name).lstrip("\n"))
     except Exception as e:
         logging.error(f"Failed to announce coronation in {chat_id}: {e}")
-    await announce_achievements(context, chat_id, king_name, award(king_id, chat_id, 'king'))
 
 
 async def king_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2836,8 +2920,8 @@ async def consort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"از این به بعد {int(CONSORT_TAX_SHARE * 100)}٪ از مالیات روزانهٔ پادشاه به {target_name} می‌رسه "
         f"و گارد سلطنتی جلوی دزدی ازش رو می‌گیره.\n"
         f"⚠️ ولی حواست باشه — همسرِ پادشاه هر وقت بخواد می‌تونه خیانت کنه..."
+        + badge_lines(target_name, award(target_id, chat_id, 'consort'), html=False)
     )
-    await announce_achievements(context, chat_id, target_name, award(target_id, chat_id, 'consort'))
 
 
 async def divorce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2917,8 +3001,8 @@ async def betray_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"😏 {lover_name}: +{int(lover_cut)} سانت\n\n"
         f"🗡️ {user.first_name} تا {TRAITOR_DAYS} روز داغ «خائن» رو داره: "
         f"هیچ پادشاهی همسرش نمی‌کنه و دزدی ازش راحت‌تره."
+        + badge_lines(user.first_name, award(user.id, chat_id, 'traitor'), html=False)
     )
-    await announce_achievements(context, chat_id, user.first_name, award(user.id, chat_id, 'traitor'))
 
 
 async def collect_king_tax(context: ContextTypes.DEFAULT_TYPE, chat_id, today_str):
@@ -2952,13 +3036,13 @@ async def collect_king_tax(context: ContextTypes.DEFAULT_TYPE, chat_id, today_st
         return
     consort_cut = int(total * CONSORT_TAX_SHARE) if consort_id else 0
 
-    msg = (f"👑 مالیات روزانهٔ سلطنتی\n\n"
-           f"{king_name} از {payers} نفر مجموعاً {int(total)} سانت مالیات گرفت.")
+    msg = (f"👑 <b>مالیات روزانهٔ سلطنتی</b>\n"
+           f"{_esc(king_name)} از {payers} نفر مجموعاً {int(total)} سانت مالیات گرفت.")
     if consort_cut:
-        msg += f"\n💍 سهم همسرش {consort_name}: {int(consort_cut)} سانت"
-    msg += "\n\n(دوست نداری مالیات بدی؟ تاج رو ازش بگیر 😈)"
+        msg += f"\n💍 سهم همسرش {_esc(consort_name)}: {int(consort_cut)} سانت"
+    msg += "\n(دوست نداری مالیات بدی؟ تاج رو ازش بگیر 😈)"
     try:
-        await context.bot.send_message(chat_id=chat_id, text=msg)
+        await night_report(context, chat_id, 'tax', NR_TAX, msg)
     except Exception as e:
         logging.error(f"Failed to announce king tax in {chat_id}: {e}")
 
@@ -3099,14 +3183,14 @@ async def steal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.update_size(user.id, chat_id, loot - theft_fee)
         if theft_fee > 0:
             db.treasury_add(chat_id, theft_fee, note="کارمزد دزدی")
+        # Both badges ride along in the theft's own message; they were two more.
         await update.message.reply_text(
             f"🥷 دزدی موفق!\n\n{user.first_name} زد و {int(loot)} سانت از {target_name} بالا کشید!{item_note}"
             + (f"\n🧾 کارمزد دزدی ({int(THEFT_FEE_RATIO*100)}٪): {theft_fee} سانت رفت تو خزانه."
                if theft_fee > 0 else "")
+            + badge_lines(user.first_name, award(user.id, chat_id, 'thief'), html=False)
+            + badge_lines(target_name, award(target_id, chat_id, 'robbed'), html=False)
         )
-        earned = award(user.id, chat_id, 'thief')
-        await announce_achievements(context, chat_id, user.first_name, earned)
-        await announce_achievements(context, chat_id, target_name, award(target_id, chat_id, 'robbed'))
     else:
         fine = max(1, loot // 2)
         if thief_perk == "دست‌کج":
@@ -4064,14 +4148,13 @@ async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id,
             lines.append(f"   • {partner_name}: +{int(partner_cut)} سانت (شریک)")
             lines.append(f"\n😱 هیچ‌جا امن نیست! (تا {HEIST_COOLDOWN_SECONDS // 86400} روز دیگه بانک آماده‌باشه‌ست)")
             text = "\n".join(lines)
-        # deliver_pvp_message sends plain text (no parse_mode), so the message is built
-        # without HTML tags and without _esc() - there's nothing to escape for.
-        await deliver_pvp_message(context, row['message_chat_id'], row['message_id'], text)
         if total > 0:
             for uid, name in ((thief_id, thief_name), (partner_id, partner_name)):
                 if uid:
-                    await announce_achievements(context, chat_id, name,
-                                                award(uid, chat_id, 'thief'))
+                    text += badge_lines(name, award(uid, chat_id, 'thief'), html=False)
+        # deliver_pvp_message sends plain text (no parse_mode), so the message is built
+        # without HTML tags and without _esc() - there's nothing to escape for.
+        await deliver_pvp_message(context, row['message_chat_id'], row['message_id'], text)
         return
 
     # Lost. BOTH conspirators go down - that shared risk is what the accomplice agreed
@@ -4228,20 +4311,18 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
                 mood = "بانک کم‌درآمده — نرخ افتاده کف 😬"
             else:
                 mood = "نرخ با درآمد و ذخیرهٔ بانک بالا و پایین می‌ره"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(f"🏦 <b>سود روزانهٔ بانک</b>\n\n"
-                      f"📈 سود امروز: <b>{rate*100:.2f}٪</b> — {mood}\n"
-                      f"🧾 کارمزد نگهداری حساب: <b>{fee_ratio*100:.2f}٪</b>\n"
-                      f"   └ خالص برای سپرده‌گذار: <b>{net_rate*100:+.2f}٪</b>\n\n"
-                      f"💸 به {rows} نفر مجموعاً {int(paid)} سانت سود داده شد.\n"
-                      f"🏛 از {fee_rows} حساب مجموعاً {int(fee_total)} سانت کارمزد گرفته شد.\n"
-                      f"🔒 کل سپرده‌ها: {int(total_dep)} سانت\n"
-                      f"💰 سهم این گروه از ذخیره: {int(treasury_now)} سانت "
-                      f"(پوشش کل {coverage*100:.0f}٪)\n\n"
-                      f"نرخ سود از درآمد واقعی بانک میاد — هرچی بیشتر خرید و کارمزد و "
-                      f"معاملهٔ کریپتو باشه، سود همه بیشتر می‌شه."),
-                parse_mode="HTML"
+            await night_report(
+                context, chat_id, 'bank', NR_BANK,
+                (f"🏦 <b>سود روزانهٔ بانک</b>\n"
+                 f"📈 سود امروز: <b>{rate*100:.2f}٪</b> — {mood}\n"
+                 f"🧾 کارمزد نگهداری: <b>{fee_ratio*100:.2f}٪</b> "
+                 f"→ خالص <b>{net_rate*100:+.2f}٪</b>\n"
+                 f"💸 به {rows} نفر مجموعاً {int(paid)} سانت سود داده شد.\n"
+                 f"🏛 از {fee_rows} حساب مجموعاً {int(fee_total)} سانت کارمزد گرفته شد.\n"
+                 f"🔒 کل سپرده‌ها: {int(total_dep)} سانت · "
+                 f"💰 ذخیره: {int(treasury_now)} سانت (پوشش {coverage*100:.0f}٪)\n"
+                 f"نرخ سود از درآمد واقعی بانک میاد — هرچی بیشتر خرید و کارمزد و "
+                 f"معاملهٔ کریپتو باشه، سود همه بیشتر می‌شه.")
             )
         except Forbidden:
             db.remove_chat(chat_id)
@@ -5052,8 +5133,8 @@ async def collect_loans_job(context: ContextTypes.DEFAULT_TYPE):
                 bits.append("🏷 از این به بعد <b>بدهکار</b>ه.")
             bits.append(f"📊 اعتبارش {r['credit_delta']:+d} شد → <b>{r['credit_score']}</b>/200 "
                         f"(سقف وام‌های بعدیش کمتر شد)")
-            await context.bot.send_message(chat_id=r['chat_id'], text="\n".join(bits),
-                                           parse_mode="HTML")
+            await night_report(context, r['chat_id'], f'loan:{loan_id}', NR_LOAN,
+                               "\n".join(bits))
         except Forbidden:
             pass
         except Exception:
@@ -5450,15 +5531,14 @@ async def economy_tick_job(context: ContextTypes.DEFAULT_TYPE):
                 before, after, growth = tick
                 if abs(after - before) >= 0.02:
                     arrow = "📈" if after > before else "📉"
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(f"{arrow} <b>شاخص قیمت‌ها</b>\n\n"
-                              f"حجم پول {growth*100:+.1f}٪ تغییر کرد.\n"
-                              f"تورم: {before:.2f} → <b>{after:.2f}</b>\n\n"
-                              + ("قیمت‌ها گرون‌تر شد و ارزش پس‌اندازها کم شد."
-                                 if after > before else
-                                 "قیمت‌ها پایین اومد و پس‌اندازها باارزش‌تر شد.")),
-                        parse_mode="HTML")
+                    await night_report(
+                        context, chat_id, 'inflation', NR_INFLATION,
+                        (f"{arrow} <b>شاخص قیمت‌ها</b>\n"
+                         f"حجم پول {growth*100:+.1f}٪ تغییر کرد.\n"
+                         f"تورم: {before:.2f} → <b>{after:.2f}</b>\n"
+                         + ("قیمت‌ها گرون‌تر شد و ارزش پس‌اندازها کم شد."
+                            if after > before else
+                            "قیمت‌ها پایین اومد و پس‌اندازها باارزش‌تر شد.")))
 
             # A furious population eventually removes the problem themselves.
             if unrest >= UNREST_REVOLT_THRESHOLD:
@@ -5528,11 +5608,10 @@ async def _revolt(context, chat_id, kingdom):
         text=(f"🔥🔥 <b>شورش!</b>\n\n"
               f"مردم ریختن تو قصر و {_esc(king_name or '?')} رو کشیدن پایین.\n"
               f"💰 {int(seized)} سانت از دارایی‌ش مصادره و بین {len(players)} نفر تقسیم شد "
-              f"(هر نفر {int(share)} سانت).\n\n" + tail),
+              f"(هر نفر {int(share)} سانت).\n\n" + tail
+              + (badge_lines(new_king[1], award(new_king[0], chat_id, 'king'))
+                 if new_king else "")),
         parse_mode="HTML")
-    if new_king:
-        await announce_achievements(context, chat_id, new_king[1],
-                                    award(new_king[0], chat_id, 'king'))
     return (True, seized, share, len(players))
 
 
@@ -6228,6 +6307,7 @@ async def boss_hit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # them out of the split entirely.
     hits = db.get_boss_hits(boss_id)
     lines = [f"🎉 گروه **{name}** رو کشت!", "", "💰 جایزه‌ها:"]
+    badges = ""
     top_damage = max((h[2] for h in hits), default=0)
     for uid, fname, dmg in hits:
         reward = priced(BOSS_REWARD_BASE, chat_id) + dmg // 2
@@ -6236,9 +6316,10 @@ async def boss_hit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.update_size(uid, chat_id, reward)
         star = " 🏆" if dmg == top_damage else ""
         lines.append(f"• {fname}{star}: {dmg} دمیج → +{reward} سانت")
-        await announce_achievements(context, chat_id, fname, award(uid, chat_id, 'boss_slayer'))
+        # One badge message per slayer meant a five-player kill posted six messages.
+        badges += badge_lines(fname, award(uid, chat_id, 'boss_slayer'), html=False)
     try:
-        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines) + badges)
     except Exception as e:
         logging.error(f"Failed to announce boss kill in {chat_id}: {e}")
 
@@ -6254,7 +6335,8 @@ async def expire_bosses_job(context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception:
                     pass
-            await context.bot.send_message(chat_id=chat_id, text=f"🐉 {name} تا صبح فرار کرد! امشب دوباره یکی میاد.")
+            await night_report(context, chat_id, f'boss:{boss_id}', NR_BOSS,
+                               _esc(f"🐉 {name} تا صبح فرار کرد! امشب دوباره یکی میاد."))
         except Forbidden:
             db.remove_chat(chat_id)
         except Exception as e:
@@ -6355,9 +6437,9 @@ async def draw_lottery(context: ContextTypes.DEFAULT_TYPE, draw_date):
             result = lottery.draw(chat_id, draw_date)
             if not result:
                 continue
-            await context.bot.send_message(chat_id=chat_id, text=lottery.render_result(result))
-            await announce_achievements(context, chat_id, result["winner_name"],
-                                        award(result["winner_id"], chat_id, 'lottery_winner'))
+            body = _esc(lottery.render_result(result)) + badge_lines(
+                result["winner_name"], award(result["winner_id"], chat_id, 'lottery_winner'))
+            await night_report(context, chat_id, 'lottery', NR_LOTTERY, body)
         except Forbidden:
             db.remove_chat(chat_id)
         except Exception as e:
