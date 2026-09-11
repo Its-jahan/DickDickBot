@@ -4980,6 +4980,11 @@ async def repay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     extra = ""
     if result['from_bank'] > 0:
         extra += f"\n🏦 {int(result['from_bank'])} سانتش از سپردهٔ بانکیت برداشته شد."
+    if result.get('from_other_groups', 0) > 0:
+        n = len(result.get('cross') or [])
+        extra += (f"\n🌍 {int(result['from_other_groups'])} سانتش از سایزت تو "
+                  f"{n} گروه دیگه برداشته شد — وام از بانک مرکزیه، پس بدهیش "
+                  f"به همهٔ گروه‌هاست نه فقط این یکی.")
     if result['shortfall'] > 0:
         extra += f"\n🔻 {int(result['shortfall'])} سانت کم آوردی و سایزت رفت زیر صفر."
     d = result['credit_delta']
@@ -5023,6 +5028,8 @@ async def collect_loans_job(context: ContextTypes.DEFAULT_TYPE):
                 bits.append(f"💼 از جیبش: {int(r['from_wallet'])} سانت")
             if r['from_bank'] > 0:
                 bits.append(f"🏦 از سپردهٔ بانکیش: {int(r['from_bank'])} سانت")
+            if r.get('from_other_groups', 0) > 0:
+                bits.append(f"🌍 از گروه‌های دیگه‌ش: {int(r['from_other_groups'])} سانت")
             if r['shortfall'] > 0:
                 bits.append(f"🔻 بازم کم آورد: {int(r['shortfall'])} سانت — سایزش رفت زیر صفر!")
                 bits.append("🏷 از این به بعد <b>بدهکار</b>ه.")

@@ -3591,20 +3591,38 @@ def accept_loan(loan_id, borrower_id, term_days, origination_ratio=0.0):
 
 
 def _collect(c, chat_id, borrower_id, principal, interest, loan_id):
-    """Pulls a whole debt out of a borrower: wallet first, then their bank deposit, and
-    if they are still short the remainder is driven negative on the wallet.
+    """Pulls a whole debt out of a borrower, across every league they play in.
+
+    Order, and the order is the whole point:
+
+        1. the home group's wallet      (where the loan was taken)
+        2. the home group's deposit
+        3. EVERY OTHER GROUP, richest first: wallet, then deposit
+        4. only then, the home wallet goes negative for whatever is still short
 
     Reaching into the bank is deliberate. The bank is safe from *theft*, but if it were
     safe from *debt* too then borrowing and immediately hiding the money in it would be
     a free money printer.
 
-    The wallet-borne part of the debt is logged as two rows, not one: the interest under
-    'loan_interest' (real cost the handicap counts) and the rest under 'loan_principal'
-    (a transfer it ignores). Interest is charged against the wallet first, so the two
-    rows always sum to exactly the change the wallet actually saw - the ledger has to
-    reconstruct the balance, so it cannot book money the wallet never paid.
+    Reaching into OTHER GROUPS is deliberate for the same reason, one level up. `/vam`
+    is funded from the central bank's pooled deposits, which every group's savers paid
+    into - so a debt to it is a debt to the whole bot, not to one league. If collection
+    stopped at the home group, the dodge would be obvious and unstoppable: borrow in a
+    group you keep empty, let that one wallet go negative, and keep the size you already
+    had everywhere else. The lender's money is global, so the collector has to be too.
 
-    Returns (from_wallet, from_bank, shortfall)."""
+    Home first, though, and that is not arbitrary: the loan was taken against that
+    group's standing and its wallet is the one that agreed to it. Other leagues are only
+    reached for what the home group genuinely could not cover.
+
+    LEDGER. Each seizure is logged in the group it was actually taken from - that is
+    where the size left, so that is where size_log has to show it. Interest is charged
+    first and against the home group where possible (it is the home loan's cost), which
+    also keeps the invariant that each group's rows sum to exactly the change that
+    group's wallet saw. The ledger cannot book money a wallet never paid.
+
+    Returns (from_wallet, from_bank, shortfall, cross), where `cross` is
+    [(chat_id, from_wallet, from_bank), ...] for the other groups that were reached."""
     total = round(principal + interest, 2)
 
     c.execute('SELECT COALESCE(size,0) FROM users WHERE user_id = %s AND chat_id = %s FOR UPDATE',
@@ -3615,37 +3633,87 @@ def _collect(c, chat_id, borrower_id, principal, interest, loan_id):
     from_wallet = round(min(max(wallet, 0.0), total), 2)
     remaining = round(total - from_wallet, 2)
 
-    from_bank = 0.0
-    if remaining > 0.009:
+    def _seize_deposit(cid, want):
+        """Takes up to `want` out of one group's deposit. bank_log only: the wallet
+        never saw this size, so size_log must not claim it did."""
+        if want <= 0.009:
+            return 0.0
         c.execute('SELECT COALESCE(balance,0) FROM bank_accounts '
-                  'WHERE user_id = %s AND chat_id = %s FOR UPDATE', (borrower_id, chat_id))
+                  'WHERE user_id = %s AND chat_id = %s FOR UPDATE', (borrower_id, cid))
         brow = c.fetchone()
-        bank_bal = float(brow[0]) if brow else 0.0
-        from_bank = round(min(max(bank_bal, 0.0), remaining), 2)
-        if from_bank > 0:
-            c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
-                      'WHERE user_id = %s AND chat_id = %s RETURNING balance',
-                      (from_bank, borrower_id, chat_id))
-            _bank_log(c, chat_id, borrower_id, 'debt_seized', -from_bank, c.fetchone()[0],
-                      f'بدهی #{loan_id}')
-            remaining = round(remaining - from_bank, 2)
+        got = round(min(max(float(brow[0]) if brow else 0.0, 0.0), want), 2)
+        if got <= 0:
+            return 0.0
+        c.execute('UPDATE bank_accounts SET balance = COALESCE(balance,0) - %s '
+                  'WHERE user_id = %s AND chat_id = %s RETURNING balance',
+                  (got, borrower_id, cid))
+        note = f'بدهی #{loan_id}' if cid == chat_id else f'بدهی #{loan_id} (گروه دیگر)'
+        _bank_log(c, cid, borrower_id, 'debt_seized', -got, c.fetchone()[0], note)
+        return got
 
-    # Nothing left to take: the debt is still owed in full, so the wallet goes negative
-    # for the rest. The lender is made whole either way - that is what the borrower
-    # agreed to - and the hole is the borrower's problem to dig out of.
+    from_bank = _seize_deposit(chat_id, remaining)
+    remaining = round(remaining - from_bank, 2)
+
+    # --- every other league this borrower plays in, richest first ---------------
+    # Richest first so the debt clears in the fewest groups touched, and so it lands on
+    # the hoard the borrower actually moved the money to rather than nibbling every
+    # league they ever said hello in.
+    cross = []
+    if remaining > 0.009:
+        c.execute('SELECT u.chat_id, GREATEST(COALESCE(u.size,0), 0) AS wallet, '
+                  '       GREATEST(COALESCE(b.balance,0), 0) AS deposit '
+                  'FROM users u '
+                  'LEFT JOIN bank_accounts b '
+                  '  ON b.user_id = u.user_id AND b.chat_id = u.chat_id '
+                  'WHERE u.user_id = %s AND u.chat_id < 0 AND u.chat_id <> %s '
+                  '  AND (COALESCE(u.size,0) > 0 OR COALESCE(b.balance,0) > 0) '
+                  'ORDER BY (GREATEST(COALESCE(u.size,0),0) '
+                  '          + GREATEST(COALESCE(b.balance,0),0)) DESC, u.chat_id '
+                  'FOR UPDATE OF u', (borrower_id, chat_id))
+        others = c.fetchall()
+        for other_id, other_wallet, _other_dep in others:
+            if remaining <= 0.009:
+                break
+            took_w = round(min(float(other_wallet), remaining), 2)
+            if took_w > 0.009:
+                remaining = round(remaining - took_w, 2)
+            else:
+                took_w = 0.0
+            took_b = _seize_deposit(other_id, remaining)
+            remaining = round(remaining - took_b, 2)
+            if took_w > 0 or took_b > 0:
+                cross.append((other_id, took_w, took_b))
+
+    # Nothing left anywhere: the debt is still owed in full, so the HOME wallet goes
+    # negative for the rest. The lender is made whole either way - that is what the
+    # borrower agreed to - and the hole is the borrower's problem to dig out of. It is
+    # deliberately the home group that carries the hole: the other leagues were reached
+    # for what they actually had, never pushed into debt of their own.
     shortfall = remaining if remaining > 0.009 else 0.0
-    wallet_total = round(from_wallet + shortfall, 2)
 
-    interest_w = round(min(interest, wallet_total), 2)
-    principal_w = round(wallet_total - interest_w, 2)
-    if principal_w > 0.009:
-        _size_move(c, chat_id, borrower_id, -principal_w, 'loan_principal',
-                   f'بازپرداخت #{loan_id}')
-    if interest_w > 0.009:
-        _size_move(c, chat_id, borrower_id, -interest_w, 'loan_interest',
-                   f'سود بدهی #{loan_id}')
+    # --- book the wallet-borne seizures, interest first -------------------------
+    interest_left = round(interest, 2)
 
-    return (from_wallet, from_bank, shortfall)
+    def _book(cid, amount):
+        nonlocal interest_left
+        if amount <= 0.009:
+            return
+        i = round(min(interest_left, amount), 2)
+        p = round(amount - i, 2)
+        interest_left = round(interest_left - i, 2)
+        tail = '' if cid == chat_id else ' (گروه دیگر)'
+        if p > 0.009:
+            _size_move(c, cid, borrower_id, -p, 'loan_principal',
+                       f'بازپرداخت #{loan_id}{tail}')
+        if i > 0.009:
+            _size_move(c, cid, borrower_id, -i, 'loan_interest',
+                       f'سود بدهی #{loan_id}{tail}')
+
+    _book(chat_id, round(from_wallet + shortfall, 2))
+    for other_id, took_w, _took_b in cross:
+        _book(other_id, took_w)
+
+    return (from_wallet, from_bank, shortfall, cross)
 
 
 def settle_loan(loan_id, forced, today_str=''):
@@ -3669,8 +3737,9 @@ def settle_loan(loan_id, forced, today_str=''):
         principal = float(principal); due_amount = float(due_amount)
         interest = round(due_amount - principal, 2)
 
-        from_wallet, from_bank, shortfall = _collect(c, chat_id, borrower_id,
-                                                     principal, interest, loan_id)
+        from_wallet, from_bank, shortfall, cross = _collect(c, chat_id, borrower_id,
+                                                            principal, interest, loan_id)
+        from_other_groups = round(sum(w + b for _cid, w, b in cross), 2)
 
         if lender_id is None:
             # The principal was lent out of deposits, so retiring the debt is what puts
@@ -3725,7 +3794,11 @@ def settle_loan(loan_id, forced, today_str=''):
                 outcome = 'on_time' if delta > 0 else 'token'
         elif shortfall > 0:
             delta, outcome = CREDIT_SHORTFALL, 'shortfall'
-        elif from_bank > 0:
+        elif from_bank > 0 or from_other_groups > 0:
+            # Having the collector dig into your deposit or reach into another league
+            # are the same grade of failure: in both cases the home wallet could not
+            # cover what you borrowed against it. Folded into one tier rather than given
+            # a fifth constant, because the difference isn't one a player would feel.
             delta, outcome = CREDIT_BANK_SEIZED, 'bank_seized'
         else:
             delta, outcome = CREDIT_FORCED, 'forced'
@@ -3770,6 +3843,7 @@ def settle_loan(loan_id, forced, today_str=''):
             'borrower_id': borrower_id, 'borrower_name': borrower_name,
             'principal': principal, 'due_amount': due_amount, 'interest': interest,
             'from_wallet': from_wallet, 'from_bank': from_bank, 'shortfall': shortfall,
+            'cross': cross, 'from_other_groups': from_other_groups,
             'forced': forced, 'outcome': outcome, 'credit_delta': delta,
             'credit_score': new_score, 'was_late': was_late,
         }

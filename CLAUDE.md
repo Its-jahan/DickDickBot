@@ -587,10 +587,54 @@ actually paid. The size_log rows for a repayment must sum to the real change in
 `users.size`, so interest paid out of a seized bank deposit is recorded in `bank_log`
 only — the ledger cannot book money the wallet never paid.
 
-Debt collection deliberately reaches into `bank_accounts`. The bank is safe from
+### Collection reaches every league, because the money came from every league
+
+`/vam` is funded out of the central bank's **pooled** deposits — size that every group's
+savers paid in. A debt to it is therefore a debt to the whole bot, not to one league, and
+`_collect` is built to match:
+
+```
+1. the home group's wallet      (where the loan was taken)
+2. the home group's deposit
+3. EVERY OTHER GROUP the borrower plays in, richest first: wallet, then deposit
+4. only then, the home wallet goes negative for whatever is still short
+```
+
+**Stopping at the home group left an unstoppable dodge**: borrow in a group you keep
+empty, let that one wallet go negative, and keep everything you own in every other
+league. No fee or cap closes that — the lender's money is global, so the collector has to
+be too.
+
+Three details are load-bearing:
+
+- **Home first is not arbitrary.** The loan was taken against that group's standing and
+  its wallet is the one that agreed to it; other leagues are only reached for what the
+  home group genuinely could not cover.
+- **Only the home group is ever pushed below zero.** Other leagues are drained to exactly
+  what they had and no further — the hole belongs to the group that borrowed.
+- **Richest first**, so the debt clears in the fewest groups touched and lands on the
+  hoard the borrower actually moved the money to, rather than nibbling every league they
+  ever said hello in. Ties break on `chat_id` so it is deterministic.
+
+Each seizure is logged **in the group it came from** — that is where the size left, so
+that is where `size_log` has to show it. Interest is charged first and against the home
+group where possible (it is the home loan's cost), which preserves the invariant that
+each group's rows sum to exactly the change that group's wallet saw. Deposits stay
+`bank_log`-only, because the wallet never paid them.
+
+Reaching another league is graded as `CREDIT_BANK_SEIZED`, folded into the same tier as a
+seized deposit rather than given a fifth constant: in both cases the home wallet could
+not cover what was borrowed against it, and the difference isn't one a player would feel.
+
+Debt collection deliberately reaches into `bank_accounts` as well. The bank is safe from
 *theft*; if it were safe from *debt* as well, then borrowing and immediately hiding the
-proceeds in it would be a free money printer. Order is wallet → bank → negative wallet,
-and the lender is made whole in every case, so a default is still zero-sum.
+proceeds in it would be a free money printer. The lender is made whole in every case, so
+a default is still zero-sum.
+
+One trap for anyone writing a test here: `accept_loan` pays the principal **into the home
+wallet**, so a fixture that sets balances *before* the loan silently leaves the proceeds
+sitting in the home group and the collector never has to look anywhere else. Set the
+balances you want at settlement time *after* acceptance.
 
 `LOAN_MAX_PRINCIPAL_RATIO` caps a loan at the borrower's current size. That bound is what
 stops a single default from burying a player past any hope of recovery, and it is the
