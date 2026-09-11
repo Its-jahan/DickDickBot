@@ -1115,11 +1115,17 @@ def get_all_chats(include_inactive=False):
 
 def chats_without_title():
     """Groups we only know by id. The picker shows them as "گروه 717026", which is the
-    bot admitting it never saw a message from them - the daily job asks Telegram."""
+    bot admitting it never saw a message from them - the daily job asks Telegram.
+
+    Deactivated groups are included deliberately. They run nothing, so a name buys them
+    no gameplay - but the panel's inactive filter is a list the owner has to make
+    decisions from (reactivate this one? delete that one?), and a column of bare ids is
+    the same complaint this backfill exists to answer.
+    """
     with get_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT chat_id FROM chats WHERE (title IS NULL OR title = '') "
-                  "AND COALESCE(active, TRUE) ORDER BY chat_id")
+                  "ORDER BY COALESCE(active, TRUE) DESC, chat_id")
         return [r[0] for r in c.fetchall()]
 
 

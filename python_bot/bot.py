@@ -63,14 +63,18 @@ async def deactivate_idle_chats(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logging.exception("could not list unnamed chats")
         return
+    active = set(db.get_all_chats())
     for chat_id in missing[:40]:          # bounded: the rest get tomorrow's run
         try:
             chat = await context.bot.get_chat(chat_id)
             if chat and chat.title:
                 db.track_chat(chat_id, chat.title[:80])
         except Forbidden:
-            # Kicked out. Nothing to name, and nothing to run for it either.
-            db.set_chat_active(chat_id, False, reason='removed')
+            # Kicked out. Nothing to name, and nothing to run for it either - but only
+            # switch off a group that is still ON, or a getChat failure would overwrite
+            # the owner's own 'admin' reason with 'removed' and lose why it was off.
+            if chat_id in active:
+                db.set_chat_active(chat_id, False, reason='removed')
         except Exception:
             continue
 
