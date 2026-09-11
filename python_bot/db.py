@@ -272,6 +272,15 @@ def init_db():
         # 'blocked' (never). Heuristics can be gamed by someone patient enough with
         # enough alt accounts, so the last word has to be a human's.
         c.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS xfer_policy TEXT DEFAULT 'auto'")
+        # A group's lifecycle. `active` is what every scheduled job iterates, so a dead
+        # group stops costing the bot a nightly report, a tax run, a boss and a decree
+        # forever. `deactivated_reason` is the part that matters: 'idle' lifts the moment
+        # somebody speaks again, 'admin' does NOT - otherwise one message would undo the
+        # owner's decision.
+        c.execute('ALTER TABLE chats ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE')
+        c.execute('ALTER TABLE chats ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ')
+        c.execute('ALTER TABLE chats ADD COLUMN IF NOT EXISTS deactivated_reason TEXT')
+        c.execute('ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ')
         # Group name, so the web app's group picker can say "خانواده" instead of
         # "-1001858630001". Recorded opportunistically from whatever update comes in -
         # Telegram is the only source of it and the bot never asked before.
@@ -1088,11 +1097,141 @@ def get_chat_id_from_instance(chat_instance):
         return row[0] if row else None
 
 
-def get_all_chats():
+def get_all_chats(include_inactive=False):
+    """Every group the bot works for.
+
+    Deactivated groups are excluded by DEFAULT, because this is what the nightly jobs
+    iterate and a dead group should stop costing a report, a tax run, a boss and a
+    decree every single day. Pass include_inactive=True only to administer them.
+    """
     with get_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT chat_id FROM chats')
+        if include_inactive:
+            c.execute('SELECT chat_id FROM chats')
+        else:
+            c.execute('SELECT chat_id FROM chats WHERE COALESCE(active, TRUE)')
         return [r[0] for r in c.fetchall()]
+
+
+def chats_without_title():
+    """Groups we only know by id. The picker shows them as "گروه 717026", which is the
+    bot admitting it never saw a message from them - the daily job asks Telegram."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT chat_id FROM chats WHERE (title IS NULL OR title = '') "
+                  "AND COALESCE(active, TRUE) ORDER BY chat_id")
+        return [r[0] for r in c.fetchall()]
+
+
+def mark_chat_seen(chat_id):
+    """Somebody spoke. Stamps the activity clock and lifts an IDLE deactivation.
+
+    Deliberately does not lift an 'admin' one: the owner turned that group off on
+    purpose, and a single message must not undo it. Called from log_incoming only -
+    track_chat is called from forty places that are not evidence of anybody being there.
+    """
+    if chat_id >= 0:
+        return
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE chats SET last_seen_at = now(), "
+                  "active = CASE WHEN COALESCE(deactivated_reason,'') = 'idle' THEN TRUE "
+                  "              ELSE COALESCE(active, TRUE) END, "
+                  "deactivated_at = CASE WHEN COALESCE(deactivated_reason,'') = 'idle' "
+                  "                      THEN NULL ELSE deactivated_at END, "
+                  "deactivated_reason = CASE WHEN COALESCE(deactivated_reason,'') = 'idle' "
+                  "                          THEN NULL ELSE deactivated_reason END "
+                  "WHERE chat_id = %s", (chat_id,))
+
+
+def set_chat_active(chat_id, active, reason=None):
+    """The owner's switch. `reason` is stored so the idle sweep can tell its own work
+    apart from a decision a human made."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        if active:
+            c.execute('UPDATE chats SET active = TRUE, deactivated_at = NULL, '
+                      'deactivated_reason = NULL WHERE chat_id = %s', (chat_id,))
+        else:
+            c.execute('UPDATE chats SET active = FALSE, deactivated_at = now(), '
+                      'deactivated_reason = %s WHERE chat_id = %s',
+                      (reason or 'admin', chat_id))
+        return c.rowcount
+
+
+def sweep_idle_chats(days):
+    """Deactivate groups nobody has spoken in for `days`. Returns the chat_ids.
+
+    A group with no last_seen_at yet is left ALONE rather than swept: the column was
+    added after these groups existed, and reading "never recorded" as "never active"
+    would switch off every live group on the first night.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE chats SET active = FALSE, deactivated_at = now(), "
+                  "deactivated_reason = 'idle' "
+                  "WHERE COALESCE(active, TRUE) AND last_seen_at IS NOT NULL "
+                  "  AND last_seen_at < now() - (%s || ' days')::interval "
+                  "RETURNING chat_id", (str(int(days)),))
+        return [r[0] for r in c.fetchall()]
+
+
+def admin_list_chats(status='active'):
+    """Groups for the panel: name, players, size, and when anybody last spoke.
+    `status` is 'active', 'inactive' or 'all'."""
+    where = {'active': 'WHERE COALESCE(c.active, TRUE)',
+             'inactive': 'WHERE NOT COALESCE(c.active, TRUE)'}.get(status, '')
+    sql = (
+        "SELECT c.chat_id, c.title, COALESCE(c.active, TRUE), c.deactivated_reason, "
+        "       EXTRACT(EPOCH FROM (now() - c.last_seen_at))::bigint, "
+        "       COALESCE(u.players, 0), COALESCE(u.total, 0) "
+        "FROM chats c "
+        "LEFT JOIN (SELECT chat_id, COUNT(*) players, SUM(GREATEST(size,0)) total "
+        "           FROM users GROUP BY chat_id) u ON u.chat_id = c.chat_id "
+        + where +
+        " ORDER BY COALESCE(u.total, 0) DESC, c.chat_id")
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(sql)
+        return cur.fetchall()
+
+
+# Every table keyed by chat_id. Deleting a group means deleting its league: there is no
+# archive here, and the size in it is gone for good.
+CHAT_SCOPED_TABLES = (
+    'size_log', 'bank_log', 'events', 'night_report_sections', 'night_reports',
+    'rebalance_log', 'crypto_holdings', 'bank_accounts', 'inventory', 'achievements',
+    'consensus_vote_casts', 'consensus_votes', 'consensus_protection', 'boss_hits',
+    'bosses', 'lottery_tickets', 'pvp_match_bets', 'pvp_matches', 'heist_attempts',
+    'loans', 'decree_log', 'shop_purchases', 'shop_item_state', 'kingdom', 'economy',
+    'bank_treasury', 'claimed_challenges', 'chat_instances', 'users', 'chats',
+)
+
+# Nothing may be keyed by chat_id and missing from that tuple, or a deleted group leaves
+# rows behind that still answer queries about it - a stale chat_instances row in
+# particular would keep resolving an inline button into a league that no longer exists.
+# There is a regression test that diffs the tuple against information_schema.
+
+
+def delete_chat(chat_id):
+    """Erase a group and every row belonging to it, in ONE transaction.
+
+    Irreversible, and it destroys real players' size - the panel makes the caller type
+    the group id to confirm. A table that does not exist is skipped rather than failing
+    the whole delete.
+    """
+    removed = {}
+    with get_connection() as conn:
+        c = conn.cursor()
+        for table in CHAT_SCOPED_TABLES:
+            c.execute('SELECT 1 FROM information_schema.columns '
+                      'WHERE table_name = %s AND column_name = %s', (table, 'chat_id'))
+            if not c.fetchone():
+                continue
+            c.execute('DELETE FROM ' + table + ' WHERE chat_id = %s', (chat_id,))
+            if c.rowcount:
+                removed[table] = c.rowcount
+    return removed
 
 
 def get_user(user_id, chat_id, username, first_name):

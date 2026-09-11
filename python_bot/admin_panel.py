@@ -299,16 +299,37 @@ def save_transfer_settings():
     return redirect(url_for("index"))
 
 
+def _ago(seconds):
+    """'never', or how long ago in the units a person actually thinks in."""
+    if seconds is None:
+        return "هیچ‌وقت"
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60} دقیقه پیش"
+    if seconds < 86400:
+        return f"{seconds // 3600} ساعت پیش"
+    return f"{seconds // 86400} روز پیش"
+
+
 @app.route("/")
 @login_required
 def index():
+    # active | inactive | all. A dead group should not be scrolled past every time the
+    # owner opens the panel, but it must stay findable - hence the filter rather than
+    # hiding them outright.
+    status = request.args.get("status", "active")
+    if status not in ("active", "inactive", "all"):
+        status = "active"
     groups = []
-    for chat_id in db.get_all_chats():
+    for chat_id, title, active, reason, idle_s, players, total in db.admin_list_chats(status):
         stats = db.get_group_stats(chat_id)
         kingdom = db.get_kingdom(chat_id)
         groups.append({"chat_id": chat_id, "stats": stats,
+                       "title": title, "active": active, "reason": reason,
+                       "seen": _ago(idle_s),
                        "king": kingdom[1] if kingdom else None,
                        "consort": kingdom[3] if kingdom else None})
+    counts = {k: len(db.admin_list_chats(k)) for k in ("active", "inactive")}
     groups.sort(key=lambda g: -g["stats"]["players"])
     xfer_enabled = db.is_xfer_enabled()
     xfer_fee_pct = round(db.get_xfer_fee_ratio() * 100)
@@ -336,16 +357,54 @@ def index():
 </div>
 
 <h1>گروه‌ها</h1>
+<div class="card">
+  <div class="row">
+    <div style="flex:0 0 auto">
+      <a class="link" href="{{ url_for('index', status='active') }}"
+         {% if status == 'active' %}style="font-weight:800"{% endif %}>
+        فعال ({{ counts.active }})</a>
+    </div>
+    <div style="flex:0 0 auto">
+      <a class="link" href="{{ url_for('index', status='inactive') }}"
+         {% if status == 'inactive' %}style="font-weight:800"{% endif %}>
+        غیرفعال ({{ counts.inactive }})</a>
+    </div>
+    <div style="flex:0 0 auto">
+      <a class="link" href="{{ url_for('index', status='all') }}"
+         {% if status == 'all' %}style="font-weight:800"{% endif %}>همه</a>
+    </div>
+  </div>
+</div>
 {% for g in groups %}
 <div class="card">
   <div class="row">
     <div style="flex:2">
       <a class="link" style="font-size:17px" href="{{ url_for('group', chat_id=g.chat_id) }}">
-        گروه {{ g.chat_id }}</a>
+        {{ g.title or ('گروه ' ~ g.chat_id) }}</a>
+      <div class="dim">
+        <code>{{ g.chat_id }}</code> ·
+        {% if g.active %}<span class="pos">فعال</span>
+        {% else %}<span class="neg">غیرفعال</span>
+          {% if g.reason == 'idle' %}(بی‌فعالیت — با اولین پیام خودش برمی‌گرده)
+          {% elif g.reason == 'removed' %}(ربات از گروه بیرون انداخته شده)
+          {% else %}(دستی){% endif %}
+        {% endif %}
+        · آخرین فعالیت: {{ g.seen }}
+      </div>
       <div class="dim">
         {% if g.king %}👑 {{ g.king }}{% endif %}
         {% if g.consort %} · 💍 {{ g.consort }}{% endif %}
       </div>
+    </div>
+    <div style="flex:0 0 auto">
+      <form method="post" action="{{ url_for('set_group_active', chat_id=g.chat_id) }}">
+        <input type="hidden" name="status" value="{{ status }}">
+        {% if g.active %}
+          <button class="danger" name="active" value="0">غیرفعال کن</button>
+        {% else %}
+          <button name="active" value="1">فعال کن</button>
+        {% endif %}
+      </form>
     </div>
   </div>
   <div class="grid" style="margin-top:12px">
@@ -355,10 +414,46 @@ def index():
     <div class="stat"><b>{{ g.stats.biggest|int }}</b><span>بزرگ‌ترین</span></div>
     <div class="stat"><b>{{ g.stats.log_events }}</b><span>رویداد ثبت‌شده</span></div>
   </div>
+  <form method="post" action="{{ url_for('delete_group', chat_id=g.chat_id) }}"
+        class="row" style="margin-top:10px;align-items:flex-end"
+        onsubmit="return confirm('حذف کامل {{ g.title or g.chat_id }}؟ سایز همهٔ بازیکن‌هاش برای همیشه از بین می‌ره.')">
+    <div style="flex:1">
+      <label>حذف کامل — برای تأیید، ایدی گروه را بنویسید</label>
+      <input name="confirm" placeholder="{{ g.chat_id }}" autocomplete="off">
+    </div>
+    <div style="flex:0 0 auto"><button class="danger">حذف</button></div>
+  </form>
 </div>
 {% endfor %}
-{% if not groups %}<div class="card">هنوز گروهی ثبت نشده.</div>{% endif %}
-""", groups=groups, xfer_enabled=xfer_enabled, xfer_fee_pct=xfer_fee_pct)
+{% if not groups %}<div class="card">گروهی با این فیلتر نیست.</div>{% endif %}
+""", groups=groups, xfer_enabled=xfer_enabled, xfer_fee_pct=xfer_fee_pct,
+     status=status, counts=counts)
+
+
+@app.route("/group/<int(signed=True):chat_id>/active", methods=["POST"])
+@login_required
+def set_group_active(chat_id):
+    active = request.form.get("active") == "1"
+    db.set_chat_active(chat_id, active, reason="admin")
+    flash("گروه فعال شد." if active else
+          "گروه غیرفعال شد — دیگه گزارش شبانه، مالیات، باس و فرمان براش اجرا نمی‌شه. "
+          "چون دستی خاموشش کردی، با پیام‌دادن خودش روشن نمی‌شه.")
+    return redirect(url_for("index", status=request.form.get("status", "active")))
+
+
+@app.route("/group/<int(signed=True):chat_id>/delete", methods=["POST"])
+@login_required
+def delete_group(chat_id):
+    # Typing the id is the confirmation. This erases real players' size and there is no
+    # undo, so a misclick must not be enough - the browser confirm() is a nicety, this
+    # is the actual gate.
+    if (request.form.get("confirm") or "").strip() != str(chat_id):
+        flash("برای حذف باید دقیقاً ایدی گروه رو بنویسی. چیزی حذف نشد.")
+        return redirect(url_for("index", status="all"))
+    removed = db.delete_chat(chat_id)
+    rows = sum(removed.values())
+    flash(f"گروه {chat_id} کامل حذف شد ({rows} ردیف از {len(removed)} جدول).")
+    return redirect(url_for("index", status="all"))
 
 
 # chat_id is signed: Telegram group ids are negative and the default int

@@ -1671,6 +1671,45 @@ but not retroactively silent about the loan's eventual, very normal-looking outc
 one stat that gates borrowing, going through the same generic per-player fields form as
 `theft_luck`/`growth_mult`, with no code path that notifies anyone.
 
+### A group has a lifecycle, and `get_all_chats()` is where it bites
+
+A group that has gone quiet used to cost the bot a nightly report, a tax run, a boss, a
+decree and a growth reminder every single day, forever. `chats` now carries `active`,
+`deactivated_at`, `deactivated_reason` and `last_seen_at`, and
+**`db.get_all_chats()` excludes inactive groups by default** — that one default is what
+actually delivers the saving, because it is what every nightly job iterates. Pass
+`include_inactive=True` only to administer them; there is a regression test asserting no
+caller in `bot.py` passes it.
+
+Four rules hold the state machine together:
+
+- **Activity is stamped in exactly one place.** `db.mark_chat_seen` is called from
+  `log_incoming` and nowhere else. `track_chat` is called from forty places that are not
+  evidence of anybody being there (a job posting into the group is not the group being
+  alive), so stamping there would mean nothing is ever idle.
+- **`mark_chat_seen` lifts an `'idle'` deactivation and only an `'idle'` one.** The owner
+  switched a group off on purpose; one message must not undo that, and neither must a
+  group the bot was kicked out of (`'removed'`) come back. It still stamps
+  `last_seen_at` in every case, so a reactivated group is not immediately re-swept.
+- **`sweep_idle_chats` skips rows with `last_seen_at IS NULL`.** The column was added
+  after these groups existed, and reading "never recorded" as "never active" would have
+  switched off every live group on the first night it ran.
+- **Deactivation is reversible; deletion is not.** `db.delete_chat` erases every table in
+  `CHAT_SCOPED_TABLES` in one transaction, and that tuple must name **every** table keyed
+  by `chat_id` — a test diffs it against `information_schema` for exactly this reason. A
+  stale `chat_instances` row left behind would go on resolving an inline button into a
+  league that no longer exists. The panel makes the owner **type the chat id**: the
+  browser `confirm()` is a nicety, the typed id is the gate.
+
+`deactivate_idle_chats` (daily, 00:30 Tehran) runs the sweep and also **backfills group
+names**. `chats.title` is otherwise only recorded opportunistically from incoming
+messages, so a group that has not spoken since that was added showed in the app's picker
+as `گروه 717026` — the bot admitting it never saw a message from them. One `getChat` per
+unknown group, bounded to 40 a run, fixes it permanently; a `Forbidden` means the bot was
+kicked, which deactivates with `reason='removed'` instead of retrying forever. Note that
+`track_chat(chat_id, None)` must never blank a name already recorded — most of its
+callers pass no title at all.
+
 ### The nightly auto-handicap (`auto_handicap_job`)
 
 Runs daily at 00:20 Tehran, after `midnight_tasks` has closed the day out. For each

@@ -36,6 +36,45 @@ import db
 import lottery
 import decrees
 
+# A group nobody has spoken in for this long is switched off: no nightly report, no
+# tax run, no boss, no decree. It comes straight back the moment anybody speaks (see
+# db.mark_chat_seen), so this costs a dead group nothing and a live one nothing either.
+IDLE_CHAT_DAYS = 7
+
+
+async def deactivate_idle_chats(context: ContextTypes.DEFAULT_TYPE):
+    """Switch off groups that have gone quiet, and learn the names of the ones we only
+    know by id.
+
+    The name backfill lives here because it needs Telegram: chats.title is otherwise
+    recorded opportunistically from incoming messages, so a group that has not spoken
+    since that was added shows in the picker as "گروه 717026". One getChat per unknown
+    group, once a day, is cheap and fixes it permanently.
+    """
+    try:
+        gone = db.sweep_idle_chats(IDLE_CHAT_DAYS)
+        if gone:
+            logging.info("deactivated %d idle chats: %s", len(gone), gone)
+    except Exception:
+        logging.exception("idle chat sweep failed")
+
+    try:
+        missing = db.chats_without_title()
+    except Exception:
+        logging.exception("could not list unnamed chats")
+        return
+    for chat_id in missing[:40]:          # bounded: the rest get tomorrow's run
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            if chat and chat.title:
+                db.track_chat(chat_id, chat.title[:80])
+        except Forbidden:
+            # Kicked out. Nothing to name, and nothing to run for it either.
+            db.set_chat_active(chat_id, False, reason='removed')
+        except Exception:
+            continue
+
+
 async def midnight_tasks(context: ContextTypes.DEFAULT_TYPE):
     """Everything that closes out a Tehran day, in the order that keeps the books
     straight: settle yesterday's lottery, let the surviving bosses run, then collect
@@ -231,9 +270,14 @@ async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message is not None:
             # Cheapest place to learn a group's name: every delivered message carries it,
             # and this handler already sees every one of them.
-            if update.message.chat.id < 0 and update.message.chat.title:
+            if update.message.chat.id < 0:
                 try:
-                    db.track_chat(update.message.chat.id, update.message.chat.title)
+                    if update.message.chat.title:
+                        db.track_chat(update.message.chat.id, update.message.chat.title)
+                    # This is the ONLY place activity is stamped. track_chat is called
+                    # from forty places that are not evidence of anybody being there;
+                    # a delivered message is.
+                    db.mark_chat_seen(update.message.chat.id)
                 except Exception:
                     pass
             logging.info("RX message chat=%s user=%s text=%r",
@@ -7164,6 +7208,8 @@ if __name__ == '__main__':
     app.job_queue.run_daily(bank_interest_job, time=time(hour=0, minute=10, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(collect_loans_job, time=time(hour=0, minute=15, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_daily(auto_handicap_job, time=time(hour=0, minute=20, second=0, tzinfo=IRAN_TZ))
+    app.job_queue.run_daily(deactivate_idle_chats,
+                            time=time(hour=0, minute=30, second=0, tzinfo=IRAN_TZ))
     app.job_queue.run_repeating(random_event_job, interval=RANDOM_EVENT_INTERVAL_SECONDS, first=300)
     app.job_queue.run_repeating(crypto_tick_job, interval=CRYPTO_TICK_SECONDS, first=20)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
