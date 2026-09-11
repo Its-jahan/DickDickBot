@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, authHeaders, readLogin, ApiError } from '@/lib/api'
-import { TG } from '@/lib/tg'
+import { TG, waitForTelegram } from '@/lib/tg'
 import { num } from '@/lib/format'
 import { BottomNav, ThemeToggle, type TabKey } from '@/components/Shell'
 import { useToast } from '@/components/Toast'
@@ -42,6 +42,10 @@ export default function App() {
   }, [])
 
   const boot = useCallback(async () => {
+    // telegram-web-app.js is async, so at this point it may not have landed yet. Wait a
+    // bounded moment for it rather than deciding early and showing a Telegram user the
+    // browser login screen.
+    await waitForTelegram()
     if (!TG?.initData && !readLogin()) return setPhase('login')
     try {
       const r = await fetch('/api/groups', { headers: authHeaders() })
@@ -68,7 +72,19 @@ export default function App() {
   }, [logout])
 
   useEffect(() => {
-    try { TG?.ready(); TG?.expand() } catch { /* not in Telegram */ }
+    waitForTelegram().then(() => {
+      try {
+        TG?.ready()
+        TG?.expand()
+        // No saved choice means follow the client. The pre-paint script in index.html
+        // could not read this, because Telegram had not loaded yet.
+        let saved: string | null = null
+        try { saved = localStorage.getItem('theme') } catch { /* private window */ }
+        if (!saved && TG?.colorScheme) {
+          document.documentElement.classList.toggle('dark', TG.colorScheme === 'dark')
+        }
+      } catch { /* not in Telegram */ }
+    })
     ;(window as any).onTelegramAuth = (user: any) => {
       try { localStorage.setItem('login', JSON.stringify(user)) } catch { /* private window */ }
       setPhase('boot'); boot()

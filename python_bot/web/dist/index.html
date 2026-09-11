@@ -4,9 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>دودول</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&display=swap">
+<!-- ASYNC on purpose. A synchronous <script> in <head> blocks the parser, so if
+     telegram.org is slow or unreachable the player stares at a blank page until the
+     network gives up - nothing in <body> has even been parsed yet. Async means the
+     shell paints immediately and the app waits a bounded moment for Telegram to turn
+     up (see waitForTelegram); if it never does, the browser path takes over. -->
+<script async src="https://telegram.org/js/telegram-web-app.js"
+        onload="window.__tgSettled=1" onerror="window.__tgSettled=1"></script>
+<style>
+  /* Inline, so the shell has a background and a font before any request resolves. */
+  html { background: #0e1116; color-scheme: dark light; }
+  html:not(.dark) { background: #ffffff; }
+  body { margin: 0; font-family: Vazirmatn, "Segoe UI", system-ui, -apple-system, sans-serif; }
+  #boot { padding: 64px 16px; text-align: center; font-size: 14px; color: #8b95a7;
+          font-family: Vazirmatn, "Segoe UI", system-ui, -apple-system, sans-serif; }
+</style>
 <script>
   // Applied before the first paint so the app never flashes the wrong theme. Telegram
   // tells us the client's scheme; outside Telegram the OS does. An explicit choice the
@@ -25,6 +37,33 @@
   <link rel="stylesheet" crossorigin href="/assets/app.css">
 </head>
 <body>
-<div id="root"></div>
+<div id="root"><div id="boot">در حال بارگذاری…</div></div>
+<script>
+  // A white screen must never be silent again. Whatever goes wrong - a parse error on
+  // an old WebView, a blocked asset, a throw during the first render - the player sees
+  // a reason and we get something to act on. Shipping a blocking Google Fonts link is
+  // how this page spent a release stuck on blank white with nothing on screen to say so.
+  (function () {
+    var shown = false;
+    function fail(what) {
+      if (shown) return;
+      shown = true;
+      var root = document.getElementById('root');
+      if (!root || root.children.length > 1 || !document.getElementById('boot')) return;
+      root.innerHTML =
+        '<div id="boot"><div style="font-size:34px">🍆</div>' +
+        '<p style="margin:14px 0 6px;font-weight:700">اپ بالا نیومد</p>' +
+        '<p style="margin:0 0 14px">' + what + '</p>' +
+        '<p style="font-size:12px">اینترنتت رو چک کن و دوباره باز کن. ' +
+        'اگه باز هم نشد، توی گروه از دستورها استفاده کن.</p></div>';
+    }
+    window.addEventListener('error', function (e) {
+      fail('خطا: ' + String((e && e.message) || 'نامشخص').slice(0, 160));
+    });
+    // React mounting replaces #boot. If it is still there after this long, something
+    // never ran at all - which is the case a thrown error would not have caught.
+    setTimeout(function () { fail('بارگذاری بیشتر از حد معمول طول کشید.'); }, 12000);
+  })();
+</script>
 </body>
 </html>
