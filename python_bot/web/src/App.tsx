@@ -8,7 +8,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
 import { Home } from '@/screens/Home'
-import { Top } from '@/screens/Top'
+import { Feed } from '@/screens/Feed'
 import { Crypto } from '@/screens/Crypto'
 import { Bank } from '@/screens/Bank'
 import { Shop } from '@/screens/Shop'
@@ -18,7 +18,7 @@ import { ActionSheet, type ActionKind } from '@/screens/Actions'
 import { Login } from '@/screens/Login'
 
 const ENDPOINT: Record<TabKey, string> = {
-  home: '/api/home', top: '/api/top', crypto: '/api/crypto',
+  home: '/api/home', feed: '/api/feed', crypto: '/api/crypto',
   bank: '/api/bank', shop: '/api/shop', bag: '/api/inventory',
 }
 const USABLE = ['دستکش', 'کیسه', 'بلیت طلایی']
@@ -39,6 +39,10 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [xfer, setXfer] = useState(false)
   const [action, setAction] = useState<ActionKind | null>(null)
+  // The bell's badge. `seen` is the newest id the player has actually looked at, so the
+  // count survives switching tabs and does not reset just because the app re-rendered.
+  const [seen, setSeen] = useState(0)
+  const [unread, setUnread] = useState(0)
   const toast = useToast()
 
   const logout = useCallback(() => {
@@ -123,6 +127,24 @@ export default function App() {
 
   useEffect(() => { if (phase === 'play') reload() }, [phase, tab, chat, reload])
 
+  // Poll the feed for the badge while the player is on another tab. Cheap: it returns a
+  // count, not the list.
+  useEffect(() => {
+    if (phase !== 'play' || !chat) return
+    let alive = true
+    const check = async () => {
+      try {
+        const r = await api<any>(`/api/feed?since=${seen}`, undefined, chat)
+        if (!alive) return
+        setUnread(r.unread)
+        if (tab === 'feed') { setSeen(r.latest); setUnread(0) }
+      } catch { /* the badge is not worth a toast */ }
+    }
+    check()
+    const t = window.setInterval(check, 45000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [phase, chat, tab, seen])
+
   // Only ever the data for the tab being drawn. Anything else is a mismatch, and the
   // skeleton is the honest thing to show while the right data is on its way.
   const d = data && data.tab === tab ? data.payload : null
@@ -200,7 +222,7 @@ export default function App() {
         ) : tab === 'home' ? (
           <Home d={d} onPickGroup={() => setPhase('groups')} onTransfer={() => setXfer(true)}
                 onLogout={logout} onAction={setAction} />
-        ) : tab === 'top' ? <Top d={d} />
+        ) : tab === 'feed' ? <Feed d={d} />
           : tab === 'crypto' ? <Crypto d={d} chat={chat!} reload={reload} />
           : tab === 'bank' ? <Bank d={d} chat={chat!} reload={reload} />
           : tab === 'shop' ? <Shop d={d} chat={chat!} reload={reload} />
@@ -208,7 +230,7 @@ export default function App() {
       </Wrap>
       <Transfer chat={chat!} open={xfer} onClose={() => setXfer(false)} reload={reload} />
       <ActionSheet kind={action} chat={chat!} onClose={() => setAction(null)} reload={reload} />
-      <BottomNav tab={tab} onTab={setTab} />
+      <BottomNav tab={tab} onTab={setTab} unread={unread} />
     </>
   )
 }

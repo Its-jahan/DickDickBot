@@ -94,6 +94,8 @@ async def night_report(context, chat_id, key, rank, body, html_safe=True):
     """
     if not html_safe:
         body = _esc(body)
+    # The report is a Telegram rendering of the night; the feed gets the night itself.
+    record(chat_id, 'night', body)
     try:
         message_id, full = db.night_report_add(chat_id, tehran_today_str(), key, rank, body)
     except Exception:
@@ -1129,6 +1131,19 @@ DONATE_REFUSED, DONATE_RESULT = 'refused', 'result'
 
 def perform_donation(actor_id, actor_name, actor_username, chat_id, target_id,
                      target_name, amount):
+    """perform_donation, recorded at its single exit. See perform_theft."""
+    kind, text = _donation(actor_id, actor_name, actor_username, chat_id, target_id,
+                           target_name, amount)
+    if kind == DONATE_RESULT:
+        record(chat_id, 'donation',
+               f"🎁 {actor_name} به {target_name} سایز اهدا کرد.",
+               actor_id=actor_id, actor_name=actor_name,
+               target_id=target_id, target_name=target_name)
+    return kind, text
+
+
+def _donation(actor_id, actor_name, actor_username, chat_id, target_id,
+              target_name, amount):
     """A donation, with no Telegram in it. Returns (kind, text). Shared by /dd and the app."""
     db.track_chat(chat_id)
     db.get_user(actor_id, chat_id, actor_username, actor_name)
@@ -1877,6 +1892,8 @@ async def resolve_pvp_match(context: ContextTypes.DEFAULT_TYPE, match_id):
         if new_king:
             msg += coronation_text(chat_id, new_king, old_king_name)
 
+        record(chat_id, 'challenge', msg, actor_id=winner_id, actor_name=winner_name,
+               target_id=loser_id, target_name=loser_name)
         await deliver_pvp_message(context, chat_id, message_id, msg,
                                   inline_message_id=inline_message_id)
     except Exception:
@@ -2170,6 +2187,14 @@ async def grow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def perform_growth(user, chat_id):
+    """perform_growth, recorded at its single exit. See perform_theft."""
+    ok, text = await _growth_roll(user, chat_id)
+    if ok:
+        record(chat_id, 'growth', text, actor_id=user.id, actor_name=user.first_name)
+    return ok, text
+
+
+async def _growth_roll(user, chat_id):
     """The daily roll itself, shared by /d and the inline button.
 
     Returns (True, the message to show) or (False, why not). It deliberately does not
@@ -3188,10 +3213,49 @@ async def collect_king_tax(context: ContextTypes.DEFAULT_TYPE, chat_id, today_st
 # A theft either happened or it did not. REFUSED means nothing moved and the message is
 # private noise; RESULT means size changed and the group is entitled to see it. Every
 # surface that can steal decides presentation from this, and nothing else.
+# ---------------------------------------------------------------- the event log
+# The app's feed reads db.events, NOT Telegram. A chat message is one rendering of an
+# event; it is never the event itself. That inversion is the point: the game's record
+# lives in the database, so a player who never opens Telegram still sees everything that
+# happened, and a Telegram outage costs nothing but the chat copy.
+#
+# Kept forever on the server. Only the VIEW is scoped to a day.
+EV_GROUP, EV_PRIVATE = 'group', 'private'
+
+
+def record(chat_id, kind, text, audience=EV_GROUP, actor_id=None, actor_name=None,
+           target_id=None, target_name=None, amount=None):
+    """Write one line of the feed. Swallows everything: a feed entry must never be able
+    to undo the thing it is describing."""
+    if not chat_id or chat_id >= 0:
+        return          # a DM has no group feed
+    try:
+        db.log_event(chat_id, tehran_today_str(), kind, text, audience=audience,
+                     actor_id=actor_id, actor_name=actor_name, target_id=target_id,
+                     target_name=target_name, amount=amount)
+    except Exception:
+        logging.exception("could not record an event")
+
+
 THEFT_REFUSED, THEFT_RESULT = 'refused', 'result'
 
 
 def perform_theft(actor_id, actor_name, actor_username, chat_id, target_id, target_name):
+    """perform_theft, plus the one thing every caller would otherwise have to remember.
+
+    The recording lives HERE, at the single exit, rather than at the four call sites -
+    same discipline as size_log being written inside db.update_size: coverage that
+    depends on every caller remembering is coverage that drifts.
+    """
+    kind, text = _theft_attempt(actor_id, actor_name, actor_username, chat_id,
+                                target_id, target_name)
+    if kind == THEFT_RESULT:
+        record(chat_id, 'theft', text, actor_id=actor_id, actor_name=actor_name,
+               target_id=target_id, target_name=target_name)
+    return kind, text
+
+
+def _theft_attempt(actor_id, actor_name, actor_username, chat_id, target_id, target_name):
     """The whole theft, with no Telegram in it. Returns (kind, text).
 
     Extracted so /dozdi and the Mini App share ONE implementation. Two copies of odds

@@ -1536,6 +1536,43 @@ Three implementation details, in order of how easy they are to get wrong:
   is a regression test asserting the distinctive phrases appear in `transfer_callback`'s
   source as well as in what the endpoint sends.
 
+### The event log: the game's record is the database, not Telegram
+
+**A chat message is one RENDERING of an event. It is never the event itself.** That
+inversion is the architecture, and everything else here follows from it: a player who
+never opens Telegram still sees everything that happened, and a Telegram outage costs
+the chat copy and nothing else. There is a test that makes `_tg_send` throw and asserts
+the event is still recorded.
+
+`events` holds every one, **forever**. Only the *view* is scoped to a day — the bell tab
+asks for today, tomorrow it asks for tomorrow, and nothing is ever deleted. There is a
+test that ages an event into the past, asserts the feed stops showing it, and asserts the
+row is still on the server.
+
+**`record()` is called at the SINGLE EXIT of each shared function**, not at the call
+sites. `perform_theft` / `perform_donation` / `perform_growth` are now thin recording
+wrappers around `_theft_attempt` / `_donation` / `_growth_roll`. This is the same
+discipline as `size_log` being written inside `db.update_size` rather than at its fifty
+callers: coverage that depends on everyone remembering is coverage that drifts. A test
+asserts each wrapper records and each delegates.
+
+Three properties worth keeping:
+
+- **A refusal is not an event.** The feed is what happened, not what was attempted —
+  only the `RESULT` branch records.
+- **`audience`** splits group news from a personal fact. Everyone sees a theft; only you
+  see your own bank interest. `get_events` filters on `audience = 'group' OR actor_id =
+  you OR target_id = you`, and there are tests from both sides.
+- **`record()` and `db.log_event` swallow everything.** A feed entry must never be able
+  to undo the thing it describes.
+
+The bell carries an unread badge driven by `count_events_since(..., after_id)`, which
+returns a count rather than the list — it is polled while the player is on another tab,
+so it has to stay cheap.
+
+The leaderboard moved onto the home screen when the bell took the sixth tab; `/api/home`
+already computed the board for the rank, so it costs nothing extra.
+
 ### Group actions in the app, and the line between them and the chat
 
 **Theft and donation are in the app**, and the bot announces the outcome in the group.

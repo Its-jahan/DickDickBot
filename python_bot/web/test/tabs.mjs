@@ -32,7 +32,7 @@ page.on('console', m => { if (m.type() === 'error') errors.push('[console] ' + m
 await page.goto('http://127.0.0.1:8099/', { waitUntil: 'domcontentloaded' })
 await page.waitForSelector('nav button', { timeout: 20000 })
 
-const TABS = ['خونه', 'جدول', 'بازار', 'بانک', 'فروشگاه', 'کوله']
+const TABS = ['خونه', 'رویدادها', 'بازار', 'بانک', 'فروشگاه', 'کوله']
 const snap = async () => (await page.innerText('#root')).replace(/\s+/g, ' ').slice(0, 55)
 
 console.log('--- one pass, waiting between ---')

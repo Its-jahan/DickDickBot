@@ -335,6 +335,7 @@ def api_home():
     return jsonify({
         'ok': True,
         'name': name,
+        'me_id': uid,
         'size': float(size or 0),
         'perk': perk,
         'grown_today': last_grown == bot.tehran_today_str(),
@@ -349,6 +350,13 @@ def api_home():
         'consort': crown[3] if crown else None,
         'inflation': float(econ[0]),
         'unrest': float(econ[1]),
+        # The board is already computed above for the rank, so the leaderboard costs
+        # nothing extra here - and it belongs on the home screen now that the bell has
+        # the sixth tab.
+        'board': [{'user_id': r[0], 'name': r[1], 'size': float(r[2] or 0),
+                   'streak': int(r[3] or 0), 'king': r[0] == king_id,
+                   'consort': r[0] == (crown[2] if crown else None)}
+                  for r in board],
     })
 
 
@@ -860,6 +868,14 @@ def api_transfer():
     # Both groups hear about it, exactly as they would have from /enteghal. Dispatched
     # after the transfer has committed and off the request, so a failed announcement
     # can neither undo it nor change what the player is told.
+    day = bot.tehran_today_str()
+    db.log_event(chat_id, day, 'transfer',
+                 f"🔁 {name} {int(amount)} سانت از این گروه فرستاد به {dest_title}.",
+                 actor_id=uid, actor_name=name, amount=amount)
+    db.log_event(dest_chat, day, 'transfer',
+                 f"🔁 {name} {int(delivered)} سانت از یه گروه دیگه آورد اینجا!",
+                 actor_id=uid, actor_name=name, amount=delivered)
+
     _run_bg(_announce_transfer, name, amount, delivered, fee, chat_id, dest_chat,
             dest_title)
 
@@ -954,6 +970,38 @@ def api_donate():
     _announce(chat_id, _esc_plain(
         f"🎁 {name} {int(amount)} سانت به {target_name} اهدا کرد."))
     return jsonify({'ok': True, 'message': text})
+
+
+@app.get('/api/feed')
+def api_feed():
+    """Today's log for this group, from the EVENT TABLE - not from Telegram.
+
+    The whole point of the inversion: a player who never opens Telegram still sees
+    everything that happened, and a Telegram outage costs the chat copy and nothing
+    else. `since` powers the unread badge without re-sending the list.
+    """
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    db.get_user(uid, chat_id, username, name)
+    day = bot.tehran_today_str()
+    rows = db.get_events(chat_id, day, uid)
+    try:
+        since = int(request.args.get('since') or 0)
+    except (TypeError, ValueError):
+        since = 0
+    return jsonify({
+        'ok': True,
+        'day': day,
+        'unread': db.count_events_since(chat_id, day, uid, since) if since else 0,
+        'latest': rows[0][0] if rows else 0,
+        'events': [{
+            'id': r[0], 't': r[1], 'kind': r[2], 'private': r[3] != 'group',
+            'actor_id': r[4], 'actor': r[5], 'target_id': r[6], 'target': r[7],
+            'amount': r[8], 'text': r[9],
+        } for r in rows],
+    })
 
 
 @app.get('/api/config')

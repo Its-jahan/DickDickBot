@@ -294,6 +294,29 @@ def init_db():
             )
         ''')
 
+        # THE EVENT LOG. The app's feed reads this, not Telegram - a chat message is a
+        # rendering of an event, never the event itself. Kept forever on the server;
+        # only the VIEW is scoped to a day.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                day TEXT,
+                at TIMESTAMPTZ DEFAULT now(),
+                kind TEXT,
+                audience TEXT DEFAULT 'group',
+                actor_id BIGINT,
+                actor_name TEXT,
+                target_id BIGINT,
+                target_name TEXT,
+                amount DOUBLE PRECISION,
+                text TEXT
+            )
+        ''')
+        # The feed's only two reads: this group's day, and one player's own day.
+        c.execute('CREATE INDEX IF NOT EXISTS events_chat_day ON events (chat_id, day, id DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS events_actor ON events (actor_id, day)')
+
         # One message per group per night, edited in place as each nightly job lands its
         # section, instead of seven separate messages between 00:00 and 00:20.
         # Price history for the market chart. Downsampled on write (see
@@ -923,6 +946,52 @@ def crypto_prune_history(keep_days=7):
         c = conn.cursor()
         c.execute("DELETE FROM crypto_history WHERE at < now() - (%s || ' days')::interval",
                   (str(int(keep_days)),))
+
+
+def log_event(chat_id, day, kind, text, audience='group', actor_id=None,
+              actor_name=None, target_id=None, target_name=None, amount=None):
+    """Record that something happened. Never raises - a feed entry must not be able to
+    undo the thing it describes."""
+    try:
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute('INSERT INTO events (chat_id, day, kind, audience, actor_id, '
+                      'actor_name, target_id, target_name, amount, text) '
+                      'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                      (chat_id, day, kind, audience, actor_id, actor_name,
+                       target_id, target_name,
+                       float(amount) if amount is not None else None, text))
+    except Exception:
+        import logging
+        logging.exception('event log write failed')
+
+
+def get_events(chat_id, day, user_id, limit=200):
+    """One day's feed for one player: everything the group can see, plus that player's
+    own private entries. Somebody else's bank balance is not group news.
+
+    The day is passed in rather than derived here so the caller decides what "today"
+    means - db.py has no business owning the game's calendar.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, EXTRACT(EPOCH FROM at)::bigint, kind, audience, actor_id, "
+                  "actor_name, target_id, target_name, amount, text FROM events "
+                  "WHERE chat_id = %s AND day = %s AND (audience = 'group' "
+                  "  OR actor_id = %s OR target_id = %s) "
+                  "ORDER BY id DESC LIMIT %s",
+                  (chat_id, day, user_id, user_id, int(limit)))
+        return c.fetchall()
+
+
+def count_events_since(chat_id, day, user_id, after_id):
+    """How many entries a player has not seen, for the badge on the bell."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM events WHERE chat_id = %s AND day = %s "
+                  "AND id > %s AND (audience = 'group' OR actor_id = %s OR target_id = %s)",
+                  (chat_id, day, int(after_id or 0), user_id, user_id))
+        return int(c.fetchone()[0])
 
 
 def night_report_add(chat_id, day, key, rank, body):

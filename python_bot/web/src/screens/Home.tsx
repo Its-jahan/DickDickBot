@@ -1,4 +1,5 @@
-import { Card, CardContent } from '@/components/ui/card'
+import { Card, CardContent, CardTitle } from '@/components/ui/card'
+import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { fa, num } from '@/lib/format'
@@ -67,6 +68,28 @@ export function Home({ d, onPickGroup, onTransfer, onLogout, onAction }: {
         <Stat label="تورم" value={`${num(d.inflation, 2)}×`}
               sub={`خشم مردم ${fa(Math.round(d.unrest))}`} />
       </div>
+
+      <Card>
+        <CardContent className="pt-4">
+          <CardTitle className="mb-2 text-base">🏆 جدول گروه</CardTitle>
+          <div className="divide-y">
+            {(d?.board ?? []).map((r: any, i: number) => (
+              <div key={r.user_id}
+                   className={cn('flex items-center gap-3 py-2',
+                     r.user_id === d.me_id && '-mx-2 rounded-md bg-primary/10 px-2')}>
+                <span className="w-6 text-center text-sm text-muted-foreground tnum">
+                  {i < 3 ? ['🥇', '🥈', '🥉'][i] : fa(i + 1)}
+                </span>
+                <span className="min-w-0 flex-1 truncate">
+                  {r.name} {r.king ? '👑' : ''}{r.consort ? '💍' : ''}
+                  {r.streak > 1 && <span className="ms-1 text-xs text-muted-foreground">🔥{fa(r.streak)}</span>}
+                </span>
+                <b className="tnum">{num(r.size)}</b>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardContent className="space-y-3 pt-4">
