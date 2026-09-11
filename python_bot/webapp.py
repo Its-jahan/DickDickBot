@@ -310,7 +310,10 @@ def api_home():
     if err:
         return err
     uid, name, username, chat_id = sc
-    size, perk, last_grown = db.get_user(uid, chat_id, username, name)
+    # get_user returns (size, last_grown, perk) - see its SELECT. Reading it as
+    # (size, perk, last_grown) compared the PERK against today's date, so grown_today
+    # was permanently False and the perk badge showed a date string.
+    size, last_grown, perk = db.get_user(uid, chat_id, username, name)
     board = db.get_top_users_full(chat_id)
     rank = next((i + 1 for i, r in enumerate(board) if r[0] == uid), None)
     crown, _changed = bot.refresh_king(chat_id)
@@ -364,7 +367,7 @@ def api_bank():
     if err:
         return err
     uid, name, username, chat_id = sc
-    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     balance, dep_date, dep_today = db.get_bank(uid, chat_id)
     if dep_date != bot.tehran_today_str():
         dep_today = 0.0
@@ -397,7 +400,7 @@ def api_crypto():
     if err:
         return err
     uid, name, username, chat_id = sc
-    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     held = {s: (float(a), float(c)) for s, a, c in db.crypto_holdings_of(uid, chat_id)}
     coins = []
     for sym, cname, mid, prev_mid, base, vol, net in db.crypto_all():
@@ -428,7 +431,7 @@ def api_shop():
     if err:
         return err
     uid, name, username, chat_id = sc
-    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     econ = db.get_economy(chat_id)
     day, week = bot.tehran_today_str(), bot.tehran_week_str()
     items = []
@@ -529,7 +532,7 @@ def api_deposit():
     amount = _amount(request.get_json(silent=True) or {})
     if amount is None or amount < bot.BANK_MIN_DEPOSIT:
         return _fail(f'حداقل واریز {bot.BANK_MIN_DEPOSIT} سانته')
-    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     ok, a, b, fee = db.bank_deposit(uid, chat_id, amount, bot.tehran_today_str(),
                                     bot._bank_daily_cap(wallet),
                                     bot.fee_of(chat_id, bot.BANK_DEPOSIT_FEE_RATIO))
@@ -574,7 +577,7 @@ def api_crypto_buy():
         return _fail(f'حداقل خرید {bot.CRYPTO_MIN_TRADE} سانته')
     if symbol not in {r[0] for r in db.crypto_all()}:
         return _fail('همچین کوینی نداریم')
-    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     res = db.crypto_buy(uid, chat_id, symbol, spend, bot.CRYPTO_FEE_RATIO,
                         bot.tehran_today_str(), bot._crypto_daily_cap(wallet),
                         bot.CRYPTO_IMPACT_DEPTH, bot.CRYPTO_IMPACT_CAP)
@@ -761,7 +764,7 @@ def api_transfer_info():
     if err:
         return err
     uid, name, username, chat_id = sc
-    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     enabled = db.is_xfer_enabled()
     source_ok, source_reason = bot.check_xfer_source(chat_id, uid)
 
@@ -821,7 +824,7 @@ def api_transfer():
     # Checked BEFORE the cooldown is claimed: a transfer refused for being larger than
     # the wallet must not cost the player their 24 hours. transfer_callback does the
     # same, and the two have to stay in step.
-    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     if wallet < amount:
         return _fail(f'این‌قدر سانت نداری! {int(wallet)} سانت داری.')
 
