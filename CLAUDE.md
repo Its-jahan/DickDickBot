@@ -1312,6 +1312,33 @@ needs it, so it is a separate chunk: the main bundle is ~84 KB gzipped and the f
 screens that draw no chart never download the chart library. There is a test asserting
 the split survives.
 
+### Run the UI, not just the API
+
+The rewrite shipped with **tab switching completely broken** and all thirty Python
+suites green, because they test the API and this was a render bug. It is the same lesson
+as "run the handlers, not just the SQL", one layer up.
+
+What went wrong is worth knowing because it is the default shape of this mistake:
+`setTab` re-renders **immediately**, long before the new data arrives, so `<Top>` was
+handed the *home* payload and read `.rows.length` off `undefined`. That threw during
+render, React unmounted the tree, and the player lost the nav as well — so they could not
+even switch back. From the outside it looks exactly like "the app crashes and loads
+nothing".
+
+Two rules came out of it:
+
+- **The payload is tagged with the tab it belongs to** (`{tab, payload}`) and rendering
+  is gated on the tag matching; a monotonic `reqRef` makes a slow response for a tab you
+  have already left unable to overwrite the one you are on. Never hand a screen the raw
+  state.
+- **No screen may be the thing that takes the app down.** Every list read is
+  `d?.field ?? []`, as defence in depth behind the gate.
+
+`test_webapp_build.py` asserts both statically. `web/test/tabs.mjs` drives the real thing
+in Chromium — Playwright is not a repo dependency and CI does not run it, so run it by
+hand after changing anything that decides what gets rendered. It was verified against the
+broken build first: the click on the third tab times out because the nav no longer exists.
+
 ### Light and dark, decided before first paint
 
 The tokens are shadcn's: light on bare `:root`, dark under an explicit `.dark` class, so

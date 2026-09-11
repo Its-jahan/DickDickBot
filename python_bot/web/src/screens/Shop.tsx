@@ -31,7 +31,7 @@ export function Shop({ d, chat, reload }: { d: any; chat: number; reload: () => 
           <b className="tnum">{num(d.wallet)} سانت</b>
         </CardContent>
       </Card>
-      {d.items.map((it: any) => {
+      {(d?.items ?? []).map((it: any) => {
         const out = it.day_left <= 0 || it.week_left <= 0
         return (
           <Card key={it.name}>

@@ -9,7 +9,8 @@ export function Bag({ d, chat, reload }: { d: any; chat: number; reload: () => P
   const [busy, setBusy] = useState<string | null>(null)
   const toast = useToast()
 
-  if (!d.items.length) {
+  const items: any[] = d?.items ?? []
+  if (!items.length) {
     return (
       <div className="py-16 text-center text-sm text-muted-foreground">
         کوله‌ت خالیه — از فروشگاه بخر یا با /d شانس بیار
@@ -32,7 +33,7 @@ export function Bag({ d, chat, reload }: { d: any; chat: number; reload: () => P
 
   return (
     <div className="space-y-3">
-      {d.items.map((it: any) => (
+      {items.map((it: any) => (
         <Card key={it.name}>
           <CardContent className="pt-4">
             <div className="flex items-center justify-between gap-3">

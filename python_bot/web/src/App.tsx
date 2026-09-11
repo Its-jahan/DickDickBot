@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, authHeaders, readLogin, ApiError } from '@/lib/api'
 import { TG, waitForTelegram } from '@/lib/tg'
 import { num } from '@/lib/format'
@@ -31,7 +31,10 @@ export default function App() {
   const [groups, setGroups] = useState<any[]>([])
   const [chat, setChat] = useState<number | null>(null)
   const [tab, setTab] = useState<TabKey>('home')
-  const [data, setData] = useState<any | null>(null)
+  const [data, setData] = useState<{ tab: TabKey; payload: any } | null>(null)
+  // Monotonic request id: a slow response for a tab you have already left must not
+  // overwrite the one you are looking at now.
+  const reqRef = useRef(0)
   const [loading, setLoading] = useState(false)
   const [xfer, setXfer] = useState(false)
   const toast = useToast()
@@ -94,20 +97,33 @@ export default function App() {
 
   const reload = useCallback(async () => {
     if (!chat) return
+    const want = tab
+    const seq = ++reqRef.current
     setLoading(true)
     try {
-      const d = await api<any>(ENDPOINT[tab], undefined, chat)
-      if (tab === 'bag') d.items.forEach((i: any) => { i.usable = USABLE.includes(i.name) })
-      setData(d)
+      const d = await api<any>(ENDPOINT[want], undefined, chat)
+      if (want === 'bag') d.items.forEach((i: any) => { i.usable = USABLE.includes(i.name) })
+      // Tag the payload with the tab it belongs to. Rendering is gated on that tag, so a
+      // screen can never be handed another screen's data - which is what made switching
+      // tabs crash: setTab re-renders IMMEDIATELY, long before the new data arrives, so
+      // <Top> got the home payload and read .rows.length off undefined.
+      if (seq === reqRef.current) setData({ tab: want, payload: d })
     } catch (e: any) {
-      setData(null)
-      toast(e.message, true)
+      // A response that lost the race must not clear the screen the player is now on.
+      if (seq === reqRef.current) {
+        setData(null)
+        toast(e.message, true)
+      }
     } finally {
-      setLoading(false)
+      if (seq === reqRef.current) setLoading(false)
     }
   }, [chat, tab, toast])
 
   useEffect(() => { if (phase === 'play') reload() }, [phase, tab, chat, reload])
+
+  // Only ever the data for the tab being drawn. Anything else is a mismatch, and the
+  // skeleton is the honest thing to show while the right data is on its way.
+  const d = data && data.tab === tab ? data.payload : null
 
   const choose = (id: number) => {
     try { localStorage.setItem('chat', String(id)) } catch { /* private window */ }
@@ -171,17 +187,21 @@ export default function App() {
     <>
       <Wrap>
         {header}
-        {loading && !data ? (
-          <><Skeleton className="h-32 w-full" /><div className="h-3" /><Skeleton className="h-28 w-full" /></>
-        ) : !data ? (
-          <div className="py-16 text-center text-sm text-muted-foreground">چیزی برای نمایش نیست</div>
+        {!d ? (
+          loading ? (
+            <><Skeleton className="h-32 w-full" /><div className="h-3" /><Skeleton className="h-28 w-full" /></>
+          ) : (
+            <div className="py-16 text-center text-sm text-muted-foreground">
+              چیزی برای نمایش نیست
+            </div>
+          )
         ) : tab === 'home' ? (
-          <Home d={data} onPickGroup={() => setPhase('groups')} onTransfer={() => setXfer(true)} onLogout={logout} />
-        ) : tab === 'top' ? <Top d={data} />
-          : tab === 'crypto' ? <Crypto d={data} chat={chat!} reload={reload} />
-          : tab === 'bank' ? <Bank d={data} chat={chat!} reload={reload} />
-          : tab === 'shop' ? <Shop d={data} chat={chat!} reload={reload} />
-          : <Bag d={data} chat={chat!} reload={reload} />}
+          <Home d={d} onPickGroup={() => setPhase('groups')} onTransfer={() => setXfer(true)} onLogout={logout} />
+        ) : tab === 'top' ? <Top d={d} />
+          : tab === 'crypto' ? <Crypto d={d} chat={chat!} reload={reload} />
+          : tab === 'bank' ? <Bank d={d} chat={chat!} reload={reload} />
+          : tab === 'shop' ? <Shop d={d} chat={chat!} reload={reload} />
+          : <Bag d={d} chat={chat!} reload={reload} />}
       </Wrap>
       <Transfer chat={chat!} open={xfer} onClose={() => setXfer(false)} reload={reload} />
       <BottomNav tab={tab} onTab={setTab} />

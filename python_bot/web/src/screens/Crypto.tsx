@@ -42,7 +42,7 @@ export function Crypto({ d, chat, reload }: { d: any; chat: number; reload: () =
 
       <Card>
         <CardContent className="divide-y pt-2">
-          {d.coins.map((c: any) => (
+          {(d?.coins ?? []).map((c: any) => (
             <button key={c.symbol} onClick={() => setOpen(c)} className="flex w-full items-center gap-3 py-3 text-right">
               <span className={cn('h-2 w-2 shrink-0 rounded-full',
                 c.change > 0.01 ? 'bg-success' : c.change < -0.01 ? 'bg-destructive' : 'bg-muted-foreground')} />

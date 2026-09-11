@@ -5,13 +5,17 @@ import { cn } from '@/lib/utils'
 const MEDAL = ['🥇', '🥈', '🥉']
 
 export function Top({ d }: { d: any }) {
-  if (!d.rows.length) {
+  // Defence in depth. App gates rendering on the payload belonging to this tab, so an
+  // empty list here should be a real empty list - but a screen must never be the thing
+  // that takes the whole app down, which is exactly what .rows.length on undefined did.
+  const rows: any[] = d?.rows ?? []
+  if (!rows.length) {
     return <div className="py-16 text-center text-sm text-muted-foreground">هنوز کسی بازی نکرده</div>
   }
   return (
     <Card>
       <CardContent className="divide-y pt-2">
-        {d.rows.map((r: any, i: number) => (
+        {rows.map((r: any, i: number) => (
           <div
             key={r.user_id}
             className={cn('flex items-center gap-3 py-2.5', r.user_id === d.me && '-mx-2 rounded-md bg-primary/10 px-2')}
