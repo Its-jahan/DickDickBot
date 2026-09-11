@@ -4158,6 +4158,22 @@ def try_start_xfer(user_id, chat_id, cooldown_seconds):
         return (False, int(row[0]) if row and row[0] and row[0] > 0 else 0)
 
 
+def get_xfer_wait_remaining(user_id, chat_id, cooldown_seconds):
+    """Seconds left on the transfer cooldown, WITHOUT claiming it.
+
+    try_start_xfer is a claim: calling it to find out whether you may transfer would
+    consume the slot for anyone merely opening the screen. The Mini App needs to show
+    the countdown before the player commits, so it needs a read that costs nothing."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM '
+                  '  (last_xfer_at + (%s || %s)::interval - NOW())))) '
+                  'FROM users WHERE user_id = %s AND chat_id = %s',
+                  (cooldown_seconds, ' seconds', user_id, chat_id))
+        row = c.fetchone()
+        return int(row[0]) if row and row[0] else 0
+
+
 def cross_group_transfer(user_id, from_chat, to_chat, amount, fee_ratio):
     """Moves one player's own size from one group to another, minus a heavy fee.
 

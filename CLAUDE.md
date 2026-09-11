@@ -1193,6 +1193,32 @@ It deliberately does **not** do the Cloudflare DNS record (that needs an API tok
 script has no business holding — it checks the name resolves and stops with instructions)
 or BotFather `/setdomain` (there is no API for it).
 
+### `/enteghal` is in the app, and every gate came with it
+
+Transfer belongs here for the same reason the bank does: it only touches the player's own
+state across their own groups, so there is nobody in a chat who needs to see it happen.
+
+`api_transfer` mirrors `transfer_callback` **step for step, in the same order, with the
+same functions** — `is_xfer_enabled`, the minimum, a `< 0` destination that isn't the
+current group, membership re-checked against `get_user_groups` (the client supplies the
+destination here exactly as `callback_data` does there), `check_xfer_source`, the wallet,
+then `try_start_xfer`. Skipping any one of them would make the browser the soft way round
+the farm-group gate the chat enforces, which is the one thing this feature cannot be.
+There is a suite asserting each refusal individually, plus that a blocked source group and
+the owner's global switch both still hold from the web.
+
+Two details worth keeping:
+
+- **`db.get_xfer_wait_remaining` exists because `try_start_xfer` is a claim, not a
+  question.** The screen has to show the countdown before the player commits, and calling
+  the claim to find out would consume the slot for anyone who merely opened the sheet.
+- **The wallet is checked *before* the cooldown is claimed**, in both the callback and the
+  endpoint. It used to be checked only inside `cross_group_transfer`, which meant a
+  transfer refused for being bigger than your wallet still cost you 24 hours for a typo.
+
+The UI is a sheet off the home screen rather than a seventh nav tab — six is already a lot
+at phone width, and this is something you do occasionally rather than a screen you live on.
+
 ### What is deliberately not in it
 
 Challenges, theft, `/ejma`, heists, decrees and the crown's powers are absent by design,

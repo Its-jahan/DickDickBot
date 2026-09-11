@@ -26,6 +26,7 @@ h2{font-size:17px;margin:0 0 12px}
 .up{color:var(--up)} .dn{color:var(--dn)} .gold{color:var(--gold)}
 .pill{background:var(--card2);border:1px solid var(--line);border-radius:999px;
   padding:3px 11px;font-size:12px;color:var(--dim);white-space:nowrap}
+.xdot{opacity:.75;margin-left:5px}
 button{font-family:inherit;font-size:14px;border:0;border-radius:12px;padding:11px 16px;
   background:var(--acc);color:#fff;font-weight:700;cursor:pointer}
 button:disabled{opacity:.45}
@@ -175,6 +176,7 @@ V.home = d => `
   <div class="card">
     <div class="row" style="margin-bottom:10px">
       <button class="sm ghost" onclick="pickGroup()">تعویض گروه</button>
+      <button class="sm" onclick="xferSheet()">🔁 انتقال بین‌گروهی</button>
       ${TG?.initData ? '' : '<button class="sm ghost" onclick="logout()">خروج از حساب</button>'}
     </div>
     <div class="dim" style="margin-bottom:10px">اینا فقط توی گروه کار می‌کنن، چون بقیه باید ببیننشون:</div>
@@ -328,6 +330,84 @@ window.useItem = async name => {
   try { const r = await api('/api/inventory/use', { item: name }); toast(r.message); await render(); }
   catch (e) { toast(e.message, true); }
 };
+// ---------------------------------------------------------------- cross-group transfer
+// A sheet rather than a seventh nav tab: six is already a lot at phone width, and this
+// is a thing you do occasionally, not a screen you live on.
+let xferTo = null;
+
+window.xferSheet = async () => {
+  sheet('<div class="dim" style="text-align:center;padding:20px">...</div>');
+  let d;
+  try { d = await api('/api/transfer'); }
+  catch (e) { return sheet(`<div class="empty">${esc(e.message)}</div>`); }
+  S.data.xfer = d;
+
+  if (!d.enabled) return sheet(`<div class="row"><b style="font-size:18px">🔁 انتقال بین‌گروهی</b></div>
+    <div class="dim" style="margin-top:12px">🔒 این قابلیت الان بسته‌ست.</div>`);
+  if (!d.source_ok) return sheet(`<div class="row"><b style="font-size:18px">🔁 انتقال بین‌گروهی</b></div>
+    <div class="dim" style="margin-top:12px">${esc(d.source_reason || 'این گروه اجازهٔ خروج سایز نداره.')}</div>
+    <div class="dim" style="margin-top:10px;font-size:12px">سایز فقط از یه گروهِ واقعی و فعال
+      می‌تونه خارج بشه — این جلوی ساختن گروه الکی و پروارکردن سایز توش رو می‌گیره.</div>`);
+  if (!d.groups.length) return sheet(`<div class="row"><b style="font-size:18px">🔁 انتقال بین‌گروهی</b></div>
+    <div class="dim" style="margin-top:12px">تو هیچ گروه دیگه‌ای بازی نمی‌کنی!
+      اول تو یه گروه دیگه <b>/d</b> بزن.</div>`);
+  if (d.wait_seconds > 0) {
+    const h = Math.floor(d.wait_seconds / 3600), m = Math.floor((d.wait_seconds % 3600) / 60);
+    return sheet(`<div class="row"><b style="font-size:18px">🔁 انتقال بین‌گروهی</b></div>
+      <div class="dim" style="margin-top:12px">تازه انتقال زدی —
+        تا <b>${fa(h)}</b> ساعت و <b>${fa(m)}</b> دقیقهٔ دیگه صبر کن.</div>`);
+  }
+
+  xferTo = d.groups[0].chat_id;
+  sheet(`
+    <div class="row"><b style="font-size:18px">🔁 انتقال بین‌گروهی</b>
+      <span class="dim">جیبت ${num(d.wallet)}</span></div>
+    <div class="dim" style="margin:10px 0">
+      کارمزد <b class="dn">${fa(Math.round(d.fee_ratio*100))}٪</b> ·
+      حداقل ${fa(d.min_amount)} سانت · هر ${fa(d.cooldown_hours)} ساعت یک بار</div>
+    <div class="dim" style="margin-bottom:6px">به کدوم گروه؟</div>
+    <div id="xgroups">` + d.groups.map(g => `
+      <div class="row" style="padding:7px 0;cursor:pointer" onclick="xferPick(${g.chat_id}, this)">
+        <span><span class="xdot">${g.chat_id === xferTo ? '●' : '○'}</span> ${esc(g.title)}</span>
+        <span class="dim">${num(g.size)}</span>
+      </div>`).join('') + `</div>
+    <div style="height:8px"></div>
+    <input id="xamt" type="number" inputmode="numeric" placeholder="مقدار سانت"
+           oninput="xferQuote()">
+    <div class="dim" style="text-align:center;margin:9px 0" id="xq">
+      کارمزد و مبلغ رسیده رو اینجا می‌بینی</div>
+    <button style="width:100%" onclick="xferGo()">فرستادن</button>`);
+};
+
+window.xferPick = (id, el) => {
+  xferTo = id;
+  [...document.getElementById('xgroups').children].forEach((row, i) => {
+    row.querySelector('.xdot').textContent =
+      S.data.xfer.groups[i].chat_id === id ? '●' : '○';
+  });
+};
+
+window.xferQuote = () => {
+  const d = S.data.xfer, v = +document.getElementById('xamt').value;
+  const el = document.getElementById('xq');
+  if (!v || v < d.min_amount) {
+    el.textContent = `حداقل ${fa(d.min_amount)} سانت`;
+    return;
+  }
+  const fee = Math.floor(v * d.fee_ratio);
+  el.innerHTML = `کارمزد <b class="dn">${fa(fee)}</b> · به مقصد می‌رسه <b class="up">${fa(v - fee)}</b>`;
+};
+
+window.xferGo = async () => {
+  const v = +document.getElementById('xamt').value;
+  if (!v) return toast('مقدار رو بنویس', true);
+  if (!xferTo) return toast('گروه مقصد رو انتخاب کن', true);
+  try {
+    const r = await api('/api/transfer', { amount: v, to_chat: xferTo });
+    closeSheet(); toast(r.message); await render();
+  } catch (e) { toast(e.message, true); }
+};
+
 window.chat = cmd => {
   if (TG) { TG.close(); }
   toast('توی گروه بزن: /' + cmd);

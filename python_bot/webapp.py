@@ -641,6 +641,99 @@ def index():
     return Response(_PAGE, mimetype='text/html; charset=utf-8')
 
 
+@app.get('/api/transfer')
+def api_transfer_info():
+    """Everything the transfer screen needs, judged exactly the way the bot judges it.
+
+    Whether it is open, what it charges, whether THIS group is allowed to export, and
+    how long the cooldown has left are all read from the same functions /enteghal calls.
+    Re-deriving any of them here is the drift this app exists to avoid."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    enabled = db.is_xfer_enabled()
+    source_ok, source_reason = bot.check_xfer_source(chat_id, uid)
+
+    rows = db.get_user_groups(uid, exclude_chat_id=chat_id)
+    titles = db.get_chat_titles([r[0] for r in rows])
+    return jsonify({
+        'ok': True,
+        'enabled': enabled,
+        'wallet': float(wallet or 0),
+        'fee_ratio': db.get_xfer_fee_ratio(),
+        'min_amount': bot.XFER_MIN_AMOUNT,
+        'cooldown_hours': bot.XFER_COOLDOWN_SECONDS // 3600,
+        'wait_seconds': db.get_xfer_wait_remaining(uid, chat_id,
+                                                   bot.XFER_COOLDOWN_SECONDS),
+        'source_ok': source_ok,
+        'source_reason': None if source_ok else source_reason,
+        'groups': [{'chat_id': cid, 'size': float(size or 0),
+                    'title': titles.get(cid) or f'گروه {str(cid)[-6:]}'}
+                   for cid, size in rows],
+    })
+
+
+@app.post('/api/transfer')
+def api_transfer():
+    """Mirrors transfer_callback step for step, in the same order, with the same
+    functions. Every one of these checks exists for a reason spelled out in CLAUDE.md,
+    and skipping any of them here would make the web the soft way round the gate that
+    /enteghal enforces in the chat."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+
+    if not db.is_xfer_enabled():
+        return _fail('انتقال سایز بین گروه‌ها الان بسته‌ست')
+
+    amount = _amount(body)
+    if amount is None or amount < bot.XFER_MIN_AMOUNT:
+        return _fail(f'حداقل مبلغ انتقال {bot.XFER_MIN_AMOUNT} سانته')
+    try:
+        dest_chat = int(body.get('to_chat'))
+    except (TypeError, ValueError):
+        return _fail('گروه مقصد نامعتبره')
+    if dest_chat >= 0 or dest_chat == chat_id:
+        return _fail('گروه مقصد نامعتبره')
+
+    # The destination is client-supplied, exactly like the button's callback_data, so
+    # membership is re-checked rather than trusted.
+    if dest_chat not in [g[0] for g in db.get_user_groups(uid, exclude_chat_id=chat_id)]:
+        return _fail('تو اون گروه بازی نمی‌کنی')
+
+    source_ok, source_reason = bot.check_xfer_source(chat_id, uid)
+    if not source_ok:
+        return _fail(source_reason)
+
+    # Checked BEFORE the cooldown is claimed: a transfer refused for being larger than
+    # the wallet must not cost the player their 24 hours. transfer_callback does the
+    # same, and the two have to stay in step.
+    wallet, _p, _lg = db.get_user(uid, chat_id, username, name)
+    if wallet < amount:
+        return _fail(f'این‌قدر سانت نداری! {int(wallet)} سانت داری.')
+
+    ok, remaining = db.try_start_xfer(uid, chat_id, bot.XFER_COOLDOWN_SECONDS)
+    if not ok:
+        hours, minutes = remaining // 3600, (remaining % 3600) // 60
+        return _fail(f'تازه انتقال زدی! تا {hours} ساعت و {minutes} دقیقهٔ دیگه صبر کن.')
+
+    ok, delivered, fee = db.cross_group_transfer(uid, chat_id, dest_chat, amount,
+                                                 db.get_xfer_fee_ratio())
+    if not ok:
+        return _fail('سایزت کافی نیست')
+
+    titles = db.get_chat_titles([dest_chat])
+    dest_title = titles.get(dest_chat) or f'گروه {str(dest_chat)[-6:]}'
+    return jsonify({
+        'ok': True, 'delivered': float(delivered), 'fee': float(fee),
+        'message': f'{int(delivered)} سانت رسید به {dest_title} (کارمزد {int(fee)})',
+    })
+
+
 @app.get('/api/config')
 def api_config():
     """Public: just the bot's username, so the Login Widget can be rendered without

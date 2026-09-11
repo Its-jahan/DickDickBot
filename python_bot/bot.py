@@ -5815,6 +5815,14 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(source_reason, show_alert=True)
         return
 
+    # Checked BEFORE the cooldown is claimed. try_start_xfer is a claim, not a question,
+    # so a transfer refused afterwards for being bigger than the wallet would silently
+    # cost the player their 24 hours for a typo. The web endpoint does the same.
+    size_now, _p, _lg = db.get_user(user.id, chat_id, user.username, user.first_name)
+    if size_now < amount:
+        await query.answer(f"این‌قدر سانت نداری! {int(size_now)} سانت داری.", show_alert=True)
+        return
+
     ok, remaining = db.try_start_xfer(user.id, chat_id, XFER_COOLDOWN_SECONDS)
     if not ok:
         hours, minutes = remaining // 3600, (remaining % 3600) // 60
