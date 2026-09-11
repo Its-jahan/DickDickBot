@@ -413,6 +413,14 @@ Three more things make guessing or half-remembering useless, and all three matte
 - `HEIST_RECALL_SECONDS` is tight enough that reassembling the answer from screenshots
   on a second device loses to the clock.
 
+**`HEIST_MIN_VAULT` is not a balance dial.** The weight cap already decides how much a
+group can take; the floor only stops a heist being staged against literally nothing. Set
+high (it was 800), it silently locked small leagues out of the feature altogether — and
+because the refusal said *"the vault is nearly empty"* while the shared treasury held
+22,000, it read to players as a bug in the bank rather than a property of their group.
+The refusal now prints the real reserve, this group's share of it, and why the share is
+what it is. A displayed number that is true but unexplained is its own kind of drift.
+
 A pure guesser is at `(1/6) × (1/9)^10` ≈ **1 in 21 billion**. The dials to retune if it
 ever needs to be easier or harder, in order of effect: `HEIST_SEQUENCE_LENGTH`,
 `HEIST_REVEAL_STEP_SECONDS`, then `HEIST_RECALL_SECONDS`.

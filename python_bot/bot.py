@@ -2528,7 +2528,12 @@ BANK_MIN_DEPOSIT = 5
 # crack a vault-cracking memory game under a shared deadline (see heist_cmd below).
 # Succeeding is meant to be close to impossible; the bank is supposed to be safe.
 HEIST_COOLDOWN_SECONDS = 120 * 3600  # one attempt per group per FIVE days
-HEIST_MIN_VAULT = 800              # not worth cracking anything but a genuinely fat vault
+# The floor is deliberately low. It is not a balance dial - the weight cap already
+# decides how much a group can actually take - it only stops a heist being staged
+# against literally nothing. Set high, it silently locked small groups out of the
+# feature entirely, which read to players as 'the bank is empty' when the shared
+# treasury was in fact full. Let a small league try for a small prize.
+HEIST_MIN_VAULT = 100
 HEIST_TREASURY_RATIO = 0.50        # of the group's claim on the treasury, on success
 HEIST_DEPOSIT_RATIO = 0.15         # of every other depositor's balance on success
 HEIST_PARTNER_SHARE = 0.35         # the accomplice's cut of whatever the pair walks off with
@@ -3549,9 +3554,21 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     others = max(0.0, total_dep - mine)
     vault = treasury + others
     if vault < HEIST_MIN_VAULT:
+        # Say WHY, with the real numbers. "The vault is empty" while the shared treasury
+        # holds tens of thousands is simply false from the player's side, and it was the
+        # single most confusing message in the game: the treasury IS one pot, but what a
+        # heist reaches is this group's weight-bounded claim on it.
+        total_reserve = db.get_central_bank()['reserve']
         await update.message.reply_text(
-            f"🏦 صندوق تقریباً خالیه ({int(vault)} سانت) — ارزش سرقت نداره.\n"
-            f"(حداقل {HEIST_MIN_VAULT} سانت باید توش باشه)"
+            f"🏦 اینجا چیزی برای بردن نیست ({int(vault)} سانت).\n\n"
+            f"خزانه یکیه و کل بات <b>{int(total_reserve)}</b> سانت توشه — ولی سرقت فقط به "
+            f"<b>سهم این گروه</b> می‌رسه، نه به کل خزانه:\n"
+            f"   🏛 سهم این گروه: {int(treasury)} سانت\n"
+            f"   🧾 سپردهٔ بقیهٔ اعضا: {int(others)} سانت\n\n"
+            f"سهم گروه به‌اندازهٔ وزنشه (سایز اعضا + سپرده‌هاشون نسبت به کل بات) — "
+            f"وگرنه یه نفر تو کوچیک‌ترین گروه می‌تونست پس‌انداز همه رو ببره.\n"
+            f"حداقل {HEIST_MIN_VAULT} سانت لازمه. تو گروه بزرگ‌ترت امتحان کن.",
+            parse_mode="HTML"
         )
         return
 
