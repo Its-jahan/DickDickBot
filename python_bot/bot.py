@@ -4957,6 +4957,18 @@ async def nozul_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     warn = (f"\n📊 اعتبار {_esc(target_name)}: <b>{b_score}</b>/200 — {_credit_grade(b_score)}"
             f" (سروقت {b_repaid - b_late} / با تأخیر {b_late} / نکول {b_defaults})")
+    # The offer already shows the score for free, and the live debt is the more
+    # important of the two: a lender about to hand over real size should not walk into
+    # "he already owes 5000 elsewhere" just because the breakdown costs a fee. The
+    # TOTAL is free here; /etebar still sells the coverage ratio, the split and the
+    # repayment history.
+    _exp = db.get_debt_exposure(target_id, chat_id)
+    _debt = _exp['debt_here'] + _exp['debt_away']
+    if _debt > 0:
+        warn += (f"\n⚠️ همین الان <b>{int(_debt)}</b> سانت بدهی فعال داره"
+                 + (f" (که {int(_exp['debt_away'])} سانتش تو گروه‌های دیگه‌ست)"
+                    if _exp['debt_away'] > 0 else "")
+                 + " — با /etebar کاملش رو ببین.")
     keyboard = [[InlineKeyboardButton("✍️ قبول می‌کنم", callback_data=f"loanok_{loan_id}")]]
     await update.message.reply_text(
         f"🤝 <b>پیشنهاد نزول</b>\n\n"
@@ -5290,7 +5302,50 @@ def _credit_grade(score):
     return "خراب 🔴"
 
 
-def _credit_report(name, score, repaid, late, defaults, size):
+def _debt_section(exp):
+    """The borrower's live debt, across the whole bot, for the credit report.
+
+    A lender who only saw this group's loan book was missing claims that already outrank
+    theirs: /vam is funded out of pooled deposits and the collector reaches every league,
+    so a borrower quietly carrying debt elsewhere is a worse risk than an empty local
+    loan book makes them look.
+    """
+    total = exp['debt_here'] + exp['debt_away']
+    if total <= 0:
+        return "\n\n💚 <b>بدهی فعال:</b> هیچی — الان به هیچ‌کس بدهکار نیست."
+
+    lines = [f"\n\n💀 <b>بدهی فعال (کل ربات): {int(total)} سانت</b>"]
+    if exp['debt_here'] > 0:
+        lines.append(f"   • همین گروه: {int(exp['debt_here'])} سانت "
+                     f"({exp['loans_here']} وام)")
+    if exp['debt_away'] > 0:
+        # Deliberately a count, never the group names: the number is what a lending
+        # decision turns on, and the list would publish where this player plays.
+        lines.append(f"   • گروه‌های دیگه: {int(exp['debt_away'])} سانت "
+                     f"({exp['loans_away']} وام تو {exp['groups_away']} گروه)")
+    if exp['to_bank'] > 0:
+        lines.append(f"   • از این مقدار {int(exp['to_bank'])} سانتش به بانک مرکزیه")
+    if exp['soonest_due']:
+        left = exp['soonest_due'] - datetime.datetime.now(datetime.timezone.utc)
+        hours = max(0, int(left.total_seconds() // 3600))
+        lines.append(f"   • نزدیک‌ترین سررسید: {hours // 24} روز و {hours % 24} ساعت دیگه")
+
+    # Everything the collector can actually reach, everywhere. The bank sweeps wallets
+    # and deposits in every group before a loan is written off, so this is the number a
+    # player lender is really standing behind.
+    cover = exp['assets'] / total if total > 0 else 0
+    verdict = ("✅ دارایی‌هاش راحت جواب می‌ده" if cover >= 2
+               else "🟡 دارایی‌هاش فقط به‌زور جواب می‌ده" if cover >= 1
+               else "🔴 بیشتر از کل دارایی‌هاشه!")
+    lines.append(f"\n🏦 کل دارایی قابل‌وصولش (جیب + سپرده، همهٔ گروه‌ها): "
+                 f"{int(exp['assets'])} سانت")
+    lines.append(f"⚖️ پوشش بدهی: <b>{cover:.1f}×</b> — {verdict}")
+    lines.append("\n<i>یادت باشه بانک مرکزی موقع وصول از همهٔ گروه‌هاش برمی‌داره، "
+                 "پس طلبش جلوتر از توئه.</i>")
+    return "\n".join(lines)
+
+
+def _credit_report(name, score, repaid, late, defaults, size, exp=None):
     bar = "█" * max(1, round(score / 20)) + "░" * max(0, 10 - round(score / 20))
     return (f"📊 <b>اعتبارسنجی {_esc(name)}</b>\n\n"
             f"امتیاز: <b>{score}</b>/200 — {_credit_grade(score)}\n"
@@ -5299,7 +5354,8 @@ def _credit_report(name, score, repaid, late, defaults, size):
             f"🐌 تسویهٔ با تأخیر: {late}\n"
             f"🚔 نکول (وصول اجباری): {defaults}\n\n"
             f"💳 سقف وامش الان: <b>{_credit_cap(size, score)}</b> سانت "
-            f"(ضریب {_credit_factor(score):.2f}× روی سایز {int(size)})")
+            f"(ضریب {_credit_factor(score):.2f}× روی سایز {int(size)})"
+            + (_debt_section(exp) if exp else ""))
 
 
 async def credit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5327,8 +5383,9 @@ async def credit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     score, repaid, late, defaults = db.get_credit(target_id, chat_id)
     t_size = (db.get_user_info(target_id, chat_id) or (None, 0))[1] or 0
+    exposure = db.get_debt_exposure(target_id, chat_id)
     await reply_lookup(update, context,
-        _credit_report(target_name, score, repaid, late, defaults, t_size)
+        _credit_report(target_name, score, repaid, late, defaults, t_size, exposure)
         + f"\n\n🧾 هزینهٔ اعتبارسنجی: {CREDIT_CHECK_FEE} سانت → خزانه",
         parse_mode="HTML"
     )

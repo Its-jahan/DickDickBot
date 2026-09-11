@@ -3951,6 +3951,53 @@ def get_user_loans(chat_id, user_id):
         return borrowed, lent
 
 
+def get_debt_exposure(user_id, home_chat_id):
+    """Everything a lender needs to price this borrower, across the WHOLE bot.
+
+    A debt to the central bank is already a bot-wide fact: /vam is funded out of pooled
+    deposits, and `_collect` reaches every league the borrower plays in. So a lender
+    looking only at this group's loan book was seeing a fraction of the claim that
+    already outranks theirs. Returns a dict:
+
+        debt_here / loans_here       active borrowing in the group being asked from
+        debt_away / loans_away       active borrowing everywhere else
+        groups_away                  how many other groups that is spread over
+        soonest_due                  the nearest due date of any of them
+        to_bank                      how much of the total is owed to the bank
+        assets                       wallets + deposits the collector could reach,
+                                     floored at zero per group
+
+    It deliberately does NOT return which groups. The number is what a lending decision
+    turns on; the list would publish the borrower's group membership into a chat, which
+    is the cross-group leak every other feature here is careful about.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT chat_id, due_amount, due_at, lender_id FROM loans "
+                  "WHERE borrower_id = %s AND status = 'active'", (user_id,))
+        rows = c.fetchall()
+        c.execute('SELECT COALESCE(SUM(GREATEST(size, 0)), 0) FROM users WHERE user_id = %s',
+                  (user_id,))
+        wallets = float(c.fetchone()[0] or 0)
+        c.execute('SELECT COALESCE(SUM(GREATEST(balance, 0)), 0) FROM bank_accounts '
+                  'WHERE user_id = %s', (user_id,))
+        deposits = float(c.fetchone()[0] or 0)
+
+    here = [r for r in rows if r[0] == home_chat_id]
+    away = [r for r in rows if r[0] != home_chat_id]
+    dues = [r[2] for r in rows if r[2]]
+    return {
+        'debt_here': sum(float(r[1] or 0) for r in here),
+        'loans_here': len(here),
+        'debt_away': sum(float(r[1] or 0) for r in away),
+        'loans_away': len(away),
+        'groups_away': len({r[0] for r in away}),
+        'soonest_due': min(dues) if dues else None,
+        'to_bank': sum(float(r[1] or 0) for r in rows if r[3] is None),
+        'assets': wallets + deposits,
+    }
+
+
 def get_loan_defaults(chat_id, user_id):
     with get_connection() as conn:
         c = conn.cursor()

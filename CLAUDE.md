@@ -1060,6 +1060,40 @@ sweep dig into your bank deposit (`CREDIT_BANK_SEIZED`) or leave you in the red
 the score in the *same transaction* that moves the money, so a rating can never disagree
 with the loan book it describes.
 
+### `/etebar` shows the debt, and the debt is bot-wide
+
+A lender reading only this group's loan book was seeing a fraction of the claim that
+already outranks theirs. `/vam` is funded out of pooled deposits and `_collect` sweeps
+**every league the borrower plays in**, so a borrower quietly carrying 5,000 of debt in
+another group is a far worse risk than an empty local loan book makes them look.
+
+`db.get_debt_exposure(user_id, home_chat_id)` returns the whole picture in one call:
+debt here, debt away, how many other groups that is spread over, how much of it is owed
+to the bank (the claim that outranks a player lender), the nearest due date, and
+`assets` — wallets plus deposits everywhere, which is precisely what the collector can
+reach. Negative wallets are floored at zero per group, the same rule `_group_weight`
+uses: a group carrying a debtor is not thereby a liability somewhere else.
+
+**It deliberately never returns which groups**, and there is a test asserting no chat id
+reaches the message. The number is what a lending decision turns on; the list would
+publish the borrower's group membership into a chat, which is the cross-group leak the
+inline-mode rules are careful about. A count of groups carries the risk without the
+identities.
+
+Two deliberate splits between free and paid:
+
+- **`/etebar` still costs `CREDIT_CHECK_FEE`** and still charges it before reading
+  anything. The diligence is what the fee buys: the coverage ratio, the here/away split,
+  the due dates and the repayment history.
+- **A `/nozul` offer flags the debt TOTAL for free.** The offer already showed the credit
+  score for nothing, and the live debt is the more important of the two — a lender about
+  to hand over real size should not walk into "he already owes 5,000 elsewhere" merely
+  because the breakdown is behind a fee. The offer prints the total and points at
+  `/etebar` for the rest.
+
+Only `status = 'active'` counts, so a repaid loan and one the panel quietly forgave both
+stop existing here exactly as they do for `get_overdue_loans` and the per-player cap.
+
 `BANK_LOAN_MIN_SCORE` gates `/vam` only. The official bank refuses bad credit outright;
 loan sharks are unregulated and will lend to anyone, which is what `/etebar` is for — a
 lender pays `CREDIT_CHECK_FEE` to price the risk themselves before making an offer. That
