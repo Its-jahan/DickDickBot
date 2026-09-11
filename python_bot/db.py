@@ -553,6 +553,16 @@ def init_db():
                 updated_at TIMESTAMPTZ DEFAULT now()
             )
         ''')
+        # The real-market feed. feed_id is the upstream's id for the coin this one
+        # parodies; feed_scale maps that coin's dollar price onto this one's in-game
+        # price and is fixed the FIRST time a price is seen, so the game price tracks
+        # the real coin's percentage moves from wherever base_price put it. Re-deriving
+        # the scale on every tick would pin the price to base and track nothing.
+        for col, decl in (('feed_id', 'TEXT'),
+                          ('feed_scale', 'DOUBLE PRECISION'),
+                          ('feed_usd', 'DOUBLE PRECISION'),
+                          ('feed_at', 'TIMESTAMPTZ')):
+            c.execute(f'ALTER TABLE crypto_prices ADD COLUMN IF NOT EXISTS {col} {decl}')
         # Holdings are per (user, chat) because size is. `avg_cost` is what makes a sale
         # separable into "my money coming back" and "what I actually made" - see
         # crypto_sell, and get_recent_net_by_user for why that split is load-bearing.
@@ -2770,12 +2780,61 @@ def crypto_seed(coins):
     inserted. Same discipline as every other init_db write."""
     with get_connection() as conn:
         c = conn.cursor()
-        for symbol, name, base, vol in coins:
+        for symbol, name, base, vol, feed_id in coins:
             c.execute('INSERT INTO crypto_prices (symbol, name, price, prev_price, '
-                      'base_price, volatility) VALUES (%s, %s, %s, %s, %s, %s) '
+                      'base_price, volatility, feed_id) VALUES (%s, %s, %s, %s, %s, %s, %s) '
                       'ON CONFLICT (symbol) DO UPDATE SET name = EXCLUDED.name, '
-                      'base_price = EXCLUDED.base_price, volatility = EXCLUDED.volatility',
-                      (symbol, name, base, base, base, vol))
+                      'base_price = EXCLUDED.base_price, volatility = EXCLUDED.volatility, '
+                      'feed_id = EXCLUDED.feed_id',
+                      (symbol, name, base, base, base, vol, feed_id))
+
+
+def crypto_feed_rows():
+    """(symbol, feed_id, feed_scale, base_price, price) for the coins that track a real
+    market. Deliberately separate from crypto_all(), whose 7-tuple is unpacked
+    positionally in a dozen places - widening it would break every one of them."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT symbol, feed_id, feed_scale, base_price, price FROM crypto_prices '
+                  "WHERE feed_id IS NOT NULL AND feed_id <> '' ORDER BY symbol")
+        return c.fetchall()
+
+
+def crypto_apply_feed(rows):
+    """One statement for the whole board, like crypto_set_prices.
+
+    `rows` is [(symbol, in_game_price, usd, scale)]. The scale is written with
+    COALESCE so it is fixed the first time only: every later tick keeps whatever the
+    first observation set, which is what makes the game price track the real coin's
+    MOVES rather than being re-pinned to base every minute.
+    """
+    rows = [(str(sym), float(px), float(usd), float(sc))
+            for sym, px, usd, sc in rows if px and px > 0 and sc and sc > 0]
+    if not rows:
+        return 0
+    values = ','.join(['(%s, %s::double precision, %s::double precision, '
+                       '%s::double precision)'] * len(rows))
+    args = [x for r in rows for x in r]
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE crypto_prices AS cp SET prev_price = cp.price, price = v.price, '
+                  'feed_usd = v.usd, feed_scale = COALESCE(cp.feed_scale, v.scale), '
+                  'feed_at = NOW(), updated_at = NOW() '
+                  f'FROM (VALUES {values}) AS v(symbol, price, usd, scale) '
+                  'WHERE cp.symbol = v.symbol', args)
+        return c.rowcount
+
+
+def crypto_feed_status():
+    """{symbol: (feed_id, feed_usd, age_seconds)} - what the board shows about the feed,
+    and what tells the tick whether the feed is live enough to trust."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT symbol, feed_id, feed_usd, "
+                  "EXTRACT(EPOCH FROM (now() - feed_at)) FROM crypto_prices "
+                  "WHERE feed_id IS NOT NULL AND feed_id <> ''")
+        return {r[0]: (r[1], float(r[2]) if r[2] is not None else None,
+                       float(r[3]) if r[3] is not None else None) for r in c.fetchall()}
 
 
 def crypto_all():

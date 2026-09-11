@@ -878,6 +878,45 @@ it hands over while the wallet is credited in full, which mints. Proceeds
 are monotonically increasing in units inside the cap, so `crypto_sell` bisects for the
 largest fill the bank can honour. This was a real bug, caught by the conservation test.
 
+### Prices come from the real market
+
+Each coin parodies a real one, so each one **follows** it: `CRYPTO_COINS` carries a
+`feed_id` (`bitcoin`, `dogecoin`, `shiba-inu`…) and `fetch_feed_usd` pulls the whole
+board from CoinGecko's public endpoint in one GET, stdlib `urllib` like `_tg_send` —
+adding an HTTP client to `requirements.txt` for one request would be a production
+dependency for nothing.
+
+**`feed_scale` is fixed on the first observation and never re-derived.** It is
+`base_price / that day's dollar price`, and every later tick is `usd × scale`. So the
+in-game price starts at `base_price` and thereafter moves by exactly the percentage the
+real coin moved. Re-deriving the scale each tick would pin the price to base and track
+nothing at all — that is the one line to not "simplify", and there is a test that feeds
++50% and asserts the game price is +50%.
+
+Four things hold it together:
+
+- **A feed price is never mean-reverted.** Reversion is right for an invented walk and
+  wrong for a real quote: dragging a real price back toward `base_price` is fighting the
+  actual market. Fed coins skip `crypto_next_price` entirely.
+- **An unreachable feed leaves a working market, not a frozen one.** `fetch_feed_usd`
+  returns `{}` on *any* failure — blocked, rate-limited, down, garbage JSON — and every
+  coin it did not cover keeps walking. This is why the random walk is still here, and
+  why `volatility` still means something. There is a test that kills the feed and
+  asserts prices still move.
+- **`CRYPTO_FEED_MIN/MAX_MULT` is far wider than the walk's band** (0.05×–20× against
+  0.15×–6×), so ordinary market moves pass through untouched and only an absurd quote
+  gets pinned. The clamp is *not* what protects the bank — partial fill is.
+- **The invariants survive.** The bank still cannot mint: a 50× rally on the real feed
+  against a thin vault is partially filled, and the regression test asserts the whole
+  system is penny-for-penny zero-sum across it. A pump still cannot profit, because
+  `_crypto_exec_price` is a function of inventory and knows nothing about where the mid
+  came from.
+
+`crypto_all()`'s 7-tuple is unpacked positionally in a dozen places, so the feed columns
+are read through separate functions (`crypto_feed_rows`, `crypto_feed_status`) rather
+than widening it. The board and the trade sheet show the real coin and its dollar price
+when the feed is fresh, and quietly stop claiming a live quote when it is not.
+
 ### The price walk
 
 `crypto_next_price` is a **mean-reverting geometric** random walk: `pull` toward

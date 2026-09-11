@@ -2,9 +2,12 @@ import asyncio
 import hashlib
 import hmac
 import html
+import json
 import logging
 import random
 import re
+import urllib.parse
+import urllib.request
 import datetime
 from datetime import time
 from zoneinfo import ZoneInfo
@@ -4482,18 +4485,39 @@ async def bank_interest_job(context: ContextTypes.DEFAULT_TYPE):
 # and that lands in the treasury as `treasury_in` and therefore raises everyone's
 # deposit rate. Trading against your friends pays the savers.
 CRYPTO_COINS = [
-    # (symbol, display name, base price, per-tick volatility)
-    ("BTK", "بیت‌کیر",    500.0, 0.020),
-    ("ETK", "اترکیریوم",  180.0, 0.025),
-    ("KRD", "کیردانو",     40.0, 0.030),
-    ("KSL", "کوسلانا",     60.0, 0.035),
-    ("KRM", "کیریمیوم",    25.0, 0.045),
-    ("KRK", "کیرکونوک",    12.0, 0.055),
-    ("DDL", "دودولدار",     8.0, 0.060),
-    ("DGK", "دوج‌کیر",      2.0, 0.075),
-    ("SHK", "شیب‌کیر",      1.0, 0.090),
-    ("TXE", "تتر خایه",    10.0, 0.002),   # the "stablecoin" - it wobbles, barely
+    # (symbol, display name, base price, per-tick volatility, the real coin it tracks)
+    #
+    # Each one parodies a real coin, so each one FOLLOWS that coin: the feed moves the
+    # in-game price by the same percentage the real market moved. base_price is still
+    # where it starts and still what inventory impact is measured against - the feed
+    # only supplies the moves. `volatility` is now the FALLBACK walk's volatility, used
+    # when the feed cannot be reached.
+    ("BTK", "بیت‌کیر",    500.0, 0.020, "bitcoin"),
+    ("ETK", "اترکیریوم",  180.0, 0.025, "ethereum"),
+    ("KRD", "کیردانو",     40.0, 0.030, "cardano"),
+    ("KSL", "کوسلانا",     60.0, 0.035, "solana"),
+    ("KRM", "کیریمیوم",    25.0, 0.045, "polkadot"),
+    ("KRK", "کیرکونوک",    12.0, 0.055, "chainlink"),
+    ("DDL", "دودولدار",     8.0, 0.060, "avalanche-2"),
+    ("DGK", "دوج‌کیر",      2.0, 0.075, "dogecoin"),
+    ("SHK", "شیب‌کیر",      1.0, 0.090, "shiba-inu"),
+    ("TXE", "تتر خایه",    10.0, 0.002, "tether"),   # the "stablecoin" - it barely moves
 ]
+
+# The public CoinGecko endpoint: no key, no account, one request for the whole board.
+CRYPTO_FEED_URL = ("https://api.coingecko.com/api/v3/simple/price"
+                   "?ids={ids}&vs_currencies=usd")
+# Short on purpose. This runs inside the tick, so a slow feed must cost the tick a
+# moment and nothing else - the fallback walk is right there.
+CRYPTO_FEED_TIMEOUT = 8
+# Past this, the last feed price is treated as stale and the walk takes over, so the
+# market keeps breathing instead of freezing on whatever the feed last said.
+CRYPTO_FEED_STALE_SECONDS = 30 * 60
+# A feed price is still clamped, but far wider than the walk's band: ordinary market
+# moves pass through untouched and only a genuinely absurd number gets pinned. The
+# clamp is not what protects the bank - partial fill is, and it cannot mint.
+CRYPTO_FEED_MIN_MULT = 0.05
+CRYPTO_FEED_MAX_MULT = 20.0
 CRYPTO_TICK_SECONDS = 60
 # Mean reversion is what stops a random walk wandering off to zero or to the moon and
 # never coming back. Without it, one lucky coin eventually becomes the only thing worth
@@ -4559,15 +4583,76 @@ CRYPTO_HISTORY_EVERY_TICKS = 5
 _crypto_ticks = 0
 
 
+def fetch_feed_usd(feed_ids, timeout=CRYPTO_FEED_TIMEOUT):
+    """{feed_id: usd} from the public price API, or {} if it cannot be reached.
+
+    Stdlib urllib, like _tg_send in webapp.py: this is one GET, and adding an HTTP
+    client to requirements.txt for it would be a production dependency for nothing.
+
+    Returns {} rather than raising on ANY failure - blocked, rate-limited, down,
+    garbage JSON. The caller falls back to the random walk, which is the whole reason
+    the walk is still here.
+    """
+    if not feed_ids:
+        return {}
+    url = CRYPTO_FEED_URL.format(ids=urllib.parse.quote(','.join(sorted(feed_ids))))
+    try:
+        req = urllib.request.Request(url, headers={'Accept': 'application/json',
+                                                   'User-Agent': 'dickdickbot/1.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode('utf-8'))
+    except Exception as e:
+        logging.info("crypto feed unavailable (%s) - falling back to the walk", e)
+        return {}
+    out = {}
+    for fid, row in (payload or {}).items():
+        try:
+            usd = float(row.get('usd'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if usd > 0:
+            out[fid] = usd
+    return out
+
+
 def _crypto_tick_sync():
-    """The tick's database round trips, off the event loop. See crypto_tick_job."""
+    """The tick's work, off the event loop. See crypto_tick_job.
+
+    Real prices where the feed answers, the mean-reverting walk everywhere else. The
+    two are deliberately not blended: a feed price must not be dragged back toward
+    base_price, because reverting a real price is fighting the actual market.
+    """
     global _crypto_ticks
     rows = db.crypto_all()
     if not rows:
         return
-    priced_now = [(sym, crypto_next_price(mid, base, vol))
-                  for sym, _name, mid, _prev, base, vol, _net in rows]
-    db.crypto_set_prices(priced_now)
+
+    feed_rows = db.crypto_feed_rows()
+    usd = fetch_feed_usd({fid for _s, fid, _sc, _b, _p in feed_rows})
+
+    fed = {}
+    applied = []
+    for sym, fid, scale, base, _price in feed_rows:
+        px_usd = usd.get(fid)
+        if not px_usd:
+            continue
+        # The scale is fixed on the FIRST observation: base_price / that day's dollar
+        # price. Every tick after that multiplies the live dollar price by the same
+        # number, so the in-game price moves exactly as much as the real coin did.
+        sc = float(scale) if scale else (float(base) / px_usd)
+        px = min(max(px_usd * sc, base * CRYPTO_FEED_MIN_MULT), base * CRYPTO_FEED_MAX_MULT)
+        applied.append((sym, px, px_usd, sc))
+        fed[sym] = px
+    if applied:
+        db.crypto_apply_feed(applied)
+
+    # Anything the feed did not cover keeps walking, so the board never freezes.
+    walked = [(sym, crypto_next_price(mid, base, vol))
+              for sym, _name, mid, _prev, base, vol, _net in rows if sym not in fed]
+    if walked:
+        db.crypto_set_prices(walked)
+
+    priced_now = [(sym, fed.get(sym)) for sym in fed] + walked
 
     _crypto_ticks += 1
     if _crypto_ticks % CRYPTO_HISTORY_EVERY_TICKS == 0:

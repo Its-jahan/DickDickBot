@@ -19,6 +19,16 @@ import { cn } from '@/lib/utils'
 
 const RANGES: [number, string][] = [[6, '۶ ساعت'], [24, '۱ روز'], [72, '۳ روز'], [168, '۱ هفته']]
 
+/** A real dollar price spans bitcoin to shiba-inu, so the decimals have to move with it
+ *  or the cheap coins all read as $0.00. */
+const usd = (n: number | null | undefined) => {
+  const v = n ?? 0
+  return v >= 1000 ? v.toLocaleString('en-US', { maximumFractionDigits: 0 })
+    : v >= 1 ? v.toFixed(2)
+    : v >= 0.01 ? v.toFixed(4)
+    : v.toPrecision(2)
+}
+
 export function Crypto({ d, chat, reload }: { d: any; chat: number; reload: () => Promise<void> }) {
   const [open, setOpen] = useState<any | null>(null)
   return (
@@ -53,7 +63,9 @@ export function Crypto({ d, chat, reload }: { d: any; chat: number; reload: () =
                     ? `تو: ${num(c.units, 4)} · ${num(c.value)} سانت`
                     : Math.abs(c.demand) > 0.005
                       ? (c.demand > 0 ? '🔥 تقاضا ' : '🧊 تقاضا ') + pc(c.demand * 100)
-                      : c.symbol}
+                      : c.live
+                        ? `📡 ${c.feed} · $${usd(c.feed_usd)}`
+                        : c.symbol}
                 </span>
               </span>
               <span className="shrink-0 text-left">
@@ -68,6 +80,9 @@ export function Crypto({ d, chat, reload }: { d: any; chat: number; reload: () =
       </Card>
 
       <p className="px-2 pb-2 text-center text-xs leading-relaxed text-muted-foreground">
+        📡 قیمت‌ها از بازار <b>واقعی</b> کریپتو میان — هر سکه دنبال نمونهٔ واقعی خودشه و
+        دقیقاً همون‌قدر بالا و پایین می‌ره.
+        <br />
         کارمزد هر معامله {num(d.fee * 100)}٪. خرید قیمت رو بالا می‌بره و فروش پایین — ولی قیمتی
         که بهت می‌خوره میانگین مسیره، پس پامپ‌کردن سودی نداره.
       </p>
@@ -126,6 +141,11 @@ function TradeSheet({ coin, fee, chat, onClose, reload }: {
             <div className="text-xs text-muted-foreground">{coin.symbol}</div>
           </div>
           <div className="text-left">
+            {coin.live && (
+              <div className="text-[11px] text-muted-foreground" dir="ltr">
+                📡 {coin.feed} ${usd(coin.feed_usd)}
+              </div>
+            )}
             <div className="text-2xl font-extrabold tnum">{fmtPrice(coin.price)}</div>
             <div className={cn('text-xs tnum', coin.change >= 0 ? 'text-success' : 'text-destructive')}>
               {pc(coin.change)} امروز

@@ -402,6 +402,8 @@ def api_crypto():
     uid, name, username, chat_id = sc
     wallet, _lg, _p = db.get_user(uid, chat_id, username, name)
     held = {s: (float(a), float(c)) for s, a, c in db.crypto_holdings_of(uid, chat_id)}
+    # What the real market says, so the board can show that these prices are not invented.
+    feed = db.crypto_feed_status()
     coins = []
     for sym, cname, mid, prev_mid, base, vol, net in db.crypto_all():
         price = bot.crypto_display_price(mid, base, net)
@@ -417,6 +419,12 @@ def api_crypto():
             'avg_cost': mine[1] if mine else 0.0,
             'value': (mine[0] * price) if mine else 0.0,
         })
+        fid, usd, age = feed.get(sym, (None, None, None))
+        coins[-1]['feed'] = fid
+        coins[-1]['feed_usd'] = usd
+        # "Live" means the feed answered recently. When it hasn't, the coin is back on
+        # the random walk and the board says so rather than implying a real quote.
+        coins[-1]['live'] = bool(usd) and age is not None and age < bot.CRYPTO_FEED_STALE_SECONDS
     return jsonify({
         'ok': True, 'coins': coins, 'wallet': float(wallet or 0),
         'fee': bot.CRYPTO_FEE_RATIO,
