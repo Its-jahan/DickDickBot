@@ -7218,6 +7218,10 @@ if __name__ == '__main__':
     app.job_queue.run_once(recover_decree_offer, when=12)
     app.job_queue.run_once(recover_stuck_heist_attempts, when=14)
     app.job_queue.run_once(recover_group_war, when=16)
+    # Same shape as the sweeps above, and for the same reason: run_daily only fires
+    # at its appointed minute, so a bot deployed after 00:30 would leave every
+    # unnamed group showing as "گروه 717026" in the picker until tomorrow night.
+    app.job_queue.run_once(deactivate_idle_chats, when=20)
 
     app.add_error_handler(on_error)
 
