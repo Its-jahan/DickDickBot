@@ -1280,8 +1280,58 @@ generic "temporary problem".
 
 `python_bot/webapp.py` is the browser face of the game: a Flask/gunicorn service
 (`dickbot-web`, 127.0.0.1:8012) at **https://app.inddex.app**, launched from `/app` in
-Telegram. The whole front end is one file, `python_bot/templates/app.html` — no bundler,
-no build step, matching the rest of the repo.
+Telegram. The front end is a **React + Vite + shadcn/ui** app under `python_bot/web/`.
+
+### The build step, and the one thing that keeps it honest
+
+This is the only part of the repo with a build, and it earns it: shadcn/ui is Radix plus
+Tailwind plus real components, and approximating that by hand in one HTML file is how
+you end up maintaining a worse copy of it.
+
+**`web/dist` is committed.** That is the trade, and it is deliberate: the production host
+needs no Node, and the deploy stays `git reset --hard` + `pip install` + restart, exactly
+as it was before. Flask serves `dist/index.html` at `/` and `dist/assets/*` at
+`/assets/*` (`send_from_directory`, so a crafted filename cannot escape the directory —
+there is a test firing traversal at it).
+
+The obvious failure of committing an artifact is shipping a stale one, so
+`.github/workflows/web-build.yml` runs `npm ci && tsc --noEmit && npm run build` on every
+push and **fails if the committed `dist` differs**. `test_webapp_build.py` asserts the
+same thing locally. After changing anything in `web/src`:
+
+```bash
+cd python_bot/web && npm ci && npm run build   # then commit dist/
+```
+
+Filenames are stable across builds (`assets/app.js`, `assets/app.css`), so the asset
+route sends `Cache-Control: no-cache` — hashed names would only make the Flask route
+harder, but a long cache with stable names would serve yesterday's app after a deploy.
+
+**recharts is lazy-loaded.** It is two thirds of the weight and only the trade sheet ever
+needs it, so it is a separate chunk: the main bundle is ~84 KB gzipped and the five
+screens that draw no chart never download the chart library. There is a test asserting
+the split survives.
+
+### Light and dark, decided before first paint
+
+The tokens are shadcn's: light on bare `:root`, dark under an explicit `.dark` class, so
+no colour has its only definition inside a media query and the toggle wins in both
+directions. **The decision is made in `index.html`, before React runs** — an explicit
+saved choice, else Telegram's `colorScheme`, else the OS. Doing it in React would paint
+the light shell and then flip, which reads as a flash of the wrong colour on every single
+launch. There is a test asserting the pre-paint script is still there.
+
+### The market chart
+
+`crypto_history` stores one point per coin per `CRYPTO_HISTORY_EVERY_TICKS` (5 minutes at
+a one-minute tick), written by the same `_crypto_tick_sync` that moves the prices, in one
+statement like `crypto_set_prices`. `GET /api/crypto/history` serves it, capped at 240
+points because a phone cannot show more.
+
+It records the **mid**, not the impact-shifted display price: impact is a function of
+inventory, so folding it in would draw somebody's open position rather than the market.
+The chart is a display artefact and nothing settles against it — `crypto_prune_history`
+keeps a week.
 
 **It imports `bot.py`, and the admin panel deliberately does not. That difference is the
 point.** The panel is a tool that reaches *around* the game; this is the game, in a

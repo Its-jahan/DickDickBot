@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>دودول</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&display=swap">
+<script>
+  // Applied before the first paint so the app never flashes the wrong theme. Telegram
+  // tells us the client's scheme; outside Telegram the OS does. An explicit choice the
+  // player made wins over both.
+  (function () {
+    try {
+      var saved = localStorage.getItem('theme');
+      var tg = window.Telegram && window.Telegram.WebApp;
+      var want = saved || (tg && tg.colorScheme) ||
+        (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      if (want === 'dark') document.documentElement.classList.add('dark');
+    } catch (e) { document.documentElement.classList.add('dark'); }
+  })();
+</script>
+  <script type="module" crossorigin src="/assets/app.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/app.css">
+</head>
+<body>
+<div id="root"></div>
+</body>
+</html>

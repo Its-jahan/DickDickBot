@@ -1,0 +1,36 @@
+name: Web build is in sync
+
+# web/dist is COMMITTED so the production host needs no Node and the deploy stays a git
+# pull. The obvious failure of that trade is somebody editing web/src and shipping a
+# stale dist, so this rebuilds from source on every push and fails if the committed
+# output differs. It is the only thing standing between the source and what players see.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: python_bot/web/package-lock.json
+      - run: npm ci
+        working-directory: python_bot/web
+      - run: npx tsc --noEmit
+        working-directory: python_bot/web
+      - run: npm run build
+        working-directory: python_bot/web
+      - name: dist must match the committed build
+        run: |
+          if ! git diff --quiet -- python_bot/web/dist; then
+            echo "::error::python_bot/web/dist is stale. Run 'npm run build' in python_bot/web and commit the result."
+            git --no-pager diff --stat -- python_bot/web/dist
+            exit 1
+          fi
+          echo "dist matches src"

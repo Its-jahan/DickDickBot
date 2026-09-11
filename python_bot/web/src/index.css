@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* shadcn/ui's token layer. Light is the bare :root so nothing has its only definition
+   inside a media query; .dark is the explicit override the toggle writes. */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 224 32% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 32% 12%;
+    --primary: 222 89% 60%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 20% 96%;
+    --secondary-foreground: 224 32% 12%;
+    --muted: 220 20% 96%;
+    --muted-foreground: 220 10% 46%;
+    --accent: 220 20% 94%;
+    --accent-foreground: 224 32% 12%;
+    --destructive: 0 74% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 152 60% 38%;
+    --success-foreground: 0 0% 100%;
+    --border: 220 16% 90%;
+    --input: 220 16% 90%;
+    --ring: 222 89% 60%;
+    --radius: 0.85rem;
+  }
+
+  .dark {
+    --background: 224 32% 7%;
+    --foreground: 213 30% 94%;
+    --card: 224 28% 10%;
+    --card-foreground: 213 30% 94%;
+    --primary: 222 89% 66%;
+    --primary-foreground: 224 32% 7%;
+    --secondary: 223 24% 15%;
+    --secondary-foreground: 213 30% 94%;
+    --muted: 223 24% 15%;
+    --muted-foreground: 218 14% 62%;
+    --accent: 223 24% 18%;
+    --accent-foreground: 213 30% 94%;
+    --destructive: 0 72% 62%;
+    --destructive-foreground: 224 32% 7%;
+    --success: 152 58% 52%;
+    --success-foreground: 224 32% 7%;
+    --border: 223 20% 19%;
+    --input: 223 20% 19%;
+    --ring: 222 89% 66%;
+  }
+
+  * { @apply border-border; -webkit-tap-highlight-color: transparent; }
+  body {
+    @apply bg-background text-foreground;
+    margin: 0;
+    font-feature-settings: 'ss01';
+    /* The nav bar is fixed; this keeps the last card clear of it on every screen. */
+    padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  }
+  /* Persian digits look wrong in a proportional run of numbers; tabular keeps columns
+     of sizes and prices from jittering as they update. */
+  .tnum { font-variant-numeric: tabular-nums; }
+}

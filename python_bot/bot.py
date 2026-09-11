@@ -4551,15 +4551,33 @@ def crypto_display_price(mid, base_price, net_units):
     return max(0.0001, float(mid) * (1.0 + impact))
 
 
+# One chart point per coin every this many ticks. At a one-minute tick that is a point
+# every five minutes: enough to draw a day, few enough that a week of ten coins stays
+# small. The chart is a display artefact - the live price is the only thing the game
+# ever settles against, so downsampling it costs nothing that matters.
+CRYPTO_HISTORY_EVERY_TICKS = 5
+_crypto_ticks = 0
+
+
 def _crypto_tick_sync():
-    """The tick's two database round trips, off the event loop. See crypto_tick_job."""
+    """The tick's database round trips, off the event loop. See crypto_tick_job."""
+    global _crypto_ticks
     rows = db.crypto_all()
     if not rows:
         return
-    db.crypto_set_prices([
-        (sym, crypto_next_price(mid, base, vol))
-        for sym, _name, mid, _prev, base, vol, _net in rows
-    ])
+    priced_now = [(sym, crypto_next_price(mid, base, vol))
+                  for sym, _name, mid, _prev, base, vol, _net in rows]
+    db.crypto_set_prices(priced_now)
+
+    _crypto_ticks += 1
+    if _crypto_ticks % CRYPTO_HISTORY_EVERY_TICKS == 0:
+        # The MID is recorded, not the impact-shifted display price: impact is a
+        # function of inventory, so folding it in would draw somebody's open position
+        # rather than the market. The board applies impact on read, and so does the
+        # chart's own header.
+        db.crypto_record_history(priced_now)
+        if _crypto_ticks % (CRYPTO_HISTORY_EVERY_TICKS * 288) == 0:
+            db.crypto_prune_history()
 
 
 async def crypto_tick_job(context: ContextTypes.DEFAULT_TYPE):

@@ -7,3 +7,8 @@ dickbot_backup_local.db
 __pycache__/
 *.pyc
 *.db
+
+# The Mini App's toolchain. node_modules is never committed; web/dist IS - it is the
+# artifact production serves, and committing it is what keeps the deploy a git pull
+# with no Node on the server. CI rebuilds and fails if dist has drifted from src.
+python_bot/web/node_modules/

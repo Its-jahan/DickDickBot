@@ -296,6 +296,19 @@ def init_db():
 
         # One message per group per night, edited in place as each nightly job lands its
         # section, instead of seven separate messages between 00:00 and 00:20.
+        # Price history for the market chart. Downsampled on write (see
+        # crypto_record_history) and pruned on a schedule - it is a display artefact,
+        # and the live price is the only thing the game ever settles against.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS crypto_history (
+                symbol TEXT,
+                at TIMESTAMPTZ DEFAULT now(),
+                price DOUBLE PRECISION
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS crypto_history_sym_at '
+                  'ON crypto_history (symbol, at DESC)')
+
         c.execute('''
             CREATE TABLE IF NOT EXISTS night_reports (
                 chat_id BIGINT,
@@ -865,6 +878,41 @@ def get_last_chat(user_id):
         c.execute('SELECT DISTINCT chat_id FROM users WHERE user_id = %s AND chat_id < 0', (user_id,))
         rows = c.fetchall()
         return rows[0][0] if len(rows) == 1 else None
+
+
+def crypto_record_history(rows):
+    """Append one price point per coin, in a single statement.
+
+    This runs on a timer forever, so it is written the same way crypto_set_prices is:
+    one round trip for the whole board rather than ten. `rows` is [(symbol, price)].
+    """
+    if not rows:
+        return
+    with get_connection() as conn:
+        c = conn.cursor()
+        args = b','.join(c.mogrify('(%s,%s)', (sym, float(px))) for sym, px in rows)
+        c.execute(b'INSERT INTO crypto_history (symbol, price) VALUES ' + args)
+
+
+def crypto_history(symbol, hours=24, limit=240):
+    """Oldest-first price points for one coin over the last `hours`.
+
+    Capped at `limit` points because a chart on a phone cannot show more, and sending
+    1,400 of them would cost more than the rest of the screen put together.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT EXTRACT(EPOCH FROM at)::bigint, price FROM crypto_history "
+                  "WHERE symbol = %s AND at > now() - (%s || ' hours')::interval "
+                  "ORDER BY at DESC LIMIT %s", (symbol, str(int(hours)), int(limit)))
+        return [(int(t), float(p)) for t, p in reversed(c.fetchall())]
+
+
+def crypto_prune_history(keep_days=7):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM crypto_history WHERE at < now() - (%s || ' days')::interval",
+                  (str(int(keep_days)),))
 
 
 def night_report_add(chat_id, day, key, rank, body):

@@ -39,7 +39,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import db
@@ -698,19 +698,56 @@ def api_use_item():
 
 
 # ---------------------------------------------------------------- the page itself
+# The front end is a React/Vite/shadcn app under web/, and its BUILD OUTPUT IS COMMITTED
+# (web/dist). That is the trade that keeps the deploy a git pull and a restart: the
+# production host needs no Node at all, exactly as before the app grew a build step. CI
+# rebuilds from source and fails if the committed dist has drifted, so the thing served
+# is always the thing in web/src.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DIST = os.path.join(_HERE, 'web', 'dist')
 _PAGE = None
 
 
 @app.get('/')
 def index():
-    """The whole app is one file. No bundler, no build step - same call the rest of this
-    repo makes, and it keeps the deploy a git pull and a restart."""
     global _PAGE
     if _PAGE is None or app.debug:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               'templates', 'app.html'), encoding='utf-8') as fh:
+        with open(os.path.join(DIST, 'index.html'), encoding='utf-8') as fh:
             _PAGE = fh.read()
     return Response(_PAGE, mimetype='text/html; charset=utf-8')
+
+
+@app.get('/assets/<path:filename>')
+def assets(filename):
+    """The built JS and CSS. send_from_directory refuses to escape DIST, so a crafted
+    filename cannot read the rest of the disk."""
+    resp = send_from_directory(os.path.join(DIST, 'assets'), filename)
+    # Rebuilt files keep the same names (see vite.config.ts), so they must revalidate -
+    # a long cache here would serve yesterday's app after a deploy.
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.get('/api/crypto/history')
+def api_crypto_history():
+    """Price points for one coin's chart.
+
+    Scoped like everything else even though prices are global: the endpoint is only
+    reachable by a signed player, and _need_scope is what enforces that uniformly.
+    """
+    sc, err = _need_scope()
+    if err:
+        return err
+    symbol = (request.args.get('symbol') or '').strip().upper()[:16]
+    if not symbol:
+        return _fail('کدام ارز؟')
+    try:
+        hours = max(1, min(168, int(request.args.get('hours', 24))))
+    except (TypeError, ValueError):
+        hours = 24
+    rows = db.crypto_history(symbol, hours)
+    return jsonify({'ok': True, 'symbol': symbol, 'hours': hours,
+                    'points': [{'t': t, 'p': p} for t, p in rows]})
 
 
 @app.get('/api/transfer')
