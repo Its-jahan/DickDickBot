@@ -1225,7 +1225,12 @@ async def use_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, reply_markup=reply_markup)
 
 async def use_direct_item_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirms a direct item picked from the "@username" inline flow and applies it."""
+    """Confirms a direct item picked from the "@username" inline flow and applies it.
+
+    Thin wrapper over perform_item_use like every other surface: this used to carry its
+    own copy of the dose claim, the consume and the release-on-failure, which is three
+    copies of an ordering where getting it backwards costs somebody a real item.
+    """
     query = update.callback_query
     user = query.from_user
 
@@ -1243,106 +1248,132 @@ async def use_direct_item_inline_callback(update: Update, context: ContextTypes.
         await query.answer("این دکمه مال شما نیست!", show_alert=True)
         return
 
-    _, _, user_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
-    if user_perk == "کون‌سوخته":
-        await query.answer("شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!", show_alert=True)
-        return
-
     target_info = db.get_user_info(target_id, chat_id)
     target_name = target_info[0] if target_info else "ناشناس"
 
-    # Claim the target's daily dose slot before spending the item, so a blocked dose
-    # never costs the giver anything.
-    allowed, reason = claim_dose_slot(item_name, target_id, target_name, chat_id)
-    if not allowed:
-        await query.answer(reason, show_alert=True)
+    kind, msg, _public = perform_item_use(
+        user.id, user.first_name, user.username, chat_id, item_name, target_id, target_name)
+    if kind == ITEM_REFUSED:
+        await query.answer(msg, show_alert=True)
         return
 
-    success = db.use_inventory(user.id, chat_id, item_name)
-    if not success:
-        if item_name in DOSE_LIMITED_ITEMS:
-            db.release_dose(target_id, chat_id)
-        await query.answer("این آیتم رو دیگه ندارید!", show_alert=True)
-        return
-
-    msg = apply_direct_item(item_name, target_id, target_name, chat_id)
     await query.answer("انجام شد!")
     await query.edit_message_text(msg)
 
+
+ITEM_REFUSED, ITEM_RESULT = 'refused', 'result'
+
+
+def perform_item_use(actor_id, actor_name, actor_username, chat_id, item_name,
+                     target_id=None, target_name=None):
+    """Use one item. Returns (kind, text, public) and touches no Telegram object.
+
+    `public` is the group-visible line, or None for the items that are nobody else's
+    business. That split is the whole reason this returns three things: arming a condom
+    is a secret (the chat sends it by DM), while pushing 40 centimetres into somebody
+    else is an interaction other players must be able to see.
+
+    Every ordering rule the chat had is preserved here, and two of them are load-bearing:
+    the dose slot is claimed BEFORE the giver's item is consumed, and the item is
+    consumed BEFORE its effect is applied. The first stops a blocked dose costing
+    somebody their item; the second stops a race applying the effect for free.
+    """
+    db.get_user(actor_id, chat_id, actor_username, actor_name)
+    _sz, _lg, perk = db.get_user(actor_id, chat_id, None, None)
+    if perk == "کون‌سوخته":
+        return (ITEM_REFUSED,
+                "شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!",
+                None)
+
+    known = (CHALLENGE_ITEMS, DIRECT_ITEMS, THEFT_ITEMS, INSTANT_ITEMS)
+    if not any(item_name in group for group in known):
+        return ITEM_REFUSED, "همچین آیتمی نداریم.", None
+
+    if not any(n == item_name and q > 0 for n, q in db.get_inventory(actor_id, chat_id)):
+        return ITEM_REFUSED, f"شما آیتم '{item_name}' را در این گروه ندارید!", None
+
+    if item_name in THEFT_ITEMS or item_name in INSTANT_ITEMS:
+        ok, note = activate_special_item(actor_id, chat_id, item_name, actor_name)
+        return (ITEM_RESULT if ok else ITEM_REFUSED), note, None
+
+    if item_name in CHALLENGE_ITEMS:
+        if db.get_user_active_item(actor_id, chat_id):
+            return (ITEM_REFUSED,
+                    "شما از قبل یک آیتم چالشی فعال دارید! اول در یک چالش شرکت کنید.", None)
+        if not db.use_inventory(actor_id, chat_id, item_name):
+            return ITEM_REFUSED, f"شما آیتم '{item_name}' را در این گروه ندارید!", None
+        db.set_user_active_item(actor_id, chat_id, item_name)
+        # Deliberately no `public`: which item somebody is holding into a challenge is
+        # exactly the thing the item is for.
+        return ITEM_RESULT, f"آیتم چالشی {item_name} برای تو فعال شد! 🤫", None
+
+    # DIRECT_ITEMS - the only ones that reach another player.
+    if not target_id:
+        return ITEM_REFUSED, f"'{item_name}' رو باید روی یکی استفاده کنی — طرف رو انتخاب کن.", None
+    if target_id == actor_id and item_name in DOSE_LIMITED_ITEMS:
+        # Not forbidden by the old code either, and deliberately still allowed: the dose
+        # limit is per TARGET, so using one on yourself simply burns your own slot.
+        pass
+
+    allowed, reason = claim_dose_slot(item_name, target_id, target_name, chat_id)
+    if not allowed:
+        return ITEM_REFUSED, reason, None
+
+    if not db.use_inventory(actor_id, chat_id, item_name):
+        if item_name in DOSE_LIMITED_ITEMS:
+            db.release_dose(target_id, chat_id)
+        return ITEM_REFUSED, f"شما آیتم '{item_name}' را در این گروه ندارید!", None
+
+    text = apply_direct_item(item_name, target_id, target_name, chat_id)
+    record(chat_id, 'item', f"🎒 {actor_name} روی {target_name} از {item_name} استفاده کرد.",
+           actor_id=actor_id, actor_name=actor_name,
+           target_id=target_id, target_name=target_name)
+    return ITEM_RESULT, text, f"🎒 {actor_name} روی {target_name} از {item_name} استفاده کرد.\n{text}"
+
+
 async def use_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/use - thin wrapper over perform_item_use, which the app calls too."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     db.track_chat(chat_id)
-    _, _, user_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
-    if user_perk == "کون‌سوخته":
-        await reply_temp(update, context, "شما امروز پرک کون‌سوخته 🔥 رو دارید و نمی‌تونید از هیچ آیتمی استفاده کنید!")
-        return
 
-    text = update.message.text
+    text = update.message.text or ''
     parts = text.split()
     if len(parts) < 2:
         await reply_temp(update, context, "استفاده: `/use نام_آیتم`\nمثال: `/use کاندوم`")
         return
-        
-    # item name might be multiple words
-    item_name = " ".join([p for p in parts[1:] if not p.startswith('@')])
+    item_name = " ".join(p for p in parts[1:] if not p.startswith('@'))
 
-    if (item_name not in CHALLENGE_ITEMS and item_name not in DIRECT_ITEMS
-            and item_name not in THEFT_ITEMS and item_name not in INSTANT_ITEMS):
-        return  # not a real item name at all - stay silent instead of replying
-
-    # check if user has item
-    items = db.get_inventory(user.id, chat_id)
-    has_item = False
-    for i_name, qty in items:
-        if i_name == item_name and qty > 0:
-            has_item = True
-            break
-            
-    if not has_item:
-        await reply_temp(update, context, f"شما آیتم '{item_name}' را در این گروه ندارید!")
-        return
-        
-    
-    if item_name in THEFT_ITEMS or item_name in INSTANT_ITEMS:
-        _ok, note = activate_special_item(user.id, chat_id, item_name, user.first_name)
-        await reply_temp(update, context, note)
+    # An unknown word after /use is somebody talking, not a failed command - stay silent
+    # rather than answering every stray message that happens to start with it.
+    if not any(item_name in g for g in (CHALLENGE_ITEMS, DIRECT_ITEMS, THEFT_ITEMS, INSTANT_ITEMS)):
         return
 
-    if item_name in CHALLENGE_ITEMS:
-        current_active = db.get_user_active_item(user.id, chat_id)
-        if current_active:
-            await reply_temp(update, context, "شما از قبل یک آیتم چالشی فعال دارید! اول در یک چالش شرکت کنید.")
-            return
-        
-        db.use_inventory(user.id, chat_id, item_name)
-        db.set_user_active_item(user.id, chat_id, item_name)
-        try:
-            await context.bot.send_message(chat_id=user.id, text=f"آیتم چالشی **{item_name}** برای شما در گروه فعال شد!")
-            await update.message.reply_text("آیتم فعال شد. چک پی‌وی.")
-        except:
-            await update.message.reply_text("آیتم چالشی فعال شد! 🤫 (به دلیل بسته بودن پی‌وی اینجا اعلام کردم)")
-            
-    elif item_name in DIRECT_ITEMS:
-        target_user_id, target_first_name = get_target_user(update, text, chat_id)
-        if not target_user_id:
-            await reply_temp(update, context, "باید روی یک نفر ریپلای کنید یا یوزرنیمش رو منشن کنید!")
-            return
+    target_id, target_name = (get_target_user(update, text, chat_id)
+                              if item_name in DIRECT_ITEMS else (None, None))
 
-        allowed, reason = claim_dose_slot(item_name, target_user_id, target_first_name, chat_id)
-        if not allowed:
-            await reply_temp(update, context, reason)
-            return
+    kind, msg, public = perform_item_use(
+        user.id, user.first_name, user.username, chat_id, item_name, target_id, target_name)
+    if kind == ITEM_REFUSED:
+        await reply_temp(update, context, msg)
+        return
 
-        # Consume the item BEFORE applying its effect - the other order let a race
-        # (or a failed decrement) apply the effect for free.
-        if not db.use_inventory(user.id, chat_id, item_name):
-            if item_name in DOSE_LIMITED_ITEMS:
-                db.release_dose(target_user_id, chat_id)
-            await reply_temp(update, context, f"شما آیتم '{item_name}' را در این گروه ندارید!")
-            return
-        msg = apply_direct_item(item_name, target_user_id, target_first_name, chat_id)
+    if public:
+        # It moved somebody else's size, so it is the record and stays.
         await update.message.reply_text(msg)
+        return
+    if item_name in CHALLENGE_ITEMS:
+        # Secret by design: the DM is the point, and the group only learns that
+        # something was armed, never what.
+        try:
+            await context.bot.send_message(
+                chat_id=user.id, text=f"آیتم چالشی **{item_name}** برای شما در گروه فعال شد!")
+            await update.message.reply_text("آیتم فعال شد. چک پی‌وی.")
+        except Exception:
+            await update.message.reply_text("آیتم چالشی فعال شد! 🤫 (به دلیل بسته بودن پی‌وی اینجا اعلام کردم)")
+        return
+    await reply_temp(update, context, msg)
+
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id

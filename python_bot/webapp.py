@@ -47,6 +47,10 @@ Three things a browser genuinely cannot do, and how they are handled rather than
 - **It has nobody to show a button to.** Anything that needs another player's tap is
   announced into the group carrying that keyboard, so a challenge opened in the app is
   accepted from the chat and vice versa - one book, not one per surface.
+
+Item use follows the same rule: perform_item_use returns a `public` line for the items
+that reach another player and None for the ones that are nobody else's business, so the
+group sees a ویاگرا land on somebody and never sees which item you armed for a challenge.
 """
 import asyncio
 import base64
@@ -576,16 +580,38 @@ def api_settings_tone():
                     else 'لحن +۱۸ فعال شد'})
 
 
+def _item_kind(name):
+    """Which bucket an item is in, answered from bot.py's own lists.
+
+    The front end used to carry a hardcoded copy of these names to decide which items
+    showed a button. That is the drift bug this repo keeps getting bitten by: an item
+    added to a bucket in bot.py would silently stay unusable in the app forever. The
+    buckets are the bot's, so the answer comes from the bot.
+    """
+    for kind, group in (('direct', bot.DIRECT_ITEMS), ('challenge', bot.CHALLENGE_ITEMS),
+                        ('theft', bot.THEFT_ITEMS), ('instant', bot.INSTANT_ITEMS)):
+        if name in group:
+            return kind
+    return 'passive'
+
+
 @app.get('/api/inventory')
 def api_inventory():
     sc, err = _need_scope()
     if err:
         return err
     uid, _n, _u, chat_id = sc
-    return jsonify({'ok': True, 'items': [
-        {'name': it, 'count': int(n), 'desc': bot.ITEM_DESCRIPTIONS.get(it, '')}
-        for it, n in db.get_inventory(uid, chat_id)
-    ]})
+    items = []
+    for it, n in db.get_inventory(uid, chat_id):
+        kind = _item_kind(it)
+        items.append({
+            'name': it, 'count': int(n), 'desc': bot.ITEM_DESCRIPTIONS.get(it, ''),
+            'kind': kind,
+            # Passive items are worn, not used - there is nothing to press.
+            'usable': kind != 'passive',
+            'needs_target': kind == 'direct',
+        })
+    return jsonify({'ok': True, 'items': items})
 
 
 @app.get('/api/economy')
@@ -805,26 +831,41 @@ def api_shop_buy():
 # ---------------------------------------------------------------- item use
 @app.post('/api/inventory/use')
 def api_use_item():
-    """Only PASSIVE/self-targeted items can be armed from here.
+    """Use any item, including the ones that reach another player.
 
-    Anything that needs a target (ویاگرا, قرص, زعفرون) is refused on purpose: those are
-    an interaction with another player and belong in the chat where that player can see
-    it happen, not in a private browser tab.
+    perform_item_use is the SAME function /use calls, so the dose limit, the
+    consume-before-apply ordering and the کون‌سوخته block are not a second copy that
+    could drift - they are the only copy.
+
+    Anything that touched somebody else is announced in the group. That is not a
+    courtesy: 40 centimetres moving off a player who never opened the app is exactly the
+    kind of thing the chat has to see, and the shared function says so by returning a
+    `public` line for precisely those items and None for the rest.
     """
     sc, err = _need_scope()
     if err:
         return err
     uid, name, username, chat_id = sc
-    item = str((request.get_json(silent=True) or {}).get('item') or '')
-    # Exactly the set activate_special_item knows how to handle on its own. Challenge
-    # items are armed by the challenge flow and the direct ones need a target, so
-    # neither belongs in a solo browser tab.
-    if item not in bot.THEFT_ITEMS and item not in bot.INSTANT_ITEMS:
-        return _fail('این آیتم رو باید توی گروه استفاده کنی')
-    db.get_user(uid, chat_id, username, name)
-    ok, message = bot.activate_special_item(uid, chat_id, item, name)
-    if not ok:
+    body = request.get_json(silent=True) or {}
+    item = str(body.get('item') or '')
+
+    target_id, target_name = None, None
+    if item in bot.DIRECT_ITEMS:
+        try:
+            target_id = int(body.get('target'))
+        except (TypeError, ValueError):
+            return _fail('روی کی می‌خوای استفاده کنی؟')
+        target = db.get_user_info(target_id, chat_id)
+        if not target:
+            return _fail('این بازیکن تو این گروه نیست')
+        target_name = target[0] or '؟'
+
+    kind, message, public = bot.perform_item_use(
+        uid, name, username, chat_id, item, target_id, target_name)
+    if kind == bot.ITEM_REFUSED:
         return _fail(message)
+    if public:
+        _announce(chat_id, _esc_plain(public))
     return jsonify({'ok': True, 'message': message})
 
 

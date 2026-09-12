@@ -99,6 +99,23 @@ console.log('  سرقت از بانک   ok (polled 3s)')
 await page.keyboard.press('Escape')
 await page.waitForTimeout(600)
 
+// Using an item ON somebody is the one bag action that opens a picker, so it is the
+// one that can render wrong. Open the bag, fire the targeted item, pick, and use it.
+await page.click('nav button:has-text("کوله")')
+await page.waitForTimeout(1500)
+const bag = (await page.innerText('body')).replace(/\s+/g, ' ')
+if (!bag.includes('ویاگرا')) throw new Error('bag did not render: ' + bag.slice(0, 150))
+if (!bag.includes('روی یکی')) throw new Error('the targeted item is not marked: ' + bag.slice(0, 200))
+await page.click('button:has-text("استفاده")')
+await page.waitForTimeout(1200)
+const sheet = (await page.innerText('body')).replace(/\s+/g, ' ')
+if (!sheet.includes('استفاده کن')) throw new Error('target sheet did not open: ' + sheet.slice(0, 200))
+console.log('  کوله + هدف     ok')
+await page.keyboard.press('Escape')
+await page.waitForTimeout(600)
+await page.click('nav button:has-text("خونه")')
+await page.waitForTimeout(1000)
+
 // The daily roll is a plain button, not a sheet.
 await page.waitForTimeout(400)
 const home = (await page.innerText('body')).replace(/\s+/g, ' ')

@@ -1611,9 +1611,10 @@ already computed the board for the rank, so it costs nothing extra.
 
 ### Every action is in the app, and the group still sees it
 
-**Nothing is Telegram-only.** Growth, theft, donation, challenges, consensus votes and
-the crown's decrees are all reachable from the browser, and each still posts to the group
-exactly as the chat handler would.
+**Nothing is Telegram-only.** Growth, theft, donation, challenges, consensus votes, the
+heist, the crown's decrees and item use — including items used on another player — are
+all reachable from the browser, and each still posts to the group exactly as the chat
+handler would.
 
 The line this replaced — "does it need somebody else to tap something?" — turned out to
 be the wrong question. The missing piece was never the browser; it was that the group had
@@ -1636,6 +1637,7 @@ endpoint are both thin wrappers over it:
 | `/ejma` | `perform_ejma_start` / `_vote` | `consensus_cmd` / `consensus_vote_callback` | `POST /api/ejma/start` / `/vote` |
 | `/farman` | `perform_decree_sign` | `decree_callback` | `POST /api/decree/sign` |
 | `/sarghat` | `perform_heist_offer` / `settle_heist` | `heist_cmd` / `resolve_heist_attempt` | `POST /api/heist/*` |
+| `/use` | `perform_item_use` | `use_item_cmd` / `use_direct_item_inline_callback` | `POST /api/inventory/use` |
 
 A second copy of the challenge escrow ordering, the theft odds or the consensus threshold
 would be a **money bug, not a style one**. There is a test asserting each `perform_*` is
@@ -1722,15 +1724,42 @@ the message id is part of the record (the bot's stage jobs edit that message), n
 courtesy. If the send fails the group's cooldown slot is handed straight back, so a dead
 `api.telegram.org` costs nobody five days.
 
+### Items, including the ones you use on somebody else
+
+`perform_item_use` covers all four buckets and returns **three** things —
+`(kind, text, public)`. The third is the whole reason it is not the usual pair: arming a
+condom is a secret the chat delivers by DM, while pushing 40 centimetres onto another
+player is an interaction the group has to see. `public` is the group line for exactly
+the items that reach somebody else and `None` for the rest, so no caller has to keep its
+own list of which is which.
+
+**Two orderings are load-bearing, and there is now exactly one copy of them:**
+
+1. The target's dose slot is claimed **before** the giver's item is consumed — otherwise
+   a blocked dose costs somebody an item they never got to use.
+2. The item is consumed **before** its effect is applied, with `db.release_dose` on a
+   failed consume — the other order let a race apply the effect for free.
+
+There were **three** copies of that before this: `use_item_cmd`, the inline
+`use_direct_item_inline_callback`, and nearly a fourth in the endpoint. The regression
+test counts `claim_dose_slot(` and `apply_direct_item(` in `bot.py` and fails if either
+appears more than twice (its definition plus its single call) — that count is what caught
+the third copy.
+
+The dose limit is per **target**, not per giver, so two different players with two
+different items cannot both dose the same person. `زعفرون` is deliberately exempt.
+
+The front end no longer decides what is usable. `/api/inventory` returns `kind`,
+`usable` and `needs_target` from `webapp._item_kind`, which reads `bot.py`'s own bucket
+lists; the client used to carry a hardcoded copy of the names, so an item added to a
+bucket in `bot.py` stayed dead in the app forever. A direct item opens a target picker
+sheet; everything else is one button.
+
 ### What is still chat-only
 
-Item use, and only partly: theft items and the golden ticket can be armed from the web
-because they only touch the player's own state, while anything needing a target
-(`DIRECT_ITEMS`) is pushed back to the group.
-
-`chats.title` is recorded opportunistically in `log_incoming` — every delivered message
-carries the group name and that handler already sees all of them — purely so the group
-picker can say a name instead of a chat id.
+Nothing. `chats.title` is recorded opportunistically in `log_incoming` — every delivered
+message carries the group name and that handler already sees all of them — purely so the
+group picker can say a name instead of a chat id.
 
 ## Admin panel
 

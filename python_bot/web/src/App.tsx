@@ -25,7 +25,6 @@ const ENDPOINT: Record<TabKey, string> = {
   home: '/api/home', feed: '/api/feed', crypto: '/api/crypto',
   bank: '/api/bank', shop: '/api/shop', bag: '/api/inventory',
 }
-const USABLE = ['دستکش', 'کیسه', 'بلیت طلایی']
 
 type Phase = 'boot' | 'login' | 'groups' | 'empty' | 'play' | 'error'
 
@@ -116,7 +115,6 @@ export default function App() {
     setLoading(true)
     try {
       const d = await api<any>(ENDPOINT[want], undefined, chat)
-      if (want === 'bag') d.items.forEach((i: any) => { i.usable = USABLE.includes(i.name) })
       // Tag the payload with the tab it belongs to. Rendering is gated on that tag, so a
       // screen can never be handed another screen's data - which is what made switching
       // tabs crash: setTab re-renders IMMEDIATELY, long before the new data arrives, so
