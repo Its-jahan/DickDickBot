@@ -21,14 +21,30 @@ codebase would then have to keep out of git. `_verify_init_data` below is the wh
 system, and nothing downstream ever trusts a user_id from anywhere else - in particular
 never from the request body, which is client-supplied.
 
-WHAT THIS APP DELIBERATELY DOES NOT DO
---------------------------------------
-Challenges, theft, consensus votes, heists, decrees and the crown's powers are not here.
-They are not missing screens: they are group-social mechanics whose entire point is a
-message landing in the chat for other people to react to, and a browser tab has nobody
-to post to. Those open a deep link back into Telegram instead. What lives here is
-everything a player does alone - their balance, the market, the shop, their bag.
+EVERY ACTION LIVES HERE, AND THE GROUP STILL SEES IT
+---------------------------------------------------
+Nothing is Telegram-only except the heist. Growth, theft, donations, challenges,
+consensus votes and the crown's decrees are all reachable from the browser, and each one
+still posts to the group exactly as the chat handler would have - a player using the app
+is invisible to nobody. (/sarghat is the exception because its three stages are
+job_queue timers editing a live message, not a request/response.)
+
+The rule that makes that safe is that the DECISION never lives in a surface. Every one
+of them goes through a `bot.perform_*` function that touches no Telegram object and
+returns (kind, text); the chat handler and the endpoint here are both thin wrappers over
+it. A second copy of the theft odds, the challenge escrow ordering or the consensus
+threshold would be a money bug, not a style one.
+
+Two things a browser genuinely cannot do, and how they are handled rather than dodged:
+
+- **It has no job queue.** A challenge accepted or a vote opened here cannot schedule
+  its own settlement. The bot sweeps for both (recover_stuck_pvp_matches and
+  recover_expired_consensus now repeat), so the browser starts what the bot finishes.
+- **It has nobody to show a button to.** Anything that needs another player's tap is
+  announced into the group carrying that keyboard, so a challenge opened in the app is
+  accepted from the chat and vice versa - one book, not one per surface.
 """
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -36,6 +52,7 @@ import json
 import os
 import threading
 import time
+import types
 import urllib.parse
 import urllib.request
 
@@ -44,6 +61,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import db
 import bot
+import decrees
 
 app = Flask(__name__)
 # Same reasoning as the admin panel: nginx terminates TLS and may serve this under a
@@ -94,11 +112,17 @@ def _tg_api(method, payload):
         return None
 
 
-def _tg_send(chat_id, text):
-    """POST one tone-aware sendMessage; a failed announcement never rolls money back."""
+def _tg_send(chat_id, text, reply_markup=None):
+    """POST one tone-aware sendMessage; a failed announcement never rolls money back.
+
+    `reply_markup` carries the keyboard for the things a browser starts but somebody in
+    the chat has to answer - a challenge nobody can accept is not a challenge. _tg_api
+    JSON-encodes a dict payload already, so it is passed straight through.
+    """
     return _tg_api('sendMessage', {
         'chat_id': chat_id, 'text': bot.tone_text(chat_id, text),
         'parse_mode': 'HTML', 'disable_web_page_preview': 'true',
+        'reply_markup': reply_markup,
     }) is not None
 
 
@@ -960,7 +984,7 @@ def api_transfer():
     })
 
 
-def _announce(chat_id, text):
+def _announce(chat_id, text, reply_markup=None):
     """Post a group action's outcome to the group it happened in.
 
     The whole reason theft and a donation live in a chat is that other people see them.
@@ -969,7 +993,7 @@ def _announce(chat_id, text):
     used. Dispatched off the request like the transfer announcement: the size has
     already moved, so a slow api.telegram.org costs the announcement and nothing else.
     """
-    _run_bg(_tg_send, chat_id, text)
+    _run_bg(_tg_send, chat_id, text, reply_markup)
 
 
 @app.get('/api/players')
@@ -1044,6 +1068,232 @@ def api_donate():
     # The giver's own message is written in the second person; the group gets the fact.
     _announce(chat_id, _esc_plain(
         f"🎁 {name} {int(amount)} سانت به {target_name} اهدا کرد."))
+    return jsonify({'ok': True, 'message': text})
+
+
+@app.post('/api/grow')
+def api_grow():
+    """/d from the app. perform_growth is the same coroutine the chat handler awaits."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    db.get_user(uid, chat_id, username, name)
+
+    # perform_growth reads exactly three attributes off `user` (id, first_name,
+    # username) and nothing else Telegram-shaped - it was written to be callable
+    # without an Update, which is what makes this a shim rather than a mock.
+    user = types.SimpleNamespace(id=uid, first_name=name, username=username)
+    # asyncio.run is safe here: this is a synchronous WSGI worker, so there is no
+    # running loop to conflict with.
+    ok, text = asyncio.run(bot.perform_growth(user, chat_id))
+    if not ok:
+        return _fail(text)
+    _announce(chat_id, _esc_plain(text))
+    return jsonify({'ok': True, 'message': text})
+
+
+@app.get('/api/challenges')
+def api_challenges():
+    """The group's open challenges - the listing a browser needs and a button cannot be.
+
+    Challenges opened with /c appear here and challenges opened here appear in the chat,
+    because both write the same open_challenges row.
+    """
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _name, _username, chat_id = sc
+    size, _lg, _perk = db.get_user(uid, chat_id, _username, _name)
+    rows = db.list_open_challenges(chat_id, bot.CHALLENGE_OPEN_SECONDS)
+    return jsonify({
+        'ok': True,
+        'size': float(size or 0),
+        'me_id': uid,
+        'open': [{'nonce': n, 'challenger_id': cid, 'challenger': cname,
+                  'bet': float(bet or 0), 'age': int(age or 0)}
+                 for n, cid, cname, bet, age in rows],
+    })
+
+
+@app.post('/api/challenge/create')
+def api_challenge_create():
+    """Open a challenge from the app, and post it to the group WITH its accept button.
+
+    The keyboard is the point: a challenge nobody in the chat can tap is not the same
+    feature. build_challenge_data signs the stake exactly as the chat path does, and is
+    handed the nonce the row was written under so the button and the row are the same
+    challenge rather than two.
+    """
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    try:
+        bet = int(body.get('bet'))
+    except (TypeError, ValueError):
+        return _fail('مقدار شرط رو بنویس')
+
+    kind, text, nonce = bot.perform_challenge_create(uid, name, username, chat_id, bet)
+    if kind == bot.CHALLENGE_REFUSED:
+        return _fail(text)
+    _announce(chat_id, _esc_plain(text), reply_markup={'inline_keyboard': [[{
+        'text': 'بیا کیرمو بخور ⚔️',
+        'callback_data': bot.build_challenge_data(uid, bet, nonce),
+    }]]})
+    return jsonify({'ok': True, 'message': text, 'nonce': nonce})
+
+
+@app.post('/api/challenge/accept')
+def api_challenge_accept():
+    """Accept one. Settlement is the bot's repeating sweep, not a job scheduled here."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    nonce = str(body.get('nonce') or '')
+
+    row = db.get_open_challenge(nonce)
+    # The nonce is client-supplied, so the challenge is re-read from the database rather
+    # than trusting a stake or a challenger id sent alongside it - the same reason the
+    # chat path verifies the signature on its callback_data.
+    if not row or row[1] != chat_id or row[5] != 'open':
+        return _fail('این چالش دیگه باز نیست')
+    _n, _c, challenger_id, _cn, bet, _st = row
+
+    kind, text, match_id = bot.perform_challenge_accept(
+        uid, name, username, chat_id, nonce, challenger_id, int(bet))
+    if kind == bot.CHALLENGE_REFUSED:
+        return _fail(text)
+    _announce(chat_id, _esc_plain(text))
+    return jsonify({'ok': True, 'message': text, 'match_id': match_id,
+                    'resolves_in': bot.BET_WINDOW_SECONDS})
+
+
+@app.get('/api/ejma')
+def api_ejma():
+    """Open consensus votes in this group, with what this player may still do."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    _sz, last_grown, _p = db.get_user(uid, chat_id, username, name)
+    today = bot.tehran_today_str()
+    rows = db.get_open_consensus_list(chat_id, bot.CONSENSUS_VOTE_WINDOW_SECONDS)
+    return jsonify({
+        'ok': True,
+        'eligible': last_grown == today and not db.is_jester(uid, chat_id),
+        'min_players': bot.MIN_CONSENSUS_PLAYERS,
+        'active_today': db.get_active_today_count(chat_id, today),
+        'me_id': uid,
+        'open': rows,
+    })
+
+
+@app.post('/api/ejma/start')
+def api_ejma_start():
+    """Start a vote from the app; the group gets the message and the vote buttons."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    try:
+        target_id = int(body.get('target'))
+    except (TypeError, ValueError):
+        return _fail('اجماع علیه کی؟')
+
+    target = db.get_user_info(target_id, chat_id)
+    if not target:
+        return _fail('این بازیکن تو این گروه نیست')
+
+    kind, text, vote_id = bot.perform_ejma_start(
+        uid, name, username, chat_id, target_id, target[0] or '؟')
+    if kind == bot.EJMA_REFUSED:
+        return _fail(text)
+    _announce(chat_id, _esc_plain(text), reply_markup={'inline_keyboard': [[
+        {'text': '✅ موافق (1)', 'callback_data': f'ejmavote_{vote_id}_yes'},
+        {'text': '❌ مخالف (0)', 'callback_data': f'ejmavote_{vote_id}_no'},
+    ]]})
+    return jsonify({'ok': True, 'message': text, 'vote_id': vote_id})
+
+
+@app.post('/api/ejma/vote')
+def api_ejma_vote():
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    try:
+        vote_id = int(body.get('vote_id'))
+    except (TypeError, ValueError):
+        return _fail('کدوم رای‌گیری؟')
+    choice = 'yes' if str(body.get('choice')) == 'yes' else 'no'
+
+    kind, text, state = bot.perform_ejma_vote(uid, name, username, chat_id, vote_id, choice)
+    if kind == bot.EJMA_REFUSED:
+        return _fail(text)
+    # An ordinary vote is not news; a settled one is. Announcing every tap would put the
+    # running tally in the group once per voter, which is the noise the whole edit-don't-
+    # post rule exists to stop.
+    if state != 'open':
+        _announce(chat_id, _esc_plain(text))
+    return jsonify({'ok': True, 'message': text, 'state': state})
+
+
+@app.get('/api/decree')
+def api_decree():
+    """Tonight's hand, for the king. Readable now that it lives in the database."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _name, _username, chat_id = sc
+    kingdom, _ = bot.refresh_king(chat_id)
+    king_id = kingdom[0] if kingdom else None
+    today = bot.tehran_today_str()
+    full = db.get_economy_full(chat_id)
+    signed = bool(full and full[6] == today)
+
+    codes = []
+    if king_id and uid == king_id and not signed:
+        entry = db.get_pending_decrees(chat_id)
+        if not entry or entry[0] != today or entry[2] != king_id:
+            codes = bot._roll_decrees(chat_id, today, king_id)
+        else:
+            codes = entry[1]
+
+    out = []
+    for code in codes:
+        d = decrees.get(code)
+        if d:
+            out.append({'code': d[0], 'title': d[1], 'desc': d[2], 'kind': d[4]})
+    econ = db.get_economy(chat_id)
+    return jsonify({
+        'ok': True,
+        'is_king': bool(king_id and uid == king_id),
+        'king': (kingdom[1] if kingdom else None),
+        'signed_today': signed,
+        'inflation': float(econ[0]) if econ else 1.0,
+        'unrest': float(econ[1]) if econ else 0.0,
+        'choices': out,
+    })
+
+
+@app.post('/api/decree/sign')
+def api_decree_sign():
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _name, _username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    kind, text = bot.perform_decree_sign(uid, chat_id, str(body.get('code') or ''))
+    if kind == bot.DECREE_REFUSED:
+        return _fail(text)
+    # Already HTML from perform_decree_sign - do not escape it again.
+    _announce(chat_id, text)
     return jsonify({'ok': True, 'message': text})
 
 

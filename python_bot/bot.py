@@ -705,6 +705,12 @@ def verify_payload(payload, tag):
 
 
 BET_WINDOW_SECONDS = 20
+
+# How often the bot re-checks for work the app started. The betting window is 20s, so
+# 10s keeps an app-accepted match settling within a few seconds of a chat-accepted one;
+# the consensus window is an hour, so a minute is plenty.
+PENDING_SWEEP_SECONDS = 10
+CONSENSUS_SWEEP_SECONDS = 60
 # A rematch has no spectator betting window - just a short beat of "rolling the
 # dice..." before it settles through the same persisted path as a normal match.
 REMATCH_ROLL_SECONDS = 2
@@ -721,11 +727,16 @@ def render_bet_message(match_state):
             lines.append(f"- {name}: {amount} سانت گذاشت روی {side_fa} {match_state['challenger_name']}")
     return "\n".join(lines)
 
-def build_challenge_data(challenger_id, bet):
+def build_challenge_data(challenger_id, bet, nonce=None):
     """callback_data for a challenge button: the stake is signed so it can't be edited
     by a patched client, and the nonce makes the button single-accept (see
-    db.claim_challenge). Stays well inside Telegram's 64-byte callback_data limit."""
-    nonce = uuid4().hex[:10]
+    db.claim_challenge). Stays well inside Telegram's 64-byte callback_data limit.
+
+    `nonce` is passed in when the challenge was already written to open_challenges, so
+    the button and the row name the same challenge - two nonces for one challenge would
+    give it two independent single-use claims.
+    """
+    nonce = nonce or uuid4().hex[:10]
     payload = f"{challenger_id}_{int(bet)}_{nonce}"
     return f"chal_{payload}_{sign_payload(payload)}"
 
@@ -1485,92 +1496,184 @@ def build_consensus_keyboard(vote_id, yes_count, no_count):
         InlineKeyboardButton(f"❌ مخالفم ({no_count})", callback_data=f"ejmavote_{vote_id}_no"),
     ]])
 
-async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    if chat_id >= 0:
-        await reply_temp(update, context, "این قابلیت فقط داخل گروه‌ها کار می‌کند!")
-        return
-    db.track_chat(chat_id)
-    text = update.message.text
+EJMA_REFUSED, EJMA_OK = 'refused', 'ok'
 
-    _, initiator_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
+
+def perform_ejma_start(user_id, user_name, user_username, chat_id, target_id, target_name):
+    """Open a consensus vote. Returns (kind, text, vote_id); no Telegram object here.
+
+    Every eligibility rule the chat enforced is enforced here, in the same order, for
+    the same reason the transfer endpoint mirrors transfer_callback: a browser must not
+    be the soft way round a gate the chat applies.
+    """
+    if chat_id >= 0:
+        return EJMA_REFUSED, "این قابلیت فقط داخل گروه‌ها کار می‌کند!", None
+
+    _sz, initiator_last_grown, _p = db.get_user(user_id, chat_id, user_username, user_name)
     today_str = tehran_today_str()
     if initiator_last_grown != today_str:
-        await reply_temp(update, context, "فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن اجماع راه بندازن!")
-        return
+        return EJMA_REFUSED, "فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن اجماع راه بندازن!", None
 
-    target_user_id, target_first_name = get_target_user(update, text, chat_id)
+    if not target_id:
+        return EJMA_REFUSED, "اول باید مشخص کنی اجماع علیه کیه.", None
+    if target_id == user_id:
+        return EJMA_REFUSED, "نمی‌توانید علیه خودتان اجماع کنید!", None
 
-    if not target_user_id:
-        await reply_temp(update, context, "استفاده صحیح:\n/ejma @username\nیا ریپلای کردن روی پیام شخص و تایپ /ejma")
-        return
-
-    if target_user_id == user.id:
-        await reply_temp(update, context, "نمی‌توانید علیه خودتان اجماع کنید!")
-        return
-
-    target_info = db.get_user_info(target_user_id, chat_id)
+    target_info = db.get_user_info(target_id, chat_id)
+    if target_info and target_info[0]:
+        target_name = target_info[0]
     target_size = target_info[1] if target_info else 0.0
     if target_size <= 0:
-        await reply_temp(update, context, f"{target_first_name} سایز کافی برای اجماع ندارد!")
-        return
+        return EJMA_REFUSED, f"{target_name} سایز کافی برای اجماع ندارد!", None
 
     # Consensus protection applies to everyone alike, the king included: back-to-back
     # consensus on one person is the thing the cooldown exists to stop, and being #1
-    # isn't a reason to lose that. The crown still pays for itself through the daily
-    # tax and the doubled challenge loss.
-    remaining = db.get_consensus_protection_remaining(chat_id, target_user_id)
+    # isn't a reason to lose that.
+    remaining = db.get_consensus_protection_remaining(chat_id, target_id)
     if remaining is not None:
         hours = max(1, int(remaining.total_seconds() // 3600))
-        await reply_temp(update, context,
-            f"{target_first_name} در حال حاضر در برابر اجماع محافظت‌شده است! تا حدود {hours} ساعت دیگر نمی‌شود دوباره علیه او اجماع کرد."
-        )
-        return
+        return EJMA_REFUSED, (f"{target_name} در حال حاضر در برابر اجماع محافظت‌شده است! "
+                              f"تا حدود {hours} ساعت دیگر نمی‌شود دوباره علیه او اجماع کرد."), None
 
-    existing_open = db.get_open_consensus(chat_id, target_user_id)
+    existing_open = db.get_open_consensus(chat_id, target_id)
     if existing_open:
-        _, elapsed_seconds = existing_open
+        _vid, elapsed_seconds = existing_open
         if elapsed_seconds >= CONSENSUS_VOTE_WINDOW_SECONDS:
-            db.fail_open_consensus(chat_id, target_user_id, target_first_name)
-            await reply_temp(update, context,
-                f"اجماع قبلی علیه {target_first_name} به حد نصاب رای نرسیده بود و شکست خورد!\n"
-                f"تا ۳ روز دیگر نمی‌شود علیه او اجماع جدیدی راه انداخت."
-            )
-        else:
-            await reply_temp(update, context,
-                f"یک اجماع علیه {target_first_name} هم‌اکنون در حال رای‌گیری است! صبر کنید تا نتیجه‌اش مشخص شود."
-            )
-        return
+            db.fail_open_consensus(chat_id, target_id, target_name)
+            return EJMA_REFUSED, (f"اجماع قبلی علیه {target_name} به حد نصاب رای نرسیده بود و شکست خورد!\n"
+                                  f"تا ۳ روز دیگر نمی‌شود علیه او اجماع جدیدی راه انداخت."), None
+        return EJMA_REFUSED, (f"یک اجماع علیه {target_name} هم‌اکنون در حال رای‌گیری است! "
+                              f"صبر کنید تا نتیجه‌اش مشخص شود."), None
+
+    if db.is_jester(user_id, chat_id):
+        return EJMA_REFUSED, ("🤡 تو دلقک درباری! پادشاه اجماع قبلیت رو منحل کرد.\n"
+                              "تا وقتی دلقکی نمی‌تونی اجماع راه بندازی."), None
 
     player_count = db.get_active_today_count(chat_id, today_str)
-    if db.is_jester(user.id, chat_id):
-        await reply_temp(update, context,
-            "🤡 تو دلقک درباری! پادشاه اجماع قبلیت رو منحل کرد.\n"
-            "تا وقتی دلقکی نمی‌تونی اجماع راه بندازی."
-        )
-        return
-
     if player_count < MIN_CONSENSUS_PLAYERS:
-        await reply_temp(update, context, f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} نفر که امروز دودولشونو مالیدن نیاز است!")
-        return
+        return EJMA_REFUSED, (f"برای اجماع حداقل به {MIN_CONSENSUS_PLAYERS} نفر که امروز "
+                              f"دودولشونو مالیدن نیاز است!"), None
 
     required_votes = player_count // 2 + 1
     amount = max(1, round(target_size * CONSENSUS_STEAL_RATIO))
-
-    vote_id = db.create_consensus(chat_id, target_user_id, target_first_name, user.id, user.first_name, amount, required_votes, player_count)
-
+    vote_id = db.create_consensus(chat_id, target_id, target_name, user_id, user_name,
+                                  amount, required_votes, player_count)
     voters = db.get_consensus_voters(vote_id)
+    return EJMA_OK, render_consensus_message(target_name, amount, required_votes,
+                                             player_count, voters), vote_id
+
+
+def perform_ejma_vote(user_id, user_name, user_username, chat_id, vote_id, choice):
+    """Cast one vote and settle the consequence. Returns (kind, text, state) where
+    state is 'open' | 'passed' | 'failed' | 'expired' - the caller renders, this decides.
+
+    The settlement (shrink the target, pay the treasury, grant protection) lives here
+    rather than in the callback, so the app cannot reach a different outcome than the
+    chat would have reached from the same vote.
+    """
+    consensus = db.get_consensus(vote_id)
+    if not consensus:
+        return EJMA_REFUSED, "این رای‌گیری وجود ندارد!", None
+    (v_chat_id, target_id, target_name, _initiator_id, amount, required_votes,
+     total_players, status, elapsed_seconds) = consensus
+
+    # A vote id is just a number in client-supplied data: without this check a member of
+    # group B could vote on (and swing) a consensus running in group A.
+    if v_chat_id != chat_id:
+        return EJMA_REFUSED, "این رای‌گیری مال این گروه نیست!", None
+    if status != 'open':
+        return EJMA_REFUSED, "این رای‌گیری دیگر فعال نیست!", None
+
+    if elapsed_seconds >= CONSENSUS_VOTE_WINDOW_SECONDS:
+        db.fail_open_consensus(chat_id, target_id, target_name)
+        voters = db.get_consensus_voters(vote_id)
+        msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
+        msg += "\n\n⏰ مهلت یک‌ساعتهٔ اجماع تمام شد و به حد نصاب نرسید! اجماع شکست خورد."
+        msg += f"\n🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود."
+        return EJMA_OK, msg, 'expired'
+
+    if user_id == target_id:
+        return EJMA_REFUSED, "نمی‌توانید به اجماع علیه خودتان رای بدهید!", None
+    if db.is_jester(user_id, chat_id):
+        return EJMA_REFUSED, "🤡 دلقک دربار حق رأی نداره!", None
+
+    _sz, voter_last_grown, _p = db.get_user(user_id, chat_id, user_username, user_name)
+    today_str = tehran_today_str()
+    if voter_last_grown != today_str:
+        return EJMA_REFUSED, "فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن به اجماع رای بدن!", None
+
+    if not db.cast_consensus_vote(vote_id, user_id, user_name, choice):
+        return EJMA_REFUSED, "شما قبلاً رای داده بودید!", None
+
+    yes_count, no_count = db.get_consensus_vote_counts(vote_id)
+    voters = db.get_consensus_voters(vote_id)
+
+    if yes_count >= required_votes:
+        if db.resolve_consensus_success(vote_id, chat_id, target_id, target_name):
+            db.update_size(target_id, chat_id, -amount)
+            # Shrinking someone by group vote destroys the size; it now lands in the
+            # treasury so the group's collective spite pays everyone's interest.
+            db.treasury_add(chat_id, amount, note="اجماع")
+            new_size, _lg2, _p2 = db.get_user(target_id, chat_id, None, None)
+            msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
+            msg += f"\n\n🎉 اجماع با {yes_count} رای موافق موفق شد!"
+            msg += f"\n📉 {int(amount)} سانتی‌متر از {target_name} کم شد. اندازه جدید: {int(new_size)} سانتی‌متر."
+            msg += f"\n🛡️ {target_name} تا ۶ روز در برابر اجماع جدید محافظت می‌شود."
+            return EJMA_OK, msg, 'passed'
+        return EJMA_REFUSED, "این رای‌گیری دیگر فعال نیست!", None
+
+    # Early failure: if the remaining eligible voters could never push "yes" to the
+    # required threshold, stop now. The target can't vote, so exclude them from the pool
+    # - but only if they're actually IN the pool (grew today); subtracting 1
+    # unconditionally could declare failure one voter too early.
+    _s3, target_last_grown, _p3 = db.get_user(target_id, chat_id, None, None)
+    target_in_pool = 1 if target_last_grown == today_str else 0
+    remaining_pool = max(0, total_players - target_in_pool - (yes_count + no_count))
+    if yes_count + remaining_pool < required_votes:
+        db.fail_open_consensus(chat_id, target_id, target_name)
+        msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
+        msg += "\n\n💔 اجماع دیگر شانسی برای رای‌آوری نداشت و شکست خورد!"
+        msg += f"\n🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود."
+        return EJMA_OK, msg, 'failed'
+
+    # Re-read the status: the timeout sweep may have resolved this vote while we were
+    # counting, and re-attaching live buttons would resurrect a vote that already failed
+    # and already granted the target its protection.
+    still_open = db.get_consensus(vote_id)
+    if not still_open or still_open[7] != 'open':
+        return EJMA_OK, render_consensus_message(target_name, amount, required_votes,
+                                                 total_players, voters), 'failed'
+    return EJMA_OK, render_consensus_message(target_name, amount, required_votes,
+                                             total_players, voters), 'open'
+
+
+async def consensus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ejma - thin wrapper over perform_ejma_start, which the app calls too."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    db.track_chat(chat_id)
+
+    target_user_id, target_first_name = get_target_user(update, update.message.text, chat_id)
+    if not target_user_id and chat_id < 0:
+        await reply_temp(update, context,
+            "استفاده صحیح:\n/ejma @username\nیا ریپلای کردن روی پیام شخص و تایپ /ejma")
+        return
+
+    kind, msg, vote_id = perform_ejma_start(
+        user.id, user.first_name, user.username, chat_id, target_user_id, target_first_name)
+    if kind == EJMA_REFUSED:
+        await reply_temp(update, context, msg)
+        return
+
     sent_message = await update.message.reply_text(
-        render_consensus_message(target_first_name, amount, required_votes, player_count, voters),
-        reply_markup=build_consensus_keyboard(vote_id, 1, 0)
-    )
+        msg, reply_markup=build_consensus_keyboard(vote_id, 1, 0))
     context.job_queue.run_once(
         consensus_timeout_job,
         when=CONSENSUS_VOTE_WINDOW_SECONDS,
         data={"vote_id": vote_id, "chat_id": chat_id, "message_id": sent_message.message_id},
         name=f"consensus_timeout_{vote_id}"
     )
+
 
 async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1584,162 +1687,175 @@ async def consensus_vote_callback(update: Update, context: ContextTypes.DEFAULT_
     data = query.data.split('_')
     if len(data) != 3 or data[0] != 'ejmavote':
         return
-    vote_id = int(data[1])
-    choice = data[2]
+    vote_id, choice = int(data[1]), data[2]
 
-    consensus = db.get_consensus(vote_id)
-    if not consensus:
-        await query.answer("این رای‌گیری وجود ندارد!", show_alert=True)
+    kind, msg, state = perform_ejma_vote(
+        user.id, user.first_name, user.username, chat_id, vote_id, choice)
+    if kind == EJMA_REFUSED:
+        await query.answer(msg, show_alert=True)
         return
 
-    v_chat_id, target_id, target_name, initiator_id, amount, required_votes, total_players, status, elapsed_seconds = consensus
-
-    # A vote id is just a number in client-supplied callback_data: without this check a
-    # member of group B could vote on (and swing) a consensus running in group A, where
-    # they were never eligible.
-    if v_chat_id != chat_id:
-        await query.answer("این رای‌گیری مال این گروه نیست!", show_alert=True)
-        return
-
-    if status != 'open':
-        await query.answer("این رای‌گیری دیگر فعال نیست!", show_alert=True)
-        return
-
-    if elapsed_seconds >= CONSENSUS_VOTE_WINDOW_SECONDS:
-        db.fail_open_consensus(chat_id, target_id, target_name)
-        await query.answer("مهلت این اجماع تمام شده بود!", show_alert=True)
-        voters = db.get_consensus_voters(vote_id)
-        msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
-        msg += "\n\n⏰ مهلت یک‌ساعتهٔ اجماع تمام شد و به حد نصاب نرسید! اجماع شکست خورد."
-        msg += f"\n🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود."
+    if state == 'open':
+        yes_count, no_count = db.get_consensus_vote_counts(vote_id)
+        await query.answer(f"رای شما ({'موافق' if choice == 'yes' else 'مخالف'}) ثبت شد!")
         try:
-            await query.edit_message_text(msg)
-        except:
+            await query.edit_message_text(
+                msg, reply_markup=build_consensus_keyboard(vote_id, yes_count, no_count))
+        except Exception:
             pass
         return
 
-    if user.id == target_id:
-        await query.answer("نمی‌توانید به اجماع علیه خودتان رای بدهید!", show_alert=True)
-        return
-
-    if db.is_jester(user.id, chat_id):
-        await query.answer("🤡 دلقک دربار حق رأی نداره!", show_alert=True)
-        return
-
-    _, voter_last_grown, _ = db.get_user(user.id, chat_id, user.username, user.first_name)
-    today_str = tehran_today_str()
-    if voter_last_grown != today_str:
-        await query.answer("فقط کسایی که امروز دودولشونو مالیدن (/d زدن) می‌تونن به اجماع رای بدن!", show_alert=True)
-        return
-
-    is_new_vote = db.cast_consensus_vote(vote_id, user.id, user.first_name, choice)
-    if not is_new_vote:
-        await query.answer("شما قبلاً رای داده بودید!", show_alert=True)
-        return
-
-    yes_count, no_count = db.get_consensus_vote_counts(vote_id)
-    voters = db.get_consensus_voters(vote_id)
-
-    if yes_count >= required_votes:
-        if db.resolve_consensus_success(vote_id, chat_id, target_id, target_name):
-            db.update_size(target_id, chat_id, -amount)
-            # Shrinking someone by group vote destroys the size; it now lands in the
-            # treasury so the group's collective spite pays everyone's interest.
-            db.treasury_add(chat_id, amount, note="اجماع")
-            new_size, _, _ = db.get_user(target_id, chat_id, None, None)
-            await query.answer("اجماع موفق شد!")
-            msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
-            msg += f"\n\n🎉 اجماع با {yes_count} رای موافق موفق شد!"
-            msg += f"\n📉 {int(amount)} سانتی‌متر از {target_name} کم شد. اندازه جدید: {int(new_size)} سانتی‌متر."
-            msg += f"\n🛡️ {target_name} تا ۶ روز در برابر اجماع جدید محافظت می‌شود."
-            await query.edit_message_text(msg)
-        return
-
-    # Early failure: if the remaining eligible voters could never push "yes" to the required threshold, stop now.
-    # The target can't vote, so exclude them from the pool - but only if they're actually
-    # IN the pool (grew today); subtracting 1 unconditionally could declare failure one
-    # voter too early when the target wasn't part of the active count.
-    _, target_last_grown, _ = db.get_user(target_id, chat_id, None, None)
-    target_in_pool = 1 if target_last_grown == today_str else 0
-    remaining_pool = max(0, total_players - target_in_pool - (yes_count + no_count))
-    if yes_count + remaining_pool < required_votes:
-        db.fail_open_consensus(chat_id, target_id, target_name)
-        await query.answer("اجماع شکست خورد!")
-        msg = render_consensus_message(target_name, amount, required_votes, total_players, voters)
-        msg += f"\n\n💔 اجماع دیگر شانسی برای رای‌آوری نداشت و شکست خورد!"
-        msg += f"\n🛡️ {target_name} تا ۳ روز در برابر اجماع جدید محافظت می‌شود."
-        await query.edit_message_text(msg)
-        return
-
-    await query.answer(f"رای شما ({'موافق' if choice == 'yes' else 'مخالف'}) ثبت شد!")
-    # Re-read the status: the one-hour timeout job may have resolved this vote while we
-    # were awaiting above, and re-attaching live buttons here would resurrect a vote
-    # that already failed and already granted the target its protection.
-    still_open = db.get_consensus(vote_id)
-    if not still_open or still_open[7] != 'open':
-        return
+    await query.answer({'passed': "اجماع موفق شد!", 'failed': "اجماع شکست خورد!"}
+                       .get(state, "مهلت این اجماع تمام شده بود!"))
     try:
-        await query.edit_message_text(
-            render_consensus_message(target_name, amount, required_votes, total_players, voters),
-            reply_markup=build_consensus_keyboard(vote_id, yes_count, no_count)
-        )
-    except:
+        await query.edit_message_text(msg)
+    except Exception:
         pass
 
+
+CHALLENGE_REFUSED, CHALLENGE_OK = 'refused', 'ok'
+
+# A challenge nobody accepted is abandoned, not refused: no size was escrowed at
+# creation, so there is nothing to release and no job to run. It simply stops being
+# offered.
+CHALLENGE_OPEN_SECONDS = 3600
+
+
+def perform_challenge_create(user_id, user_name, user_username, chat_id, bet):
+    """Open a challenge. Returns (kind, text, nonce) and touches no Telegram object.
+
+    The row in open_challenges is what makes a challenge visible to something that has
+    no button to read - the browser. The chat writes it too, so a challenge started with
+    /c is listed in the app and vice versa: there is one book, not one per surface.
+    """
+    db.get_user(user_id, chat_id, user_username, user_name)
+    try:
+        bet = int(bet)
+    except (TypeError, ValueError):
+        return CHALLENGE_REFUSED, "مقدار شرط رو درست بنویس.", None
+    if bet <= 0:
+        return CHALLENGE_REFUSED, "شرط باید بیشتر از صفر باشه.", None
+
+    user_size, _lg, user_perk = db.get_user(user_id, chat_id, None, None)
+    if user_perk == "حرومزاده":
+        return CHALLENGE_REFUSED, ("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! "
+                                   "نمی‌تونید چالش ایجاد کنید."), None
+    if db.is_in_heist_prison(user_id, chat_id):
+        return CHALLENGE_REFUSED, "⛓ تو زندان بانکی، نمی‌تونی چالش بدی!", None
+    if user_size < bet:
+        return CHALLENGE_REFUSED, (f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه "
+                                   f"ندارید! سایز فعلی شما: {int(user_size)}"), None
+
+    nonce = uuid4().hex[:10]
+    db.create_open_challenge(nonce, chat_id, user_id, user_name, bet)
+    return (CHALLENGE_OK,
+            f"⚔️ {user_name} یک چالش با شرط {bet} سانتی‌متر در این گروه ایجاد کرد!\n"
+            f"اولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود.",
+            nonce)
+
+
+def perform_challenge_accept(user_id, user_name, user_username, chat_id, nonce,
+                             challenger_id, bet):
+    """Accept a challenge: every check, both escrows, and the match row.
+
+    Returns (kind, text, match_id). This is the whole of what accept_challenge_callback
+    used to do inline, moved out so the browser runs the SAME checks in the SAME order -
+    the escrow ordering here is what stops one wallet backing two challenges at once,
+    and a second copy of it would be a money bug, not a style one.
+
+    It deliberately does not schedule the resolution. The chat had a job_queue to hand;
+    a web request does not, so the bot sweeps for matches whose window has closed
+    (recover_stuck_pvp_matches, now repeating) and both surfaces settle the same way.
+    """
+    db.get_user(user_id, chat_id, user_username, user_name)
+    bet = int(bet)
+
+    # Claim the button before touching any money: only the first tapper wins the race,
+    # everyone else (including the same user double-tapping) bounces off here.
+    if not db.claim_challenge(nonce):
+        return CHALLENGE_REFUSED, "این چالش قبلاً پذیرفته شده!", None
+
+    def _release(msg):
+        db.release_challenge(nonce)
+        return CHALLENGE_REFUSED, msg, None
+
+    if user_id == challenger_id:
+        return _release("شما نمی‌توانید چالش خودتان را بپذیرید!")
+
+    challenger_row = db.get_user(challenger_id, chat_id, None, None)
+    if not challenger_row or challenger_row[0] < bet:
+        return _release("شروع‌کننده چالش در حال حاضر سایز کافی ندارد!")
+    if challenger_row[2] == "حرومزاده":
+        return _release("کیر شروع‌کننده امروز فیریز شده (پرک حرومزاده)! نمی‌تواند چالش انجام دهد.")
+    if db.is_in_heist_prison(challenger_id, chat_id):
+        return _release("شروع‌کننده تو زندان بانکه، نمی‌تونه چالش بده!")
+
+    _size, _lg, user_perk = db.get_user(user_id, chat_id, None, None)
+    if user_perk == "حرومزاده":
+        return _release("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش رو بپذیرید.")
+    if db.is_in_heist_prison(user_id, chat_id):
+        return _release("⛓ تو زندان بانکی، نمی‌تونی چالش بپذیری!")
+
+    # Stake both sides' bet immediately the moment the match actually starts, so nobody
+    # can accept multiple challenges at once using the same not-yet-deducted size. The
+    # deductions are atomic check-and-take, so a concurrent stake elsewhere can't spend
+    # the same centimeters twice.
+    if not db.try_deduct_size(challenger_id, chat_id, bet):
+        return _release("شروع‌کننده چالش در حال حاضر سایز کافی ندارد!")
+    if not db.try_deduct_size(user_id, chat_id, bet):
+        db.update_size(challenger_id, chat_id, bet)  # hand the challenger's stake back
+        return _release(f"شما حداقل {int(bet)} سانتی‌متر برای شرکت در این گروه نیاز دارید!")
+
+    challenger_info = db.get_user_info(challenger_id, chat_id)
+    challenger_name = challenger_info[0] if challenger_info else "ناشناس"
+
+    match_id = str(uuid4())
+    db.create_pvp_match(match_id, chat_id, challenger_id, challenger_name,
+                        user_id, user_name, bet)
+    db.close_open_challenge(nonce, 'accepted')
+    return CHALLENGE_OK, render_bet_message({
+        "challenger_name": challenger_name,
+        "acceptor_name": user_name,
+        "bet": bet,
+        "bets": {},
+    }), match_id
+
+
 async def challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/c - thin wrapper over perform_challenge_create, which the app calls too."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     db.track_chat(chat_id)
-    text = update.message.text
-    
-    db.get_user(user.id, chat_id, user.username, user.first_name)
-    
-    parts = text.split()
-    bet = 10 # default 10 cm
+
+    parts = (update.message.text or '').split()
+    bet = 10  # default 10 cm
     if len(parts) > 1:
         try:
-            bet = int(parts[1])
-            if bet <= 0:
-                raise ValueError
+            v = int(parts[1])
+            if v > 0:
+                bet = v
         except ValueError:
             pass
-            
-    user_size, _, user_perk = db.get_user(user.id, chat_id, None, None)
-    if user_perk == "حرومزاده":
-        await reply_temp(update, context, "شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش ایجاد کنید.")
+
+    kind, msg, nonce = perform_challenge_create(
+        user.id, user.first_name, user.username, chat_id, bet)
+    if kind == CHALLENGE_REFUSED:
+        await reply_temp(update, context, msg)
         return
 
-    if db.is_in_heist_prison(user.id, chat_id):
-        await reply_temp(update, context, "⛓ تو زندان بانکی، نمی‌تونی چالش بدی!")
-        return
+    keyboard = [[InlineKeyboardButton(
+        "بیا کیرمو بخور ⚔️", callback_data=build_challenge_data(user.id, bet, nonce))]]
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # جقی deliberately does NOT touch the stake here. Its description promises a wild
-    # swing on the *dice* during the challenge, and that is where it is now applied
-    # (see resolve_pvp_match). Rewriting the bet instead meant the one perk players
-    # were warned about did something else entirely - and, because the old roll was
-    # randint(bet/2, 2*bet), it quietly inflated the average stake by 25%.
-    if user_size < bet:
-        await reply_temp(update, context, f"شما به اندازه کافی سایز برای شرط {bet} سانتی‌متری در این گروه ندارید! سایز فعلی شما: {int(user_size)}")
-        return
-        
-    keyboard = [[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=build_challenge_data(user.id, bet))]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر در این گروه ایجاد کرد!\nاولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود.",
-        reply_markup=reply_markup
-    )
 
 async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
-    
+
     chat_id = resolve_chat_id(query)
     if not chat_id:
         await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن تا ربات گروه رو بشناسه!", show_alert=True)
         return
-    
-    db.get_user(user.id, chat_id, user.username, user.first_name)
 
     data = query.data.split('_')
     if len(data) != 5 or data[0] != 'chal':
@@ -1751,79 +1867,14 @@ async def accept_challenge_callback(update: Update, context: ContextTypes.DEFAUL
         return
     challenger_id, bet = int(challenger_id), int(bet_str)
 
-    # Claim the button before touching any money: only the first tapper wins the race,
-    # everyone else (including the same user double-tapping) bounces off here.
-    if not db.claim_challenge(nonce):
-        await query.answer("این چالش قبلاً پذیرفته شده!", show_alert=True)
+    kind, msg, match_id = perform_challenge_accept(
+        user.id, user.first_name, user.username, chat_id, nonce, challenger_id, bet)
+    if kind == CHALLENGE_REFUSED:
+        await query.answer(msg, show_alert=True)
         return
-
-    def _release():
-        db.release_challenge(nonce)
-
-    if user.id == challenger_id:
-        _release()
-        await query.answer("شما نمی‌توانید چالش خودتان را بپذیرید!", show_alert=True)
-        return
-
-    challenger_row = db.get_user(challenger_id, chat_id, None, None)
-    if not challenger_row or challenger_row[0] < bet:
-        _release()
-        await query.answer("شروع‌کننده چالش در حال حاضر سایز کافی ندارد!", show_alert=True)
-        return
-
-    if challenger_row[2] == "حرومزاده":
-        _release()
-        await query.answer("کیر شروع‌کننده امروز فیریز شده (پرک حرومزاده)! نمی‌تواند چالش انجام دهد.", show_alert=True)
-        return
-
-    if db.is_in_heist_prison(challenger_id, chat_id):
-        _release()
-        await query.answer("شروع‌کننده تو زندان بانکه، نمی‌تونه چالش بده!", show_alert=True)
-        return
-
-    user_size, _, user_perk = db.get_user(user.id, chat_id, None, None)
-    if user_perk == "حرومزاده":
-        _release()
-        await query.answer("شما امروز پرک حرومزاده 🥶 رو دارید و کیرتون فیریز شده! نمی‌تونید چالش رو بپذیرید.", show_alert=True)
-        return
-
-    if db.is_in_heist_prison(user.id, chat_id):
-        _release()
-        await query.answer("⛓ تو زندان بانکی، نمی‌تونی چالش بپذیری!", show_alert=True)
-        return
-
-    # Stake both sides' bet immediately the moment the match actually starts, so nobody
-    # can accept multiple challenges at once using the same not-yet-deducted size. The
-    # deductions are atomic check-and-take, so a concurrent stake elsewhere can't spend
-    # the same centimeters twice.
-    if not db.try_deduct_size(challenger_id, chat_id, bet):
-        _release()
-        await query.answer("شروع‌کننده چالش در حال حاضر سایز کافی ندارد!", show_alert=True)
-        return
-    if not db.try_deduct_size(user.id, chat_id, bet):
-        db.update_size(challenger_id, chat_id, bet)  # hand the challenger's stake back
-        _release()
-        await query.answer(f"شما حداقل {int(bet)} سانتی‌متر برای شرکت در این گروه نیاز دارید!", show_alert=True)
-        return
-
-    challenger_info = db.get_user_info(challenger_id, chat_id)
-    challenger_name = challenger_info[0] if challenger_info else "ناشناس"
-
-    match_id = str(uuid4())
-    db.create_pvp_match(match_id, chat_id, challenger_id, challenger_name, user.id, user.first_name, bet)
-
-    match_state = {
-        "challenger_name": challenger_name,
-        "acceptor_name": user.first_name,
-        "bet": bet,
-        "bets": {},
-    }
 
     await query.answer("چالش پذیرفته شد!")
-    await query.edit_message_text(
-        render_bet_message(match_state),
-        reply_markup=build_bet_keyboard(match_id)
-    )
+    await query.edit_message_text(msg, reply_markup=build_bet_keyboard(match_id))
     # query.message is None for a callback on a genuinely inline-posted message (the
     # "via @dickchallengerbot" flow) - only inline_message_id is available then. Reading
     # query.message.message_id unconditionally crashed this handler for every such
@@ -5841,7 +5892,11 @@ def fee_of(chat_id, base_ratio, econ=None):
 # What the king is offered tonight, per group: {chat_id: (date, [codes], king_id)}.
 # Held in memory on purpose - an offer that is lost to a restart simply gets re-rolled
 # by the next night's job, and nothing has moved until one is signed.
-pending_decrees = {}
+# Tonight's decree hand lives in the DATABASE, not here. It used to be a dict, which
+# lost the hand on any deploy between the deal and the signature, and - because the
+# Mini App is a separate process - made /farman impossible to offer outside Telegram.
+# db.get_pending_decrees returns the same (day, codes, king_id) shape the dict held, so
+# the readers below did not have to change.
 
 
 def _roll_decrees(chat_id, today_str, king_id):
@@ -5851,7 +5906,7 @@ def _roll_decrees(chat_id, today_str, king_id):
     good = [d[0] for d in random.sample(decrees.GOOD, DECREE_GOOD_CHOICES)]
     bad = [d[0] for d in random.sample(decrees.BAD, DECREE_BAD_CHOICES)]
     codes = good + bad
-    pending_decrees[chat_id] = (today_str, codes, king_id)
+    db.set_pending_decrees(chat_id, today_str, king_id, codes)
     return codes
 
 
@@ -5910,7 +5965,7 @@ async def _offer_decrees_to(context, chat_id, today_str):
     full = db.get_economy_full(chat_id)
     if full and full[6] == today_str:
         return False  # the king already signed today
-    entry = pending_decrees.get(chat_id)
+    entry = db.get_pending_decrees(chat_id)
     if entry and entry[0] == today_str and entry[2] == kingdom[0]:
         return False  # already offered tonight, to this same king
 
@@ -5975,7 +6030,7 @@ async def decree_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     today_str = tehran_today_str()
-    entry = pending_decrees.get(chat_id)
+    entry = db.get_pending_decrees(chat_id)
     if not entry or entry[0] != today_str or entry[2] != kingdom[0]:
         # No hand dealt yet today (or the crown changed hands) - deal one now.
         codes = _roll_decrees(chat_id, today_str, kingdom[0])
@@ -5993,34 +6048,32 @@ async def decree_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def decree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    chat_id = resolve_chat_id(query)
-    if not chat_id:
-        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن!", show_alert=True)
-        return
-    code = query.data.split('_', 1)[1] if '_' in query.data else ''
+DECREE_REFUSED, DECREE_OK = 'refused', 'ok'
+
+
+def perform_decree_sign(user_id, chat_id, code):
+    """Sign one of tonight's decrees. Returns (kind, html_text).
+
+    The hand is read from the database rather than from process memory, which is what
+    makes this callable from the Mini App at all - and what stops a deploy between the
+    deal and the signature losing the hand.
+    """
     d = decrees.get(code)
     if not d:
-        await query.answer("این فرمان معتبر نیست!", show_alert=True)
-        return
+        return DECREE_REFUSED, "این فرمان معتبر نیست!"
 
     kingdom, _ = refresh_king(chat_id)
-    if not kingdom or user.id != kingdom[0]:
-        await query.answer("فقط پادشاه می‌تونه فرمان امضا کنه! 👑", show_alert=True)
-        return
+    if not kingdom or user_id != kingdom[0]:
+        return DECREE_REFUSED, "فقط پادشاه می‌تونه فرمان امضا کنه! 👑"
 
     today_str = tehran_today_str()
-    entry = pending_decrees.get(chat_id)
-    # Only a decree that was actually offered tonight can be signed - callback_data is
+    entry = db.get_pending_decrees(chat_id)
+    # Only a decree that was actually offered tonight can be signed - the code is
     # client-supplied, so without this a king could pick his favourite out of all 200.
     if not entry or entry[0] != today_str or code not in entry[1]:
-        await query.answer("این فرمان جزو گزینه‌های امشب نیست!", show_alert=True)
-        return
+        return DECREE_REFUSED, "این فرمان جزو گزینه‌های امشب نیست!"
     if not db.claim_decree_day(chat_id, today_str):
-        await query.answer("امروز فرمانت رو امضا کردی! فردا دوباره.", show_alert=True)
-        return
+        return DECREE_REFUSED, "امروز فرمانت رو امضا کردی! فردا دوباره."
 
     _c, title, desc, eff, kind = d
     try:
@@ -6029,10 +6082,9 @@ async def decree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         db.release_decree_day(chat_id)
         logging.exception(f"decree {code} failed in {chat_id}")
-        await query.answer("اجرای فرمان به مشکل خورد!", show_alert=True)
-        return
+        return DECREE_REFUSED, "اجرای فرمان به مشکل خورد!"
 
-    pending_decrees.pop(chat_id, None)
+    db.clear_pending_decrees(chat_id)
     mark = "😈" if kind == 'bad' else "😇"
     lines = [f"👑 <b>فرمان امضا شد</b> {mark}", "",
              f"<b>{_esc(title)}</b>", f"<i>{_esc(desc)}</i>", ""]
@@ -6054,12 +6106,28 @@ async def decree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"🌱 رشد ×{res['growth_mult']}")
     if res['unrest'] >= UNREST_REVOLT_THRESHOLD:
         lines.append("\n🔥 <b>مردم دارن شورش می‌کنن!</b> اگه همین‌طور ادامه بدی، تاج رو از سرت برمی‌دارن.")
+    return DECREE_OK, "\n".join(lines)
+
+
+async def decree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = resolve_chat_id(query)
+    if not chat_id:
+        await query.answer("⚠️ اول یه بار تو گروه از /d استفاده کن!", show_alert=True)
+        return
+    code = query.data.split('_', 1)[1] if '_' in query.data else ''
+
+    kind, text = perform_decree_sign(user.id, chat_id, code)
+    if kind == DECREE_REFUSED:
+        await query.answer(text, show_alert=True)
+        return
 
     await query.answer("فرمان اجرا شد!")
     try:
-        await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+        await query.edit_message_text(text, parse_mode="HTML")
     except Exception:
-        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 async def economy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7583,6 +7651,17 @@ if __name__ == '__main__':
     app.job_queue.run_repeating(crypto_tick_job, interval=CRYPTO_TICK_SECONDS, first=20)
     app.job_queue.run_once(recover_stuck_pvp_matches, when=5)
     app.job_queue.run_once(recover_expired_consensus, when=7)
+    # ...and again, forever. A match accepted or a vote opened FROM THE APP has no
+    # job_queue to schedule its own settlement on - webapp.py is a different process
+    # with no scheduler at all. These two sweeps already knew how to settle anything
+    # whose window had closed, so repeating them is what lets the browser start a thing
+    # the bot finishes. They remain idempotent: db.claim_pvp_match and
+    # fail_open_consensus both no-op on an already-settled row, so a sweep racing the
+    # per-match job cannot double-settle.
+    app.job_queue.run_repeating(recover_stuck_pvp_matches,
+                                interval=PENDING_SWEEP_SECONDS, first=PENDING_SWEEP_SECONDS)
+    app.job_queue.run_repeating(recover_expired_consensus,
+                                interval=CONSENSUS_SWEEP_SECONDS, first=CONSENSUS_SWEEP_SECONDS)
     app.job_queue.run_once(recover_pending_lotteries, when=9)
     app.job_queue.run_once(recover_decree_offer, when=12)
     app.job_queue.run_once(recover_stuck_heist_attempts, when=14)

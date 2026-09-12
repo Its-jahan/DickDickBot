@@ -15,6 +15,7 @@ import { Shop } from '@/screens/Shop'
 import { Bag } from '@/screens/Bag'
 import { Transfer } from '@/screens/Transfer'
 import { ActionSheet, type ActionKind } from '@/screens/Actions'
+import { GroupSheet, type GroupKind } from '@/screens/Group'
 import { Login } from '@/screens/Login'
 import { ToneSettings } from '@/components/ToneSettings'
 import { politeText, tonePayload, type ToneMode } from '@/lib/tone'
@@ -41,6 +42,8 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [xfer, setXfer] = useState(false)
   const [action, setAction] = useState<ActionKind | null>(null)
+  const [groupKind, setGroupKind] = useState<GroupKind | null>(null)
+  const [growing, setGrowing] = useState(false)
   // The bell's badge. `seen` is the newest id the player has actually looked at, so the
   // count survives switching tabs and does not reset just because the app re-rendered.
   const [seen, setSeen] = useState(0)
@@ -127,6 +130,22 @@ export default function App() {
       if (seq === reqRef.current) setLoading(false)
     }
   }, [chat, tab, toast, tone])
+
+  // /d, from the home screen. It is a plain button rather than a sheet because there is
+  // nothing to choose: the roll is the whole interaction.
+  const grow = useCallback(async () => {
+    if (!chat || growing) return
+    setGrowing(true)
+    try {
+      const r = await api<any>('/api/grow', {}, chat)
+      toast(r.message?.split('\n')[0] ?? 'رشد کردی')
+      await reload()
+    } catch (e: any) {
+      toast(e.message, true)
+    } finally {
+      setGrowing(false)
+    }
+  }, [chat, growing, reload, toast])
 
   useEffect(() => { if (phase === 'play') reload() }, [phase, tab, chat, reload])
 
@@ -233,7 +252,7 @@ export default function App() {
           )
         ) : tab === 'home' ? (
           <Home d={d} onPickGroup={() => setPhase('groups')} onTransfer={() => setXfer(true)}
-                onLogout={logout} onAction={setAction} />
+                onLogout={logout} onAction={setAction} onGroup={setGroupKind} onGrow={grow} />
         ) : tab === 'feed' ? <Feed d={d} />
           : tab === 'crypto' ? <Crypto d={d} chat={chat!} reload={reload} />
           : tab === 'bank' ? <Bank d={d} chat={chat!} reload={reload} />
@@ -242,6 +261,7 @@ export default function App() {
       </Wrap>
       <Transfer chat={chat!} open={xfer} onClose={() => setXfer(false)} reload={reload} />
       <ActionSheet kind={action} chat={chat!} onClose={() => setAction(null)} reload={reload} />
+      <GroupSheet kind={groupKind} chat={chat!} onClose={() => setGroupKind(null)} reload={reload} />
       <BottomNav tab={tab} onTab={setTab} unread={unread} />
     </>
   )

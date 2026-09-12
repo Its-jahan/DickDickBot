@@ -58,6 +58,43 @@ for (const t of TABS) {
 }
 console.log('  all six still render')
 
+console.log('--- the group sheets: open each, and actually act in one ---')
+// These four moved out of the chat and into the app. Each opens a Radix sheet over the
+// home screen and fetches its own payload, which is exactly the shape that broke tab
+// switching - a sheet handed the wrong payload throws during render and takes the tree
+// with it. So: open each, read it, close it.
+await page.click('nav button:has-text("خونه")')
+await page.waitForTimeout(1200)
+
+for (const [label, expect] of [['چالش', 'چالش'], ['اجماع', 'اجماع'], ['فرمان سلطنتی', 'فرمان']]) {
+  await page.click(`button:has-text("${label}")`)
+  await page.waitForTimeout(1400)
+  const body = (await page.innerText('body')).replace(/\s+/g, ' ')
+  if (!body.includes(expect)) throw new Error(`sheet ${label} did not render: ${body.slice(0, 120)}`)
+  console.log(`  ${label.padEnd(14)} ok`)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(600)
+}
+
+// Open a real challenge from the browser and check it comes back in the listing - the
+// round trip is the point, since the listing is what a browser has instead of a button.
+await page.click('button:has-text("چالش")')
+await page.waitForTimeout(1400)
+await page.fill('input[type=number]', '25')
+await page.click('button:has-text("بنداز")')
+await page.waitForTimeout(2000)
+const after = (await page.innerText('body')).replace(/\s+/g, ' ')
+if (!after.includes('منتظر حریف')) throw new Error('challenge did not appear in the list: ' + after.slice(0, 200))
+console.log('  a challenge opened from the browser is listed back')
+await page.keyboard.press('Escape')
+await page.waitForTimeout(600)
+
+// The daily roll is a plain button, not a sheet.
+await page.waitForTimeout(400)
+const home = (await page.innerText('body')).replace(/\s+/g, ' ')
+if (!home.includes('رشد')) throw new Error('no growth button on home: ' + home.slice(0, 200))
+console.log('  the growth button is on the home screen')
+
 console.log('--- page errors:', errors.length ? errors : '(none)')
 await browser.close()
 if (errors.length) process.exit(1)

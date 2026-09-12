@@ -4,17 +4,10 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { fa, num } from '@/lib/format'
 import { TG } from '@/lib/tg'
-import { ArrowLeftRight, Users, LogOut, VenetianMask, Gift } from 'lucide-react'
+import { ArrowLeftRight, Users, LogOut, VenetianMask, Gift, Sprout, Swords,
+         Scale, Crown } from 'lucide-react'
 import type { ActionKind } from '@/screens/Actions'
-import { useToast } from '@/components/Toast'
-
-// Still chat-only, and deliberately: each one's whole point is other people reacting to
-// a message, and half of them need somebody ELSE to tap a button that does not exist in
-// a browser tab.
-const GROUP_ONLY: [string, string][] = [
-  ['d', 'رشد روزانه'], ['c', 'چالش'], ['ejma', 'اجماع'],
-  ['sarghat', 'سرقت از بانک'], ['farman', 'فرمان'],
-]
+import type { GroupKind } from '@/screens/Group'
 
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
@@ -26,14 +19,15 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
   )
 }
 
-export function Home({ d, onPickGroup, onTransfer, onLogout, onAction }: {
+export function Home({ d, onPickGroup, onTransfer, onLogout, onAction, onGroup, onGrow }: {
   d: any
   onPickGroup: () => void
   onTransfer: () => void
   onLogout: () => void
   onAction: (k: ActionKind) => void
+  onGroup: (k: GroupKind) => void
+  onGrow: () => void
 }) {
-  const toast = useToast()
   return (
     <div className="space-y-3">
       <Card>
@@ -94,14 +88,27 @@ export function Home({ d, onPickGroup, onTransfer, onLogout, onAction }: {
       <Card>
         <CardContent className="space-y-3 pt-4">
           <div className="text-xs text-muted-foreground">
-            اینا رو از همین‌جا بزن — ربات نتیجه رو تو گروه اعلام می‌کنه:
+            همه‌چی از همین‌جا — ربات نتیجه رو تو گروه اعلام می‌کنه:
           </div>
+          <Button size="lg" disabled={d.grown_today} onClick={onGrow}>
+            <Sprout className="h-4 w-4" />
+            {d.grown_today ? 'امروز رشد کردی' : 'رشد روزانه'}
+          </Button>
           <div className="grid grid-cols-2 gap-2.5">
             <Button variant="secondary" onClick={() => onAction('steal')}>
               <VenetianMask className="h-4 w-4" /> دزدی
             </Button>
             <Button variant="secondary" onClick={() => onAction('donate')}>
               <Gift className="h-4 w-4" /> اهدای سایز
+            </Button>
+            <Button variant="secondary" onClick={() => onGroup('challenge')}>
+              <Swords className="h-4 w-4" /> چالش
+            </Button>
+            <Button variant="secondary" onClick={() => onGroup('ejma')}>
+              <Scale className="h-4 w-4" /> اجماع
+            </Button>
+            <Button variant="secondary" className="col-span-2" onClick={() => onGroup('decree')}>
+              <Crown className="h-4 w-4" /> فرمان سلطنتی
             </Button>
           </div>
           <div className="flex flex-wrap gap-2 border-t pt-3">
@@ -116,16 +123,6 @@ export function Home({ d, onPickGroup, onTransfer, onLogout, onAction }: {
                 <LogOut className="h-3.5 w-3.5" /> خروج
               </Button>
             )}
-          </div>
-          <div className="text-xs text-muted-foreground">
-            اینا فقط توی گروه کار می‌کنن، چون بقیه باید ببیننشون:
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {GROUP_ONLY.map(([c, l]) => (
-              <button key={c} onClick={() => { if (TG) TG.close(); toast('توی گروه بزن: /' + c) }}>
-                <Badge className="cursor-pointer">/{c} · {l}</Badge>
-              </button>
-            ))}
           </div>
         </CardContent>
       </Card>

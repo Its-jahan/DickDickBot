@@ -1609,44 +1609,71 @@ so it has to stay cheap.
 The leaderboard moved onto the home screen when the bell took the sixth tab; `/api/home`
 already computed the board for the rank, so it costs nothing extra.
 
-### Group actions in the app, and the line between them and the chat
+### Every action is in the app, and the group still sees it
 
-**Theft and donation are in the app**, and the bot announces the outcome in the group.
-The line is not "does it touch other people" — it is **does it need somebody else to
-tap something**:
+**Nothing is Telegram-only.** Growth, theft, donation, challenges, consensus votes and
+the crown's decrees are all reachable from the browser, and each still posts to the group
+exactly as the chat handler would.
 
-- `/dozdi` and `/dd` are one target, one outcome, one announcement. Nobody else has to
-  do anything, so a browser can drive them and `_announce` posts the result to the group.
-- A challenge, an `/ejma`, a heist, a loan offer or a decree all wait on *another
-  player's* button. A browser tab has nobody to show that button to, so they stay in the
-  chat and the home screen links back to them.
+The line this replaced — "does it need somebody else to tap something?" — turned out to
+be the wrong question. The missing piece was never the browser; it was that the group had
+to get the message **and the keyboard**. `_tg_send` takes a `reply_markup` now, so a
+challenge opened in the app arrives in the chat with its accept button and an `/ejma`
+started in the app arrives with its vote buttons. **One book, not one per surface**: a
+challenge opened with `/c` is listed in the app and vice versa, because both write the
+same `open_challenges` row.
 
-**The shared `perform_*` function is the whole design.** `perform_theft` and
-`perform_donation` contain the logic and touch no Telegram object at all; `steal_cmd` and
-`donate` are thin wrappers, and the endpoints call the same functions. Theft's odds — the
-size-gap curve, both players' perks, the armed item, the luck dial, the alarm and the
-lock — would drift within a week if copied, and the drifted copy would rob real players
-by the wrong amount. There is a test asserting neither handler rolls its own dice and
-neither `perform_*` mentions Telegram.
+**The decision never lives in a surface.** Every mechanic is a `bot.perform_*` function
+that touches no Telegram object and returns `(kind, text)`; the chat handler and the HTTP
+endpoint are both thin wrappers over it:
 
-They return `(kind, text)` where kind is REFUSED or RESULT, and that single distinction
-drives everything downstream: a refusal is private noise (`reply_temp` in chat, a plain
-error in the app, **never announced**), a result is the record (permanent in chat,
-announced to the group from the app). There is a test that a refused theft posts nothing.
+| | shared function | chat | app |
+|---|---|---|---|
+| `/d` | `perform_growth` | `dick` | `POST /api/grow` |
+| `/dozdi` | `perform_theft` | `steal_cmd` | `POST /api/steal` |
+| `/dd` | `perform_donation` | `donate` | `POST /api/donate` |
+| `/c` | `perform_challenge_create` / `_accept` | `challenge` / `accept_challenge_callback` | `POST /api/challenge/create` / `/accept` |
+| `/ejma` | `perform_ejma_start` / `_vote` | `consensus_cmd` / `consensus_vote_callback` | `POST /api/ejma/start` / `/vote` |
+| `/farman` | `perform_decree_sign` | `decree_callback` | `POST /api/decree/sign` |
 
-The announcement is dispatched through `_run_bg` like the transfer one, so a dead
-`api.telegram.org` costs the announcement and nothing else — the size has already moved.
-A test makes `_tg_send` throw and asserts the donation still lands and still reports
-success.
+A second copy of the challenge escrow ordering, the theft odds or the consensus threshold
+would be a **money bug, not a style one**. There is a test asserting each `perform_*` is
+Telegram-free, that each handler delegates to it, and that the phrase
+`hand the challenger's stake back` appears exactly once in `bot.py`.
+
+Three things a browser genuinely cannot do, each handled rather than dodged:
+
+- **It has no job queue.** A challenge accepted or a vote opened from the app cannot
+  schedule its own settlement. `recover_stuck_pvp_matches` and `recover_expired_consensus`
+  already knew how to settle anything whose window had closed, so they are now
+  **`run_repeating`** (10s and 60s) as well as startup sweeps — the browser starts what
+  the bot finishes. Both stay idempotent (`claim_pvp_match`, `fail_open_consensus`), so a
+  sweep racing the per-match job cannot double-settle.
+- **It cannot see process memory.** Tonight's decree hand used to be a dict in `bot.py`,
+  which made `/farman` impossible outside Telegram *and* lost the hand on any deploy
+  between the deal and the signature. It is the `pending_decrees` table now —
+  `db.get_pending_decrees` returns the same `(day, codes, king_id)` shape the dict held.
+- **A signed button has no listing.** A challenge's stake and challenger lived only
+  inside the signed `callback_data`, which a browser has no way to enumerate.
+  `open_challenges` is the listing; `claimed_challenges` is still the atomic claim, so the
+  accept race is settled exactly where it always was. `build_challenge_data` takes the
+  row's `nonce` so the button and the row name the same challenge rather than two.
+
+**A refusal is never announced.** `(kind, text)` with kind `REFUSED` is private noise in
+both surfaces; only a result reaches the group. The one extra rule for votes: an ordinary
+vote is not news, so only a **settled** one is announced — otherwise the running tally
+would land in the group once per voter, which is the noise the edit-don't-post rule
+exists to stop.
 
 `/api/players` is the shared target picker, scoped like everything else.
 
-### What is still deliberately not in it
+### What is still chat-only
 
-Challenges, `/ejma`, heists, decrees and the crown's powers are absent by design, not by
-omission — see the line above. Item use follows the same rule: theft items and the golden
-ticket can be armed from the web because they only touch the player's own state, while
-anything needing a target (`DIRECT_ITEMS`) is pushed back to the group.
+`/sarghat` (the heist) — its three stages are driven by `job_queue` timers that edit a
+live message, so it needs its own treatment rather than an endpoint. Item use follows the
+old rule: theft items and the golden ticket can be armed from the web because they only
+touch the player's own state, while anything needing a target (`DIRECT_ITEMS`) is pushed
+back to the group.
 
 `chats.title` is recorded opportunistically in `log_incoming` — every delivered message
 carries the group name and that handler already sees all of them — purely so the group

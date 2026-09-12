@@ -357,6 +357,37 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS star_orders_user_chat_idx '
                   'ON star_orders (user_id, chat_id, created_at DESC)')
 
+        # Tonight's decree hand. This lived in a dict in bot.py, which meant two things:
+        # a deploy between the deal and the signature lost the hand (the pvp_matches
+        # lesson again), and the Mini App - a SEPARATE PROCESS - could not see it at all,
+        # so /farman could never exist outside Telegram.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_decrees (
+                chat_id BIGINT PRIMARY KEY,
+                day TEXT,
+                king_id BIGINT,
+                codes TEXT
+            )
+        """)
+
+        # Open challenges. The stake and challenger used to live only inside a signed
+        # callback_data blob, which is unlistable: a browser has no button to read it
+        # off. The row is the listing; claimed_challenges is still the atomic claim, so
+        # the accept race is settled exactly where it always was.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS open_challenges (
+                nonce TEXT PRIMARY KEY,
+                chat_id BIGINT,
+                challenger_id BIGINT,
+                challenger_name TEXT,
+                bet DOUBLE PRECISION,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                status TEXT DEFAULT 'open'
+            )
+        """)
+        c.execute('CREATE INDEX IF NOT EXISTS open_challenges_chat '
+                  'ON open_challenges (chat_id, status, created_at DESC)')
+
         # One message per group per night, edited in place as each nightly job lands its
         # section, instead of seven separate messages between 00:00 and 00:20.
         # Price history for the market chart. Downsampled on write (see
@@ -1241,8 +1272,8 @@ CHAT_SCOPED_TABLES = (
     'consensus_vote_casts', 'consensus_votes', 'consensus_protection', 'boss_hits',
     'bosses', 'lottery_tickets', 'pvp_match_bets', 'pvp_matches', 'heist_attempts',
     'loans', 'decree_log', 'shop_purchases', 'shop_item_state', 'star_orders',
-    'kingdom', 'economy',
-    'bank_treasury', 'claimed_challenges', 'chat_instances', 'users', 'chats',
+    'kingdom', 'economy', 'bank_treasury', 'claimed_challenges', 'chat_instances',
+    'pending_decrees', 'open_challenges', 'users', 'chats',
 )
 
 # Nothing may be keyed by chat_id and missing from that tuple, or a deleted group leaves
@@ -5512,3 +5543,119 @@ def get_jesters(chat_id):
                   '       CEIL(EXTRACT(EPOCH FROM (jester_until - now()))) '
                   'FROM users WHERE chat_id = %s AND jester_until > now()', ('?', chat_id))
         return c.fetchall()
+
+
+# ---------------------------------------------------------------- decree hand
+
+def set_pending_decrees(chat_id, day, king_id, codes):
+    """Store tonight's dealt hand. One row per group, replaced each night."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO pending_decrees (chat_id, day, king_id, codes) '
+                  'VALUES (%s, %s, %s, %s) ON CONFLICT (chat_id) DO UPDATE SET '
+                  'day = EXCLUDED.day, king_id = EXCLUDED.king_id, codes = EXCLUDED.codes',
+                  (chat_id, day, king_id, ','.join(codes)))
+
+
+def get_pending_decrees(chat_id):
+    """(day, codes, king_id) or None - the same shape the in-memory dict had, so the
+    callers that used to read it did not have to change their unpacking."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT day, codes, king_id FROM pending_decrees WHERE chat_id = %s',
+                  (chat_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        return (row[0], [x for x in (row[1] or '').split(',') if x], row[2])
+
+
+def clear_pending_decrees(chat_id):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM pending_decrees WHERE chat_id = %s', (chat_id,))
+
+
+# ------------------------------------------------------------ open challenges
+
+def create_open_challenge(nonce, chat_id, challenger_id, challenger_name, bet):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO open_challenges '
+                  '(nonce, chat_id, challenger_id, challenger_name, bet) '
+                  'VALUES (%s, %s, %s, %s, %s) ON CONFLICT (nonce) DO NOTHING',
+                  (nonce, chat_id, challenger_id, challenger_name, float(bet)))
+
+
+def list_open_challenges(chat_id, max_age_seconds):
+    """Challenges still waiting for somebody to accept.
+
+    Age-bounded because nothing expires one: a challenge nobody took is abandoned, not
+    refused, and there is no escrow to release (the stake is taken at ACCEPT time, not
+    at creation). So an old row is just clutter and is filtered on read rather than
+    swept by a job.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nonce, challenger_id, challenger_name, bet, "
+                  "       EXTRACT(EPOCH FROM (now() - created_at))::bigint "
+                  "FROM open_challenges "
+                  "WHERE chat_id = %s AND status = 'open' "
+                  "  AND created_at > now() - (%s || ' seconds')::interval "
+                  "ORDER BY created_at DESC",
+                  (chat_id, str(int(max_age_seconds))))
+        return c.fetchall()
+
+
+def get_open_challenge(nonce):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT nonce, chat_id, challenger_id, challenger_name, bet, status '
+                  'FROM open_challenges WHERE nonce = %s', (nonce,))
+        return c.fetchone()
+
+
+def close_open_challenge(nonce, status='accepted'):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('UPDATE open_challenges SET status = %s WHERE nonce = %s',
+                  (status, nonce))
+        return c.rowcount
+
+
+def prune_open_challenges(max_age_seconds):
+    """Housekeeping only - these rows carry no money."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM open_challenges "
+                  "WHERE created_at < now() - (%s || ' seconds')::interval",
+                  (str(int(max_age_seconds)),))
+        return c.rowcount
+
+
+
+def get_open_consensus_list(chat_id, window_seconds):
+    """Live votes in this group, for the app's ejma screen.
+
+    Window-bounded on read rather than swept: a vote whose hour has run out is failed by
+    recover_expired_consensus, but until that sweep fires it must not be offered as
+    something to vote in.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT v.id, v.target_id, v.target_name, v.amount, v.required_votes, "
+            "       v.total_players, "
+            "       EXTRACT(EPOCH FROM (now() - v.created_at))::bigint, "
+            "       COUNT(*) FILTER (WHERE k.choice = 'yes'), "
+            "       COUNT(*) FILTER (WHERE k.choice = 'no') "
+            "FROM consensus_votes v "
+            "LEFT JOIN consensus_vote_casts k ON k.vote_id = v.id "
+            "WHERE v.chat_id = %s AND v.status = 'open' "
+            "  AND v.created_at > now() - make_interval(secs => %s) "
+            "GROUP BY v.id ORDER BY v.created_at DESC",
+            (chat_id, window_seconds))
+        return [{'vote_id': r[0], 'target_id': r[1], 'target': r[2],
+                 'amount': float(r[3] or 0), 'required': r[4], 'players': r[5],
+                 'age': int(r[6] or 0), 'yes': r[7], 'no': r[8]}
+                for r in c.fetchall()]
