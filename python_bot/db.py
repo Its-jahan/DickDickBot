@@ -4693,12 +4693,29 @@ def set_xfer_fee_ratio(ratio):
 
 
 def get_user_groups(user_id, exclude_chat_id=None):
-    """Group chats where this player already has a row. Positive chat_ids are private
-    chats with the bot, not groups, so they are never transfer destinations."""
+    """Group chats this player can actually PLAY IN right now.
+
+    Positive chat_ids are private chats with the bot, not groups, so they are never
+    transfer destinations - and a DEACTIVATED group is excluded for the same reason it
+    is excluded from get_all_chats(): nothing runs there. Offering it in the picker or
+    as a transfer destination would invite a player to move size into a league with no
+    nightly report, no tax, no boss and no decree, where it would simply sit.
+
+    This is also what _scope() in webapp.py checks a client-supplied chat_id against, so
+    the exclusion closes the app for a switched-off group rather than merely hiding it.
+
+    The LEFT JOIN with COALESCE(..., TRUE) matters: a users row can exist for a chat
+    that has no chats row at all, and "unknown" must read as active, not as off.
+
+    Deliberately NOT used by _collect: a debt is still collectable out of a group the
+    owner switched off, because the size in it is still real. That query is its own.
+    """
     with get_connection() as conn:
         c = conn.cursor()
         c.execute('SELECT u.chat_id, COALESCE(u.size,0) FROM users u '
+                  'LEFT JOIN chats c ON c.chat_id = u.chat_id '
                   'WHERE u.user_id = %s AND u.chat_id < 0 '
+                  '  AND COALESCE(c.active, TRUE) '
                   '  AND (%s::bigint IS NULL OR u.chat_id <> %s) '
                   'ORDER BY u.size DESC',
                   (user_id, exclude_chat_id, exclude_chat_id))

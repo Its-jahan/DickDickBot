@@ -1839,6 +1839,29 @@ Four rules hold the state machine together:
 - **`sweep_idle_chats` skips rows with `last_seen_at IS NULL`.** The column was added
   after these groups existed, and reading "never recorded" as "never active" would have
   switched off every live group on the first night it ran.
+- **A deactivated group is not offered as somewhere to play.** `db.get_user_groups`
+  filters on `COALESCE(chats.active, TRUE)`, which covers the app's group picker, the
+  `/enteghal` destination list on both surfaces, **and** `_scope()` — so a switched-off
+  group is closed rather than merely hidden, and cannot be reached by putting its id in a
+  request. The `LEFT JOIN` matters: a `users` row can exist for a chat with no `chats`
+  row at all, and "unknown" must read as active or a real league would vanish.
+
+  Two things deliberately do **not** follow it:
+
+  - **`_collect` keeps its own cross-group query and does not filter on `active`.** A
+    debt is still collectable out of a group the owner switched off, because the size in
+    it is still real — otherwise deactivation would be a debt shelter. There is a test
+    that parks the money in a dead group and asserts the collector reaches it.
+  - **`get_last_chat` is not filtered either**, and that is the subtler one. People can
+    still talk in a switched-off group (no handler gates on `active`), so filtering there
+    would resolve an inline query typed in the dead group to a *different* one — exactly
+    the cross-group leak the inline rules exist to prevent. A player in one live and one
+    dead group must stay ambiguous, and there is a test asserting that.
+
+  Note the asymmetry this leaves: chat commands still work in a deactivated group, only
+  the scheduled jobs and the app stop. Closing the commands too would be a separate
+  decision about what deactivation means, not an oversight in this one.
+
 - **Deactivation is reversible; deletion is not.** `db.delete_chat` erases every table in
   `CHAT_SCOPED_TABLES` in one transaction, and that tuple must name **every** table keyed
   by `chat_id` — a test diffs it against `information_schema` for exactly this reason. A
