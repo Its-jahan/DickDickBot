@@ -96,3 +96,12 @@
 - [انتشار خودکار روی سرور](https://github.com/Its-jahan/DickDickBot/actions/runs/34662471265): با نتیجهٔ `success` تمام شد.
 - نتیجهٔ نهایی: کد استپ ۴ و ۵ روی `main` منتشر شد و هر دو workflow موفق شدند. پرداخت واقعی Telegram همچنان انجام نشده است.
 - این نتیجه در یک کامیت مستنداتی با `[skip ci]` ذخیره می‌شود تا فقط برای ثبت گزارش، انتشار دوبارهٔ سرویس‌ها اجرا نشود.
+
+## پرسش دربارهٔ مقصد Stars — 2026-09-12
+
+- Stars پرداخت‌شده وارد دیتابیس پروژه، خزانهٔ سانتی گروه یا کیف پول داخل بازی نمی‌شوند؛ Telegram آن‌ها را در موجودی Stars خودِ بات نگه می‌دارد.
+- کد ما فقط سفارش داخلی، مبلغ، شناسهٔ charge و تحویل آیتم را در `star_orders` ثبت می‌کند و هیچ مسیر تبدیل Stars به سانت خزانه، انتقال به حساب شخصی یا برداشت خودکار ندارد.
+- موجودی و تراکنش‌های بات از بخش Balance/Monetization حساب بات در Telegram قابل پیگیری است؛ Bot API رسمی هم `getMyStarBalance` و `getStarTransactions` را برای صاحب بات ارائه می‌کند.
+- برای برداشت، Telegram موجودی قابل‌برداشت را پس از دورهٔ انتظار خودش مشخص می‌کند و مسیر برداشت به صفحهٔ Fragment و کیف پول TON می‌رسد؛ این مرحله در کد پروژه خودکار نشده است.
+- برای refund باید از `refundStarPayment` با user id و `telegram_payment_charge_id` استفاده شود؛ فعلاً مسیر پشتیبانی `/paysupport` وجود دارد و refund خودکار/دستور مدیریتی در این مرحله اضافه نشده است.
+- مرجع بررسی: [Telegram Stars](https://core.telegram.org/api/stars)، [Bot API](https://core.telegram.org/bots/api) و [شرایط Stars](https://telegram.org/tos/stars).
