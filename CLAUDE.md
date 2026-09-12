@@ -1635,13 +1635,14 @@ endpoint are both thin wrappers over it:
 | `/c` | `perform_challenge_create` / `_accept` | `challenge` / `accept_challenge_callback` | `POST /api/challenge/create` / `/accept` |
 | `/ejma` | `perform_ejma_start` / `_vote` | `consensus_cmd` / `consensus_vote_callback` | `POST /api/ejma/start` / `/vote` |
 | `/farman` | `perform_decree_sign` | `decree_callback` | `POST /api/decree/sign` |
+| `/sarghat` | `perform_heist_offer` / `settle_heist` | `heist_cmd` / `resolve_heist_attempt` | `POST /api/heist/*` |
 
 A second copy of the challenge escrow ordering, the theft odds or the consensus threshold
 would be a **money bug, not a style one**. There is a test asserting each `perform_*` is
 Telegram-free, that each handler delegates to it, and that the phrase
 `hand the challenger's stake back` appears exactly once in `bot.py`.
 
-Three things a browser genuinely cannot do, each handled rather than dodged:
+Four things a browser genuinely cannot do, each handled rather than dodged:
 
 - **It has no job queue.** A challenge accepted or a vote opened from the app cannot
   schedule its own settlement. `recover_stuck_pvp_matches` and `recover_expired_consensus`
@@ -1653,6 +1654,9 @@ Three things a browser genuinely cannot do, each handled rather than dodged:
   which made `/farman` impossible outside Telegram *and* lost the hand on any deploy
   between the deal and the signature. It is the `pending_decrees` table now —
   `db.get_pending_decrees` returns the same `(day, codes, king_id)` shape the dict held.
+- **It has no clock of its own that anyone else can trust.** See the heist below: the
+  run's timing moved out of the job queue and into two stored timestamps, and
+  `db.heist_tick` advances it on read.
 - **A signed button has no listing.** A challenge's stake and challenger lived only
   inside the signed `callback_data`, which a browser has no way to enumerate.
   `open_challenges` is the listing; `claimed_challenges` is still the atomic claim, so the
@@ -1667,13 +1671,62 @@ exists to stop.
 
 `/api/players` is the shared target picker, scoped like everything else.
 
+### The heist was the hard one, and the fix was to stop storing time in the job queue
+
+`/sarghat` is three timed stages driven by scheduled edits to one live message, and a
+browser has no scheduler at all. The answer was **not** to reimplement the clock in
+JavaScript — two copies of a countdown drift, and the drifted one would show a player a
+cue that had already passed. Instead the run's timing became **two stored timestamps**:
+
+- `heist_attempts.alarm_at` — fixed once, when the accomplice accepts, so the cue's
+  moment is a fact every process agrees on and a restart cannot re-roll it. It used to
+  exist only as the delay on a scheduled job, which meant it was known to one process.
+- `heist_attempts.vault_at` — stamped when stage 2 opens, giving the reveal a fixed
+  `t=0` so every viewer sees the same frame at the same instant.
+
+`db.heist_tick(attempt_id, ...)` then advances the run **on read** — the same lazy
+evaluation perks already use for expiry. Nothing depends on a job having fired, so the
+app plays the identical run by polling, and a deploy mid-heist loses nothing.
+
+**One subtlety that was a real bug first.** `heist_alarm_arm_job` arms *directly*, not
+through `heist_tick`: the job IS the cue's moment, and it can fire a millisecond early
+against the database clock. A tick that then refused to arm would leave a chat player
+waiting for a cue that never lands, because nothing else re-fires for them. The two are
+idempotent against each other — whichever arms first, the other sees `alarm_armed` and
+does nothing. The tick is the catch-up for surfaces with no scheduler, never the
+authority at the moment itself.
+
+**The anti-cheat survives the port, and that is the property to protect.** `/api/heist`
+never sends the sequence. During the reveal the server computes the **one** symbol on
+screen right now from `vault_at`, so no response, screenshot or devtools frame ever
+contains two symbols of the answer — the browser equivalent of the chat's one-frame-per-
+edit rule. The nine-symbol *keypad alphabet* is in the payload and is not a leak: it is
+public, fixed, and identical for everyone, exactly like the nine buttons in the chat.
+The regression test measures the sequence with the alphabets stripped, for that reason.
+
+**`settle_heist` is the split that made it possible.** It holds every decision and every
+centimetre — the payouts, the prison sentences, both conspirators' bail — and touches no
+Telegram object; `resolve_heist_attempt` is now the thin wrapper that delivers its text
+into the chat. A heist blown in a browser therefore serves exactly the sentence a heist
+blown in the chat does, because there is still only one place that hands one down. There
+is a test asserting `db.send_to_heist_prison` is called from exactly one place in
+`bot.py`.
+
+`recover_stuck_heist_attempts` repeats like the other two sweeps, and
+`get_expired_heist_attempts` now returns a blown **stage** deadline as well as a blown
+whole-run one — otherwise an app-played run whose vault clock ran out would sit there
+until the whole-run backstop fired.
+
+The offer is the one announcement sent **synchronously** rather than through `_run_bg`:
+the message id is part of the record (the bot's stage jobs edit that message), not a
+courtesy. If the send fails the group's cooldown slot is handed straight back, so a dead
+`api.telegram.org` costs nobody five days.
+
 ### What is still chat-only
 
-`/sarghat` (the heist) — its three stages are driven by `job_queue` timers that edit a
-live message, so it needs its own treatment rather than an endpoint. Item use follows the
-old rule: theft items and the golden ticket can be armed from the web because they only
-touch the player's own state, while anything needing a target (`DIRECT_ITEMS`) is pushed
-back to the group.
+Item use, and only partly: theft items and the golden ticket can be armed from the web
+because they only touch the player's own state, while anything needing a target
+(`DIRECT_ITEMS`) is pushed back to the group.
 
 `chats.title` is recorded opportunistically in `log_incoming` — every delivered message
 carries the group name and that handler already sees all of them — purely so the group

@@ -23,11 +23,10 @@ never from the request body, which is client-supplied.
 
 EVERY ACTION LIVES HERE, AND THE GROUP STILL SEES IT
 ---------------------------------------------------
-Nothing is Telegram-only except the heist. Growth, theft, donations, challenges,
-consensus votes and the crown's decrees are all reachable from the browser, and each one
+Nothing is Telegram-only. Growth, theft, donations, challenges, consensus votes, the
+heist and the crown's decrees are all reachable from the browser, and each one
 still posts to the group exactly as the chat handler would have - a player using the app
-is invisible to nobody. (/sarghat is the exception because its three stages are
-job_queue timers editing a live message, not a request/response.)
+is invisible to nobody.
 
 The rule that makes that safe is that the DECISION never lives in a surface. Every one
 of them goes through a `bot.perform_*` function that touches no Telegram object and
@@ -35,17 +34,23 @@ returns (kind, text); the chat handler and the endpoint here are both thin wrapp
 it. A second copy of the theft odds, the challenge escrow ordering or the consensus
 threshold would be a money bug, not a style one.
 
-Two things a browser genuinely cannot do, and how they are handled rather than dodged:
+Three things a browser genuinely cannot do, and how they are handled rather than dodged:
 
 - **It has no job queue.** A challenge accepted or a vote opened here cannot schedule
-  its own settlement. The bot sweeps for both (recover_stuck_pvp_matches and
-  recover_expired_consensus now repeat), so the browser starts what the bot finishes.
+  its own settlement. The bot sweeps for all of it (recover_stuck_pvp_matches,
+  recover_expired_consensus and recover_stuck_heist_attempts now repeat), so the browser
+  starts what the bot finishes.
+- **It has no clock anyone else can trust.** The heist's three stages were timed by
+  scheduled jobs; the timing is now two stored timestamps (alarm_at, vault_at) and
+  db.heist_tick advances the run ON READ, so both surfaces compute the same run instead
+  of keeping two countdowns that drift.
 - **It has nobody to show a button to.** Anything that needs another player's tap is
   announced into the group carrying that keyboard, so a challenge opened in the app is
   accepted from the chat and vice versa - one book, not one per surface.
 """
 import asyncio
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -1295,6 +1300,249 @@ def api_decree_sign():
     # Already HTML from perform_decree_sign - do not escape it again.
     _announce(chat_id, text)
     return jsonify({'ok': True, 'message': text})
+
+
+def _heist_view(row, uid):
+    """What this player may see of a live heist, and nothing more.
+
+    The sequence is the answer, so it is never sent whole. During the reveal the server
+    works out which single symbol is on screen right now from vault_at - the same
+    anti-cheat the chat gets from editing one message per frame, except here the client
+    could otherwise just read the payload. At no instant does a response carry two
+    symbols of the answer.
+    """
+    now = time.time()
+    stage = row['stage']
+    is_thief = uid == row['thief_id']
+    view = {
+        'attempt_id': row['id'], 'status': row['status'], 'stage': stage,
+        'thief': row['thief_name'], 'partner': row['partner_name'],
+        'is_thief': is_thief, 'is_partner': uid == row['partner_id'],
+        'would_be': float(row['would_be'] or 0),
+        'symbols': bot.HEIST_SYMBOLS, 'wires': bot.HEIST_WIRES,
+        'length': bot.HEIST_SEQUENCE_LENGTH,
+        'progress': row['progress'] or 0,
+        'escape_thief': bool(row['escape_thief']),
+        'escape_partner': bool(row['escape_partner']),
+    }
+    deadline = row.get('stage_deadline')
+    view['seconds_left'] = max(0.0, deadline.timestamp() - now) if deadline else None
+
+    if row['status'] == 'offered':
+        # The wire is named exactly once, when the accomplice accepts - never here.
+        return view
+
+    if stage == 1:
+        view['armed'] = bool(row['alarm_armed'])
+        # The colour is shown once at accept and never again; by the time the buttons
+        # are up it has to be in the accomplice's head.
+        view['wire_hint'] = None
+    elif stage == 2 and is_thief:
+        vault_at = row.get('vault_at')
+        if vault_at:
+            elapsed = now - vault_at.timestamp()
+            step = int(elapsed // bot.HEIST_REVEAL_STEP_SECONDS)
+            reveal_end = bot.HEIST_SEQUENCE_LENGTH * bot.HEIST_REVEAL_STEP_SECONDS
+            seq = [int(x) for x in (row['sequence'] or '').split(',') if x != '']
+            if elapsed < reveal_end and 0 <= step < len(seq):
+                view['phase'] = 'reveal'
+                view['show'] = seq[step]          # exactly ONE symbol, ever
+                view['step'] = step
+            elif elapsed < reveal_end + bot.HEIST_BLANK_SECONDS:
+                view['phase'] = 'blank'           # the deliberate wipe frame
+            else:
+                view['phase'] = 'recall'
+    return view
+
+
+def _heist_bust(attempt_id, reason, message):
+    """A losing tap from the app. settle_heist is the SAME function the chat's losing
+    tap calls, so the sentence is identical whichever surface blew it - and the group is
+    told, because a bust is the record."""
+    settled, text = bot.settle_heist(attempt_id, outcome='lost', reason=reason)
+    if settled:
+        row = db.get_heist_attempt(attempt_id)
+        if row:
+            _announce(row['chat_id'], _esc_plain(text))
+    return jsonify({'ok': True, 'result': 'lost', 'message': message})
+
+
+@app.get('/api/heist')
+def api_heist():
+    """The player's live run, if any, plus whether they could start one."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    attempt_id = db.get_live_heist(chat_id, uid)
+    row = None
+    if attempt_id:
+        row = db.heist_tick(attempt_id, bot.HEIST_CUT_SECONDS, bot.HEIST_VAULT_SECONDS)
+    prison_until, labor_until, bail = db.get_heist_status(uid, chat_id)
+    now = time.time()
+    return jsonify({
+        'ok': True,
+        'run': _heist_view(row, uid) if row and row['status'] in ('offered', 'pending') else None,
+        'jailed': bool(prison_until and prison_until.timestamp() > now),
+        'bail': float(bail or 0),
+        'min_vault': bot.HEIST_MIN_VAULT,
+        'vault': float(db.group_reserve_claim(chat_id)),
+    })
+
+
+@app.post('/api/heist/start')
+def api_heist_start():
+    """Open a bank job from the app.
+
+    The invitation is sent SYNCHRONOUSLY, unlike every other announcement here, because
+    the message id is part of the record rather than a courtesy: the bot's stage jobs
+    edit that message, and a row pointing at no message would leave the chat side of the
+    run blind. If the send fails the slot is handed straight back, so a dead
+    api.telegram.org costs nobody the group's cooldown.
+    """
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    try:
+        partner_id = int(body.get('partner'))
+    except (TypeError, ValueError):
+        return _fail('شریکت کیه؟')
+    partner = db.get_user_info(partner_id, chat_id)
+    if not partner:
+        return _fail('این بازیکن تو این گروه نیست')
+
+    kind, text, info = bot.perform_heist_offer(uid, name, username, chat_id,
+                                               partner_id, partner[0] or '؟')
+    if kind == bot.HEIST_REFUSED:
+        return _fail(text)
+
+    sent = _tg_api('sendMessage', {
+        'chat_id': chat_id, 'text': bot.tone_text(chat_id, text), 'parse_mode': 'HTML',
+        'reply_markup': {'inline_keyboard': [[
+            {'text': '🤝 هستم', 'callback_data': f"heistjoin_{info['attempt_id']}_y"},
+            {'text': '🙅 نه بابا', 'callback_data': f"heistjoin_{info['attempt_id']}_n"},
+        ]]},
+    })
+    if not sent:
+        db.release_heist_slot(chat_id)
+        return _fail('نشد پیام رو تو گروه بفرستم — دوباره امتحان کن')
+    bot.store_heist_offer(info, chat_id, sent.get('message_id'))
+    return jsonify({'ok': True, 'message': 'پیشنهاد رفت تو گروه 🥷',
+                    'attempt_id': info['attempt_id']})
+
+
+@app.post('/api/heist/accept')
+def api_heist_accept():
+    """The accomplice signs up. This is where the wire colour is named, once."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _n, _u, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    attempt_id = str(body.get('attempt_id') or '')
+    row = db.get_heist_attempt(attempt_id)
+    if not row or row['chat_id'] != chat_id or row['status'] != 'offered':
+        return _fail('این پیشنهاد دیگه معتبر نیست')
+    if uid != row['partner_id']:
+        return _fail('این پیشنهاد مال تو نیست')
+
+    import random as _r
+    wait = _r.uniform(bot.HEIST_ALARM_MIN_SECONDS, bot.HEIST_ALARM_MAX_SECONDS)
+    deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        seconds=wait + bot.HEIST_CUT_SECONDS + 5)
+    if not db.accept_heist_offer(attempt_id, uid, deadline, wait):
+        return _fail('این پیشنهاد قبلاً تموم شده')
+    return jsonify({'ok': True, 'wire': row['wire'],
+                    'message': f"سیم {bot.HEIST_WIRES[row['wire']]} — خوب نگاش کن!"})
+
+
+@app.post('/api/heist/cut')
+def api_heist_cut():
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _n, _u, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    attempt_id = str(body.get('attempt_id') or '')
+    row = db.get_heist_attempt(attempt_id)
+    if not row or row['chat_id'] != chat_id:
+        return _fail('این بازی مال این گروه نیست')
+    try:
+        wire = int(body.get('wire'))
+    except (TypeError, ValueError):
+        return _fail('کدوم سیم؟')
+
+    db.heist_tick(attempt_id, bot.HEIST_CUT_SECONDS, bot.HEIST_VAULT_SECONDS)
+    result = db.cut_heist_wire(attempt_id, uid, wire)
+    if result is None:
+        return _fail('این بازی مال تو نیست یا دیگه معتبر نیست')
+    if result == 'early':
+        return _fail('هنوز علامت ندادم!')
+    if result in ('late', 'wrong'):
+        return _heist_bust(attempt_id, 'alarm',
+                           '⏰ دیر شد!' if result == 'late' else '💥 سیم اشتباهی!')
+    db.heist_tick(attempt_id, bot.HEIST_CUT_SECONDS, bot.HEIST_VAULT_SECONDS)
+    return jsonify({'ok': True, 'result': 'done', 'message': '🔌 دزدگیر خوابید!'})
+
+
+@app.post('/api/heist/tap')
+def api_heist_tap():
+    """One symbol at stage 2. advance_heist_attempt is the same call the chat makes."""
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _n, _u, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    attempt_id = str(body.get('attempt_id') or '')
+    row = db.get_heist_attempt(attempt_id)
+    if not row or row['chat_id'] != chat_id:
+        return _fail('این بازی مال این گروه نیست')
+    if uid != row['thief_id']:
+        return _fail('گاوصندوق کار خود دزده!')
+    try:
+        idx = int(body.get('symbol'))
+    except (TypeError, ValueError):
+        return _fail('کدوم نماد؟')
+
+    result = db.advance_heist_attempt(attempt_id, idx)
+    if result is None:
+        return _fail('این بازی دیگه معتبر نیست')
+    if result == 'wrong':
+        return _heist_bust(attempt_id, 'vault', '💥 نماد اشتباه!')
+    if result == 'done':
+        # The vault is open, but the job is not over: the getaway is a real stage and a
+        # pair who cracked the safe and then failed to run still go to prison.
+        deadline = (datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(seconds=bot.HEIST_ESCAPE_SECONDS))
+        db.start_heist_escape(attempt_id, deadline)
+        return jsonify({'ok': True, 'result': 'done', 'message': '🔓 بازه! حالا فرار کنید!'})
+    return jsonify({'ok': True, 'result': 'correct'})
+
+
+@app.post('/api/heist/escape')
+def api_heist_escape():
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _n, _u, chat_id = sc
+    body = request.get_json(silent=True) or {}
+    attempt_id = str(body.get('attempt_id') or '')
+    row = db.get_heist_attempt(attempt_id)
+    if not row or row['chat_id'] != chat_id:
+        return _fail('این بازی مال این گروه نیست')
+    result = db.tap_heist_escape(attempt_id, uid)
+    if result is None:
+        return _fail('این سرقت مال تو نیست یا دیگه معتبر نیست')
+    if result == 'again':
+        return jsonify({'ok': True, 'result': 'again', 'message': 'تو که زدی بیرون! منتظر شریکت بمون.'})
+    if result == 'done':
+        settled, text = bot.settle_heist(attempt_id, outcome='won')
+        if settled:
+            _announce(chat_id, _esc_plain(text))
+        return jsonify({'ok': True, 'result': 'done', 'message': '🏃 در رفتین!'})
+    return jsonify({'ok': True, 'result': 'waiting', 'message': '🏃 تو در رفتی — منتظر شریکت!'})
 
 
 @app.get('/api/feed')

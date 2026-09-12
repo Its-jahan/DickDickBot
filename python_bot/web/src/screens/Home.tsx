@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { fa, num } from '@/lib/format'
 import { TG } from '@/lib/tg'
 import { ArrowLeftRight, Users, LogOut, VenetianMask, Gift, Sprout, Swords,
-         Scale, Crown } from 'lucide-react'
+         Scale, Crown, Banknote } from 'lucide-react'
 import type { ActionKind } from '@/screens/Actions'
 import type { GroupKind } from '@/screens/Group'
 
@@ -19,7 +19,7 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
   )
 }
 
-export function Home({ d, onPickGroup, onTransfer, onLogout, onAction, onGroup, onGrow }: {
+export function Home({ d, onPickGroup, onTransfer, onLogout, onAction, onGroup, onGrow, onHeist }: {
   d: any
   onPickGroup: () => void
   onTransfer: () => void
@@ -27,6 +27,7 @@ export function Home({ d, onPickGroup, onTransfer, onLogout, onAction, onGroup, 
   onAction: (k: ActionKind) => void
   onGroup: (k: GroupKind) => void
   onGrow: () => void
+  onHeist: () => void
 }) {
   return (
     <div className="space-y-3">
@@ -107,8 +108,11 @@ export function Home({ d, onPickGroup, onTransfer, onLogout, onAction, onGroup, 
             <Button variant="secondary" onClick={() => onGroup('ejma')}>
               <Scale className="h-4 w-4" /> اجماع
             </Button>
-            <Button variant="secondary" className="col-span-2" onClick={() => onGroup('decree')}>
-              <Crown className="h-4 w-4" /> فرمان سلطنتی
+            <Button variant="secondary" onClick={() => onGroup('decree')}>
+              <Crown className="h-4 w-4" /> فرمان
+            </Button>
+            <Button variant="secondary" onClick={onHeist}>
+              <Banknote className="h-4 w-4" /> سرقت از بانک
             </Button>
           </div>
           <div className="flex flex-wrap gap-2 border-t pt-3">

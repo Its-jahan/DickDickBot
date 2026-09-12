@@ -842,6 +842,13 @@ def init_db():
         c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS alarm_armed BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS escape_thief BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS escape_partner BOOLEAN DEFAULT FALSE")
+        # The two moments the run's timing hangs off, stored rather than left implicit
+        # in a scheduled job. The bot still schedules its edits off them, but the Mini
+        # App - which has no scheduler at all - can derive the whole run from these two
+        # timestamps, so a heist is playable from either surface without a second copy
+        # of the clock. See heist_tick().
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS alarm_at TIMESTAMPTZ")
+        c.execute("ALTER TABLE heist_attempts ADD COLUMN IF NOT EXISTS vault_at TIMESTAMPTZ")
 
         # One-time: charge the deposit fee on money that was banked before the fee
         # existed. Everyone who deposited in that window got in free, which is both
@@ -3738,10 +3745,13 @@ def heist_take(chat_id, thief_id, partner_id, treasury_ratio, deposit_ratio,
 # never both open a heist, and released again if the offer is declined or expires. A
 # refused invitation must not silently burn the group's three days.
 
-HEIST_FIELDS = ('chat_id', 'thief_id', 'thief_name', 'partner_id', 'partner_name',
+HEIST_FIELDS = ('id', 'chat_id', 'thief_id', 'thief_name', 'partner_id', 'partner_name',
                 'sequence', 'progress', 'would_be', 'message_chat_id', 'message_id',
                 'status', 'stage', 'stage_deadline', 'wire', 'alarm_armed',
-                'escape_thief', 'escape_partner', 'expires_at')
+                'escape_thief', 'escape_partner', 'expires_at',
+                # The two stored moments the run's timing hangs off. A surface with no
+                # scheduler derives the whole run from these, so they have to be read.
+                'alarm_at', 'vault_at')
 
 
 def create_heist_offer(attempt_id, chat_id, thief_id, thief_name, partner_id,
@@ -3774,15 +3784,25 @@ def get_heist_attempt(attempt_id):
         return dict(zip(HEIST_FIELDS, row)) if row else None
 
 
-def accept_heist_offer(attempt_id, partner_id, stage_deadline):
+def accept_heist_offer(attempt_id, partner_id, stage_deadline, alarm_seconds=None):
     """The accomplice signs up: 'offered' -> 'pending' at stage 1, atomically, so a
-    double-tap or two clients racing can only ever start the job once."""
+    double-tap or two clients racing can only ever start the job once.
+
+    `alarm_seconds` fixes WHEN the cue lands, here, once. It used to exist only as the
+    delay on a scheduled job, which meant the cue was a fact known to one process; a
+    browser had no way to learn it and a restart re-rolled it. Storing it makes the
+    moment the same for everybody and survives a deploy, exactly like the wire and the
+    sequence being rolled once at create_heist_offer.
+    """
     with get_connection() as conn:
         c = conn.cursor()
         c.execute("UPDATE heist_attempts SET status = 'pending', stage = 1, "
-                  'stage_deadline = %s '
+                  'stage_deadline = %s, '
+                  "alarm_at = CASE WHEN %s::float8 IS NULL THEN NULL "
+                  "                ELSE now() + make_interval(secs => %s) END "
                   "WHERE id = %s AND status = 'offered' AND partner_id = %s "
-                  'RETURNING id', (stage_deadline, attempt_id, partner_id))
+                  'RETURNING id',
+                  (stage_deadline, alarm_seconds, alarm_seconds, attempt_id, partner_id))
         return c.fetchone() is not None
 
 
@@ -3947,7 +3967,14 @@ def get_expired_heist_attempts():
     with get_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT id, status, chat_id FROM heist_attempts "
-                  "WHERE status IN ('pending', 'offered') AND expires_at <= now()")
+                  "WHERE status IN ('pending', 'offered') "
+                  "  AND (expires_at <= now() "
+                  # A blown STAGE deadline counts too. The chat schedules a job per
+                  # stage, but a heist played from the app has no scheduler behind it,
+                  # so without this its stages would only ever be settled by the
+                  # whole-run backstop - a player who let the vault clock run out would
+                  # sit there for the rest of the run before being told they lost.
+                  "       OR (status = 'pending' AND stage_deadline <= now()))")
         return c.fetchall()
 
 
@@ -5659,3 +5686,47 @@ def get_open_consensus_list(chat_id, window_seconds):
                  'amount': float(r[3] or 0), 'required': r[4], 'players': r[5],
                  'age': int(r[6] or 0), 'yes': r[7], 'no': r[8]}
                 for r in c.fetchall()]
+
+
+def heist_tick(attempt_id, cut_seconds, vault_seconds):
+    """Advance a heist's clock from the stored timestamps, then return the row.
+
+    This is the lazy-evaluation pattern perks already use: rather than a scheduled job
+    being the only thing that can move the state, the state moves when it is READ. The
+    bot still schedules its message edits - a chat player must see the cue land without
+    polling - but nothing depends on those jobs having run, so the Mini App (which has
+    no scheduler) plays exactly the same run, and a deploy mid-heist loses nothing.
+
+    Two transitions happen here, both idempotent and both gated on the stage in the same
+    statement that writes, for the same reason claim_heist_stage_timeout is:
+
+      stage 1: once alarm_at has passed, the cue is live and the short cut window opens
+      stage 2: vault_at is stamped so the reveal has a fixed t=0 for every viewer
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE heist_attempts SET alarm_armed = TRUE, "
+                  "    stage_deadline = alarm_at + make_interval(secs => %s) "
+                  "WHERE id = %s AND status = 'pending' AND stage = 1 "
+                  "  AND NOT COALESCE(alarm_armed, FALSE) "
+                  "  AND alarm_at IS NOT NULL AND now() >= alarm_at",
+                  (cut_seconds, attempt_id))
+        c.execute("UPDATE heist_attempts SET vault_at = now(), "
+                  "    stage_deadline = now() + make_interval(secs => %s) "
+                  "WHERE id = %s AND status = 'pending' AND stage = 2 "
+                  "  AND vault_at IS NULL", (vault_seconds, attempt_id))
+    return get_heist_attempt(attempt_id)
+
+
+def get_live_heist(chat_id, user_id):
+    """The run this player is currently in, if any - the app has no message to come
+    back to, so it asks. Offers count: an invitation nobody has answered is exactly the
+    thing the accomplice needs to be shown."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM heist_attempts "
+                  "WHERE chat_id = %s AND status IN ('offered', 'pending') "
+                  "  AND (thief_id = %s OR partner_id = %s) "
+                  "ORDER BY created_at DESC LIMIT 1", (chat_id, user_id, user_id))
+        row = c.fetchone()
+        return row[0] if row else None

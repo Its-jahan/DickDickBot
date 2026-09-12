@@ -66,7 +66,7 @@ console.log('--- the group sheets: open each, and actually act in one ---')
 await page.click('nav button:has-text("خونه")')
 await page.waitForTimeout(1200)
 
-for (const [label, expect] of [['چالش', 'چالش'], ['اجماع', 'اجماع'], ['فرمان سلطنتی', 'فرمان']]) {
+for (const [label, expect] of [['چالش', 'چالش'], ['اجماع', 'اجماع'], ['فرمان', 'فرمان']]) {
   await page.click(`button:has-text("${label}")`)
   await page.waitForTimeout(1400)
   const body = (await page.innerText('body')).replace(/\s+/g, ' ')
@@ -86,6 +86,16 @@ await page.waitForTimeout(2000)
 const after = (await page.innerText('body')).replace(/\s+/g, ' ')
 if (!after.includes('منتظر حریف')) throw new Error('challenge did not appear in the list: ' + after.slice(0, 200))
 console.log('  a challenge opened from the browser is listed back')
+await page.keyboard.press('Escape')
+await page.waitForTimeout(600)
+
+// The heist POLLS on a timer, so its failure mode is a render loop rather than one bad
+// frame - it has to be left running for a few seconds, not just opened and closed.
+await page.click('button:has-text("سرقت از بانک")')
+await page.waitForTimeout(3000)
+const heist = (await page.innerText('body')).replace(/\s+/g, ' ')
+if (!heist.includes('سرقت از بانک')) throw new Error('heist sheet did not render: ' + heist.slice(0, 150))
+console.log('  سرقت از بانک   ok (polled 3s)')
 await page.keyboard.press('Escape')
 await page.waitForTimeout(600)
 

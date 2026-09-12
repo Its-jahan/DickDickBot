@@ -16,6 +16,7 @@ import { Bag } from '@/screens/Bag'
 import { Transfer } from '@/screens/Transfer'
 import { ActionSheet, type ActionKind } from '@/screens/Actions'
 import { GroupSheet, type GroupKind } from '@/screens/Group'
+import { HeistSheet } from '@/screens/Heist'
 import { Login } from '@/screens/Login'
 import { ToneSettings } from '@/components/ToneSettings'
 import { politeText, tonePayload, type ToneMode } from '@/lib/tone'
@@ -43,6 +44,7 @@ export default function App() {
   const [xfer, setXfer] = useState(false)
   const [action, setAction] = useState<ActionKind | null>(null)
   const [groupKind, setGroupKind] = useState<GroupKind | null>(null)
+  const [heist, setHeist] = useState(false)
   const [growing, setGrowing] = useState(false)
   // The bell's badge. `seen` is the newest id the player has actually looked at, so the
   // count survives switching tabs and does not reset just because the app re-rendered.
@@ -252,7 +254,8 @@ export default function App() {
           )
         ) : tab === 'home' ? (
           <Home d={d} onPickGroup={() => setPhase('groups')} onTransfer={() => setXfer(true)}
-                onLogout={logout} onAction={setAction} onGroup={setGroupKind} onGrow={grow} />
+                onLogout={logout} onAction={setAction} onGroup={setGroupKind} onGrow={grow}
+                onHeist={() => setHeist(true)} />
         ) : tab === 'feed' ? <Feed d={d} />
           : tab === 'crypto' ? <Crypto d={d} chat={chat!} reload={reload} />
           : tab === 'bank' ? <Bank d={d} chat={chat!} reload={reload} />
@@ -262,6 +265,7 @@ export default function App() {
       <Transfer chat={chat!} open={xfer} onClose={() => setXfer(false)} reload={reload} />
       <ActionSheet kind={action} chat={chat!} onClose={() => setAction(null)} reload={reload} />
       <GroupSheet kind={groupKind} chat={chat!} onClose={() => setGroupKind(null)} reload={reload} />
+      <HeistSheet chat={chat!} open={heist} onClose={() => setHeist(false)} reload={reload} />
       <BottomNav tab={tab} onTab={setTab} unread={unread} />
     </>
   )

@@ -3111,6 +3111,11 @@ HEIST_ESCAPE_SECONDS = 10
 # The whole-run deadline the recovery sweep reads. Generous on purpose: every stage
 # already has its own tight clock, and this one only exists so a process that died
 # mid-job can't leave a row pending forever.
+# The whole stage-2 window: every symbol shown, the deliberate blank frame, then the
+# recall. Named once because both the scheduled job and db.heist_tick need it.
+HEIST_VAULT_SECONDS = (HEIST_SEQUENCE_LENGTH * HEIST_REVEAL_STEP_SECONDS
+                       + HEIST_BLANK_SECONDS + HEIST_RECALL_SECONDS)
+
 HEIST_TOTAL_SECONDS = (HEIST_ALARM_MAX_SECONDS + HEIST_CUT_SECONDS
                        + HEIST_SEQUENCE_LENGTH * HEIST_REVEAL_STEP_SECONDS
                        + HEIST_BLANK_SECONDS + HEIST_RECALL_SECONDS
@@ -4062,6 +4067,130 @@ def _heist_prison_reply(prison_until, labor_until, bail_amount, now):
     return "\n".join(lines)
 
 
+HEIST_REFUSED, HEIST_OK = 'refused', 'ok'
+
+
+def perform_heist_offer(user_id, user_name, user_username, chat_id, partner_id, partner_name):
+    """Every gate on opening a bank job, then the offer row. Returns (kind, text, info).
+
+    No Telegram object is touched, so the chat command and the app endpoint run exactly
+    the same checks in exactly the same order. `info` carries the attempt_id and the
+    numbers the caller needs to render the invitation - the caller supplies the message
+    id afterwards, because only it knows how the invitation was delivered.
+
+    The group's cooldown slot is claimed here, at the END, right before the row is
+    written: claiming earlier would burn the group's days on a refusal.
+    """
+    if chat_id >= 0:
+        return HEIST_REFUSED, "سرقت از بانک فقط داخل گروه‌ها کار می‌کند!", None
+    _sz, thief_last_grown, _pk = db.get_user(user_id, chat_id, user_username, user_name)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    prison_until, labor_until, bail_amount = db.get_heist_status(user_id, chat_id)
+    if prison_until and prison_until > now:
+        return HEIST_REFUSED, _heist_prison_reply(prison_until, labor_until, bail_amount, now), None
+    if labor_until and labor_until > now:
+        return HEIST_REFUSED, (f"🔨 هنوز داری بدهیت به پادشاه رو کار می‌کنی "
+                               f"(تا {_fmt_days_hours(labor_until - now)} دیگه) "
+                               f"— تا اون‌موقع نمی‌تونی دوباره سرقت کنی."), None
+
+    # The king cannot rob his own kingdom's bank.
+    kingdom, _ = refresh_king(chat_id)
+    if kingdom and kingdom[0] == user_id:
+        return HEIST_REFUSED, "👑 پادشاه که خودش صاحب کل مملکته، نمی‌تونه از بانک خودش بدزده!", None
+
+    # Same gate as /dozdi: you have to actually be playing today to move other people's size.
+    if thief_last_grown != tehran_today_str():
+        return HEIST_REFUSED, "اول امروز /d بزن بعد برو سراغ بانک! 🥷", None
+
+    if not partner_id:
+        return HEIST_REFUSED, ("🥷 سرقت از بانک تک‌نفره نیست!\n\n"
+                               "یکی رو به‌عنوان شریک انتخاب کن.\n\n"
+                               "شریکت دزدگیر رو قطع می‌کنه و تو گاوصندوق رو باز می‌کنی — و آخرش "
+                               "هر دو باید با هم فرار کنید. اگه بگیرنتون، هر دو می‌رید زندان."), None
+    if partner_id == user_id:
+        return HEIST_REFUSED, "با خودت که نمی‌تونی شریک بشی! 🙄", None
+    if kingdom and kingdom[0] == partner_id:
+        return HEIST_REFUSED, "👑 پادشاه شریک دزدی از خزانهٔ خودش نمی‌شه!", None
+
+    _psize, partner_last_grown, _pperk = db.get_user(partner_id, chat_id, None, partner_name)
+    if db.is_in_heist_prison(partner_id, chat_id):
+        return HEIST_REFUSED, f"{partner_name} الان تو زندان بانکه — شریک دیگه‌ای پیدا کن.", None
+    if partner_last_grown != tehran_today_str():
+        return HEIST_REFUSED, (f"{partner_name} امروز هنوز /d نزده — یه شریک که تو بازی نیست "
+                               f"به چه دردت می‌خوره؟"), None
+
+    # What's actually stealable. The treasury is one pot shared with every other group,
+    # so a heist reaches this group's CLAIM on it (bounded by the group's weight in the
+    # bot - see db._group_weight), never the whole thing.
+    treasury = db.group_reserve_claim(chat_id)
+    total_dep, _holders = db.get_bank_totals(chat_id)
+    mine = db.get_bank(user_id, chat_id)[0] + db.get_bank(partner_id, chat_id)[0]
+    others = max(0.0, total_dep - mine)
+    vault = treasury + others
+    if vault < HEIST_MIN_VAULT:
+        # Say WHY, with the real numbers. "The vault is empty" while the shared treasury
+        # holds tens of thousands is simply false from the player's side.
+        total_reserve = db.get_central_bank()['reserve']
+        return HEIST_REFUSED, (
+            f"🏦 اینجا چیزی برای بردن نیست ({int(vault)} سانت).\n\n"
+            f"خزانه یکیه و کل بات <b>{int(total_reserve)}</b> سانت توشه — ولی سرقت فقط به "
+            f"<b>سهم این گروه</b> می‌رسه، نه به کل خزانه:\n"
+            f"   🏛 سهم این گروه: {int(treasury)} سانت\n"
+            f"   🧾 سپردهٔ بقیهٔ اعضا: {int(others)} سانت\n\n"
+            f"سهم گروه به‌اندازهٔ وزنشه (سایز اعضا + سپرده‌هاشون نسبت به کل بات) — "
+            f"وگرنه یه نفر تو کوچیک‌ترین گروه می‌تونست پس‌انداز همه رو ببره.\n"
+            f"حداقل {HEIST_MIN_VAULT} سانت لازمه. تو گروه بزرگ‌ترت امتحان کن."), None
+
+    # Claimed BEFORE the invitation goes out, so two players can never both open a
+    # heist - and released again by cancel_heist_offer's callers if the invitation is
+    # declined or expires, so a sleeping accomplice can't burn the group's five days.
+    ok, remaining = db.try_start_heist(chat_id, HEIST_COOLDOWN_SECONDS)
+    if not ok:
+        left = _fmt_days_hours(datetime.timedelta(seconds=remaining))
+        return HEIST_REFUSED, (f"🚨 بانک هنوز تو حالت آماده‌باشه!\n"
+                               f"تا {left} دیگه کسی نمی‌تونه بزنه بهش."), None
+
+    would_be = vault * (HEIST_TREASURY_RATIO if treasury else HEIST_DEPOSIT_RATIO)
+
+    # Everything is rolled here, once, and stored: the wire for stage 1 and the sequence
+    # for stage 2. Rolling per stage would mean a job that survived a restart had to
+    # re-roll, and a re-rolled answer is a different game from the one the player was
+    # shown. Symbols are drawn WITH replacement - repeats are possible on purpose.
+    wire = random.randrange(len(HEIST_WIRES))
+    sequence = [random.randrange(len(HEIST_SYMBOLS)) for _ in range(HEIST_SEQUENCE_LENGTH)]
+    attempt_id = str(uuid4())
+    expires_at = now + datetime.timedelta(seconds=HEIST_OFFER_SECONDS + HEIST_TOTAL_SECONDS)
+
+    text = (f"🥷 <b>پیشنهاد سرقت از بانک</b>\n\n"
+            f"{_esc(user_name)} می‌خواد بانک رو بزنه و {_esc(partner_name)} رو "
+            f"به‌عنوان <b>شریک</b> انتخاب کرده.\n\n"
+            f"💰 چیزی که تو صندوقه: حدود {int(vault)} سانت\n"
+            f"🧮 سهم شریک: {int(HEIST_PARTNER_SHARE*100)}٪ از غنیمت\n\n"
+            f"⚠️ اگه گیر بیفتین <b>هر دو</b> {HEIST_PRISON_DAYS} روز می‌رید زندان بانک.\n\n"
+            f"{_esc(partner_name)}، هستی؟ ({HEIST_OFFER_SECONDS} ثانیه وقت داری)")
+    return HEIST_OK, text, {
+        'attempt_id': attempt_id, 'chat_id': chat_id, 'thief_id': user_id,
+        'thief_name': user_name, 'partner_id': partner_id, 'partner_name': partner_name,
+        'sequence': ",".join(str(i) for i in sequence), 'wire': wire,
+        'would_be': would_be, 'expires_at': expires_at, 'vault': vault,
+    }
+
+
+def store_heist_offer(info, message_chat_id, message_id):
+    """Write the offer row once the caller knows where its invitation landed.
+
+    Split from perform_heist_offer because the message id is the one thing only the
+    surface knows - the chat has it from reply_text, the app from the sendMessage it
+    made. The row needs it either way so the bot's stage jobs have something to edit.
+    """
+    db.create_heist_offer(info['attempt_id'], info['chat_id'], info['thief_id'],
+                          info['thief_name'], info['partner_id'], info['partner_name'],
+                          info['sequence'], info['wire'], info['would_be'],
+                          message_chat_id, message_id, info['expires_at'])
+    return info['attempt_id']
+
+
 async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/sarghat @شریک` - a three-stage bank job that takes two people.
 
@@ -4074,140 +4203,27 @@ async def heist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cannot finish the job. Losing jails both of them, which is why the accomplice has to
     accept rather than simply being named.
 
-    On a win it hits the treasury AND everyone else's deposits, which is what stops the
-    bank being a risk-free hiding place. One attempt per group per cooldown."""
+    Thin wrapper over perform_heist_offer, which the app calls too.
+    """
     user = update.effective_user
     chat_id = update.effective_chat.id
-    if chat_id >= 0:
-        await reply_temp(update, context, "سرقت از بانک فقط داخل گروه‌ها کار می‌کند!")
-        return
     db.track_chat(chat_id)
-    thief_size, thief_last_grown, thief_perk = db.get_user(user.id, chat_id, user.username, user.first_name)
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    prison_until, labor_until, bail_amount = db.get_heist_status(user.id, chat_id)
-    if prison_until and prison_until > now:
-        await reply_temp(update, context, _heist_prison_reply(prison_until, labor_until, bail_amount, now))
-        return
-    if labor_until and labor_until > now:
-        await reply_temp(update, context,
-            f"🔨 هنوز داری بدهیت به پادشاه رو کار می‌کنی (تا {_fmt_days_hours(labor_until - now)} دیگه) "
-            f"— تا اون‌موقع نمی‌تونی دوباره سرقت کنی."
-        )
-        return
-
-    # The king cannot rob his own kingdom's bank.
-    kingdom, _ = refresh_king(chat_id)
-    if kingdom and kingdom[0] == user.id:
-        await reply_temp(update, context, "👑 پادشاه که خودش صاحب کل مملکته، نمی‌تونه از بانک خودش بدزده!")
-        return
-
-    # Same gate as /dozdi: you have to actually be playing today to move other people's size.
-    if thief_last_grown != tehran_today_str():
-        await reply_temp(update, context, "اول امروز /d بزن بعد برو سراغ بانک! 🥷")
-        return
 
     partner_id, partner_name = get_target_user(update, update.message.text, chat_id)
-    if not partner_id:
-        await reply_temp(update, context,
-            "🥷 سرقت از بانک تک‌نفره نیست!\n\n"
-            "یکی رو به‌عنوان شریک انتخاب کن: <code>/sarghat @username</code> "
-            "(یا روی پیامش ریپلای کن)\n\n"
-            "شریکت دزدگیر رو قطع می‌کنه و تو گاوصندوق رو باز می‌کنی — و آخرش هر دو باید "
-            "با هم فرار کنید. اگه بگیرنتون، <b>هر دو</b> می‌رید زندان.",
-            parse_mode="HTML"
-        )
+    kind, text, info = perform_heist_offer(
+        user.id, user.first_name, user.username, chat_id, partner_id, partner_name)
+    if kind == HEIST_REFUSED:
+        await reply_temp(update, context, text, parse_mode="HTML")
         return
-    if partner_id == user.id:
-        await reply_temp(update, context, "با خودت که نمی‌تونی شریک بشی! 🙄")
-        return
-    if kingdom and kingdom[0] == partner_id:
-        await reply_temp(update, context,
-            "👑 پادشاه شریک دزدی از خزانهٔ خودش نمی‌شه!"
-        )
-        return
-
-    _psize, partner_last_grown, _pperk = db.get_user(partner_id, chat_id, None, partner_name)
-    if db.is_in_heist_prison(partner_id, chat_id):
-        await reply_temp(update, context, f"{partner_name} الان تو زندان بانکه — شریک دیگه‌ای پیدا کن.")
-        return
-    if partner_last_grown != tehran_today_str():
-        await reply_temp(update, context,
-            f"{partner_name} امروز هنوز /d نزده — یه شریک که تو بازی نیست به چه دردت می‌خوره؟"
-        )
-        return
-
-    # What's actually stealable. The treasury is one pot shared with every other group,
-    # so a heist reaches this group's CLAIM on it (bounded by the group's weight in the
-    # bot - see db._group_weight), never the whole thing: one lucky memory game must not
-    # be able to empty the vault backing every player in every group.
-    treasury = db.group_reserve_claim(chat_id)
-    total_dep, holders = db.get_bank_totals(chat_id)
-    mine = db.get_bank(user.id, chat_id)[0] + db.get_bank(partner_id, chat_id)[0]
-    others = max(0.0, total_dep - mine)
-    vault = treasury + others
-    if vault < HEIST_MIN_VAULT:
-        # Say WHY, with the real numbers. "The vault is empty" while the shared treasury
-        # holds tens of thousands is simply false from the player's side, and it was the
-        # single most confusing message in the game: the treasury IS one pot, but what a
-        # heist reaches is this group's weight-bounded claim on it.
-        total_reserve = db.get_central_bank()['reserve']
-        await reply_temp(update, context,
-            f"🏦 اینجا چیزی برای بردن نیست ({int(vault)} سانت).\n\n"
-            f"خزانه یکیه و کل بات <b>{int(total_reserve)}</b> سانت توشه — ولی سرقت فقط به "
-            f"<b>سهم این گروه</b> می‌رسه، نه به کل خزانه:\n"
-            f"   🏛 سهم این گروه: {int(treasury)} سانت\n"
-            f"   🧾 سپردهٔ بقیهٔ اعضا: {int(others)} سانت\n\n"
-            f"سهم گروه به‌اندازهٔ وزنشه (سایز اعضا + سپرده‌هاشون نسبت به کل بات) — "
-            f"وگرنه یه نفر تو کوچیک‌ترین گروه می‌تونست پس‌انداز همه رو ببره.\n"
-            f"حداقل {HEIST_MIN_VAULT} سانت لازمه. تو گروه بزرگ‌ترت امتحان کن.",
-            parse_mode="HTML"
-        )
-        return
-
-    # Claimed BEFORE the invitation goes out, so two players can never both open a
-    # heist - and released again by cancel_heist_offer's callers if the invitation is
-    # declined or expires, so a sleeping accomplice can't burn the group's five days.
-    # Same claim/release shape as claim_war_day.
-    ok, remaining = db.try_start_heist(chat_id, HEIST_COOLDOWN_SECONDS)
-    if not ok:
-        left = _fmt_days_hours(datetime.timedelta(seconds=remaining))
-        await reply_temp(update, context,
-            f"🚨 بانک هنوز تو حالت آماده‌باشه!\nتا {left} دیگه کسی نمی‌تونه بزنه بهش."
-        )
-        return
-
-    would_be = vault * (HEIST_TREASURY_RATIO if treasury else HEIST_DEPOSIT_RATIO)
-
-    # Everything is rolled here, once, and stored: the wire for stage 1 and the sequence
-    # for stage 2. Rolling per stage would mean a job that survived a restart had to
-    # re-roll, and a re-rolled answer is a different game from the one the player was
-    # shown. Symbols are drawn WITH replacement - repeats are possible on purpose, which
-    # kills the "cross off what you've already used" shortcut.
-    wire = random.randrange(len(HEIST_WIRES))
-    sequence = [random.randrange(len(HEIST_SYMBOLS)) for _ in range(HEIST_SEQUENCE_LENGTH)]
-    sequence_str = ",".join(str(i) for i in sequence)
-    attempt_id = str(uuid4())
-    expires_at = now + datetime.timedelta(seconds=HEIST_OFFER_SECONDS + HEIST_TOTAL_SECONDS)
 
     sent = await update.message.reply_text(
-        f"🥷 <b>پیشنهاد سرقت از بانک</b>\n\n"
-        f"{_esc(user.first_name)} می‌خواد بانک رو بزنه و {_esc(partner_name)} رو "
-        f"به‌عنوان <b>شریک</b> انتخاب کرده.\n\n"
-        f"💰 چیزی که تو صندوقه: حدود {int(vault)} سانت\n"
-        f"🧮 سهم شریک: {int(HEIST_PARTNER_SHARE*100)}٪ از غنیمت\n\n"
-        f"⚠️ اگه گیر بیفتین <b>هر دو</b> {HEIST_PRISON_DAYS} روز می‌رید زندان بانک.\n\n"
-        f"{_esc(partner_name)}، هستی؟ ({HEIST_OFFER_SECONDS} ثانیه وقت داری)",
-        parse_mode="HTML",
+        text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🤝 هستم", callback_data=f"heistjoin_{attempt_id}_y"),
-            InlineKeyboardButton("🙅 نه بابا", callback_data=f"heistjoin_{attempt_id}_n"),
+            InlineKeyboardButton("🤝 هستم", callback_data=f"heistjoin_{info['attempt_id']}_y"),
+            InlineKeyboardButton("🙅 نه بابا", callback_data=f"heistjoin_{info['attempt_id']}_n"),
         ]])
     )
-
-    db.create_heist_offer(attempt_id, chat_id, user.id, user.first_name, partner_id,
-                          partner_name, sequence_str, wire, would_be, chat_id,
-                          sent.message_id, expires_at)
+    attempt_id = store_heist_offer(info, chat_id, sent.message_id)
 
     context.job_queue.run_once(
         heist_offer_timeout_job, when=HEIST_OFFER_SECONDS,
@@ -4266,7 +4282,10 @@ async def heist_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     wait = random.uniform(HEIST_ALARM_MIN_SECONDS, HEIST_ALARM_MAX_SECONDS)
     deadline = (datetime.datetime.now(datetime.timezone.utc)
                 + datetime.timedelta(seconds=wait + HEIST_CUT_SECONDS + 5))
-    if not db.accept_heist_offer(attempt_id, query.from_user.id, deadline):
+    # `wait` is stored on the row, not just used as a job delay: it is what lets a
+    # browser (which has no scheduler) know when the cue lands, and what stops a restart
+    # re-rolling the moment out from under whoever is waiting for it.
+    if not db.accept_heist_offer(attempt_id, query.from_user.id, deadline, wait):
         await query.answer("این پیشنهاد قبلاً تموم شده!", show_alert=True)
         return
     await query.answer("🤝 قبول کردی!")
@@ -4313,6 +4332,13 @@ async def heist_alarm_arm_job(context: ContextTypes.DEFAULT_TYPE):
     row = db.get_heist_attempt(attempt_id)
     if not row or row['status'] != 'pending' or row['stage'] != 1:
         return
+    # This job IS the cue's moment, so it arms directly rather than asking heist_tick
+    # whether the moment has arrived: the job can fire a millisecond early against the
+    # database clock, and a tick that then refused to arm would leave a chat player
+    # waiting for a cue that never lands - nothing else would re-fire for them.
+    # heist_tick is the catch-up for surfaces with NO scheduler, and the two are
+    # idempotent against each other: whichever arms first, the other sees alarm_armed
+    # already set and does nothing.
     deadline = (datetime.datetime.now(datetime.timezone.utc)
                 + datetime.timedelta(seconds=HEIST_CUT_SECONDS))
     if not db.arm_heist_alarm(attempt_id, deadline):
@@ -4373,8 +4399,7 @@ async def start_heist_vault(context: ContextTypes.DEFAULT_TYPE, attempt_id):
     except Exception as e:
         logging.error(f"Failed to open heist vault stage for {attempt_id}: {e}")
 
-    vault_seconds = (HEIST_SEQUENCE_LENGTH * HEIST_REVEAL_STEP_SECONDS
-                     + HEIST_BLANK_SECONDS + HEIST_RECALL_SECONDS)
+    vault_seconds = HEIST_VAULT_SECONDS
     context.job_queue.run_once(
         heist_reveal_step_job, when=HEIST_REVEAL_STEP_SECONDS,
         data={"attempt_id": attempt_id, "step": 0}, name=f"heist_reveal_{attempt_id}_0"
@@ -4606,11 +4631,15 @@ async def heist_escape_callback(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
 
-async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id,
-                                outcome=None, reason=None, expect_stage=None):
+def settle_heist(attempt_id, outcome=None, reason=None, expect_stage=None):
     """Single settlement point for a heist - called by a losing tap, each stage's
-    timeout job, and the startup recovery sweep, mirroring the role resolve_pvp_match
-    plays for challenges.
+    timeout job, the recovery sweep, and the app's endpoints. Returns (settled, text)
+    and touches NO Telegram object, mirroring resolve_pvp_match's role for challenges.
+
+    The money and the prison sentences are all db.* calls; only the delivery of the
+    resulting message needs a surface, which is why that is the caller's job now. A
+    heist played from the browser must serve the same sentence as one played in the
+    chat, and it does because this is still the only code that hands one down.
 
     `outcome` is 'won'/'lost' when a tap already decided it (the row is already updated
     in that case). It's None for the timeout paths, which have to claim the row
@@ -4622,12 +4651,12 @@ async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id,
                    if expect_stage is not None
                    else db.claim_expired_heist_attempt(attempt_id))
         if not claimed:
-            return  # a tap, or another job, already resolved this one
+            return False, None   # a tap, or another job, already resolved this one
         outcome = 'lost'
 
     row = db.get_heist_attempt(attempt_id)
     if not row:
-        return
+        return False, None
     chat_id = row['chat_id']
     thief_id, thief_name = row['thief_id'], row['thief_name']
     partner_id, partner_name = row['partner_id'], row['partner_name']
@@ -4661,10 +4690,9 @@ async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id,
             for uid, name in ((thief_id, thief_name), (partner_id, partner_name)):
                 if uid:
                     text += badge_lines(name, award(uid, chat_id, 'thief'), html=False)
-        # deliver_pvp_message sends plain text (no parse_mode), so the message is built
-        # without HTML tags and without _esc() - there's nothing to escape for.
-        await deliver_pvp_message(context, row['message_chat_id'], row['message_id'], text)
-        return
+        # The message is plain text, built without HTML tags and without _esc():
+        # deliver_pvp_message sends it with no parse_mode, so there is nothing to escape.
+        return True, text
 
     # Lost. BOTH conspirators go down - that shared risk is what the accomplice agreed
     # to, and it is what stops a heist from being a favour you do for a friend. Each is
@@ -4693,8 +4721,18 @@ async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id,
         lines.append(f"   • {name}: {HEIST_PRISON_DAYS} روز زندان + {int(labor_days)} روز "
                      f"کار برای پادشاه | وثیقه: {int(bail_amount)} سانت")
     lines.append(f"\n💰 با /vasighe می‌تونن زودتر آزاد شن، یا پادشاه با /afv ببخشدشون.")
-    await deliver_pvp_message(context, row['message_chat_id'], row['message_id'],
-                              "\n".join(lines))
+    return True, "\n".join(lines)
+
+
+async def resolve_heist_attempt(context: ContextTypes.DEFAULT_TYPE, attempt_id,
+                                outcome=None, reason=None, expect_stage=None):
+    """Settle a heist and deliver the result into the chat. Thin wrapper over
+    settle_heist, which is where every decision and every centimetre actually moves."""
+    row = db.get_heist_attempt(attempt_id)
+    settled, text = settle_heist(attempt_id, outcome, reason, expect_stage)
+    if not settled or not row:
+        return
+    await deliver_pvp_message(context, row['message_chat_id'], row['message_id'], text)
 
 
 async def recover_stuck_heist_attempts(context: ContextTypes.DEFAULT_TYPE):
@@ -7665,6 +7703,10 @@ if __name__ == '__main__':
     app.job_queue.run_once(recover_pending_lotteries, when=9)
     app.job_queue.run_once(recover_decree_offer, when=12)
     app.job_queue.run_once(recover_stuck_heist_attempts, when=14)
+    # Repeating for the same reason as the pvp and consensus sweeps: a heist played from
+    # the app has no job_queue behind it, so nothing else would ever time its stages out.
+    app.job_queue.run_repeating(recover_stuck_heist_attempts,
+                                interval=PENDING_SWEEP_SECONDS, first=PENDING_SWEEP_SECONDS)
     app.job_queue.run_once(recover_group_war, when=16)
     # Same shape as the sweeps above, and for the same reason: run_daily only fires
     # at its appointed minute, so a bot deployed after 00:30 would leave every
