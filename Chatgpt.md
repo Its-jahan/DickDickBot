@@ -90,5 +90,9 @@
 
 - آخرین `origin/main` دوباره دریافت شد؛ قبل از کامیت، شاخهٔ محلی و GitHub هیچ اختلافی نداشتند.
 - بررسی `git diff --check` موفق بود و دسترسی حساب GitHub تأیید شد.
-- کامیت انتشار شامل کد، خروجی build، تست‌ها و مستندات همین مرحله خواهد بود. تغییر stage‌شدهٔ قبلی `deploy/nginx-admin.inddex.app.conf` خارج از این کامیت باقی می‌ماند.
-- پوش روی `main` طبق workflow موجود، انتشار خودکار بات و سرویس وب را اجرا می‌کند؛ نتیجهٔ این اجرا پس از پوش بررسی می‌شود.
+- کامیت `457cb47bb5026ec69bb273efe7b1c2cdd3bf5bb6` با عنوان `Add Telegram Stars purchases and per-group tone settings` ساخته و با موفقیت روی `origin/main` پوش شد.
+- کامیت انتشار شامل ۱۵ فایل کد، خروجی build، تست و مستندات همین مرحله است. تغییر stage‌شدهٔ قبلی `deploy/nginx-admin.inddex.app.conf` خارج از کامیت و دست‌نخورده باقی ماند.
+- [بررسی تطابق build با سورس](https://github.com/Its-jahan/DickDickBot/actions/runs/34662471327): با نتیجهٔ `success` تمام شد.
+- [انتشار خودکار روی سرور](https://github.com/Its-jahan/DickDickBot/actions/runs/34662471265): با نتیجهٔ `success` تمام شد.
+- نتیجهٔ نهایی: کد استپ ۴ و ۵ روی `main` منتشر شد و هر دو workflow موفق شدند. پرداخت واقعی Telegram همچنان انجام نشده است.
+- این نتیجه در یک کامیت مستنداتی با `[skip ci]` ذخیره می‌شود تا فقط برای ثبت گزارش، انتشار دوبارهٔ سرویس‌ها اجرا نشود.
