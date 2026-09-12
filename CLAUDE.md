@@ -1701,14 +1701,31 @@ Four rules hold the state machine together:
   league that no longer exists. The panel makes the owner **type the chat id**: the
   browser `confirm()` is a nicety, the typed id is the gate.
 
-`deactivate_idle_chats` (daily, 00:30 Tehran) runs the sweep and also **backfills group
-names**. `chats.title` is otherwise only recorded opportunistically from incoming
-messages, so a group that has not spoken since that was added showed in the app's picker
-as `گروه 717026` — the bot admitting it never saw a message from them. One `getChat` per
-unknown group, bounded to 40 a run, fixes it permanently; a `Forbidden` means the bot was
-kicked, which deactivates with `reason='removed'` instead of retrying forever. Note that
-`track_chat(chat_id, None)` must never blank a name already recorded — most of its
-callers pass no title at all.
+`deactivate_idle_chats` runs the sweep and also **backfills group names**.
+`chats.title` is otherwise only recorded opportunistically from incoming messages, so a
+group that has not spoken since that was added showed in the app's picker as
+`گروه 717026` — the bot admitting it never saw a message from them. One `getChat` per
+unknown group, bounded to 40 a run, fixes it permanently.
+
+It is registered **twice**, and both matter: `run_daily` at 00:30 Tehran, and a
+`run_once(..., when=20)` beside the other startup sweeps. `run_daily` fires only at its
+appointed minute, so without the second one a bot deployed after 00:30 leaves every
+unnamed group showing as an id until the following night — the same reasoning as
+`recover_decree_offer`. The sweep half is safe at boot because it skips
+`last_seen_at IS NULL`, and the backfill half is idempotent: a group drops off
+`chats_without_title` the moment it is named.
+
+Three details that were each a bug first:
+
+- **Deactivated groups are named too**, with the active ones ordered first so the
+  40-a-run bound spends itself where it matters. They run nothing, so a name buys them
+  no gameplay — but the panel's inactive filter is a list the owner makes decisions from,
+  and a column of bare ids there is the very complaint this backfill exists to answer.
+- **A `Forbidden` only deactivates a group that is still ON** (`reason='removed'`). Now
+  that the sweep also touches groups the owner switched off, an unconditional write would
+  quietly rewrite their `'admin'` reason as `'removed'` and lose why the group was off.
+- **`track_chat(chat_id, None)` must never blank a name already recorded** — most of its
+  forty callers pass no title at all.
 
 ### The nightly auto-handicap (`auto_handicap_job`)
 
