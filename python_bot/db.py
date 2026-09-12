@@ -285,6 +285,12 @@ def init_db():
         # "-1001858630001". Recorded opportunistically from whatever update comes in -
         # Telegram is the only source of it and the bot never asked before.
         c.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS title TEXT")
+        # The group's public copy style. Existing groups keep the game's original
+        # adult voice; an administrator may switch the whole league to the polite
+        # renderer without changing any rules, item ids, perks or stored event text.
+        c.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS tone_mode TEXT DEFAULT 'adult'")
+        c.execute("UPDATE chats SET tone_mode = 'adult' "
+                  "WHERE tone_mode IS NULL OR tone_mode NOT IN ('adult', 'polite')")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS inventory (
@@ -325,6 +331,31 @@ def init_db():
         # The feed's only two reads: this group's day, and one player's own day.
         c.execute('CREATE INDEX IF NOT EXISTS events_chat_day ON events (chat_id, day, id DESC)')
         c.execute('CREATE INDEX IF NOT EXISTS events_actor ON events (actor_id, day)')
+
+        # Telegram Stars orders are persisted before an invoice is created. The
+        # successful-payment update may be delivered again after a reconnect, so the
+        # order row and Telegram charge id are both unique and fulfilment happens in
+        # the same transaction as the item/size grant.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS star_orders (
+                id UUID PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                sku TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                stars INTEGER NOT NULL,
+                status TEXT DEFAULT 'created',
+                telegram_charge_id TEXT UNIQUE,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                checkout_at TIMESTAMPTZ,
+                paid_at TIMESTAMPTZ,
+                refunded_at TIMESTAMPTZ
+            )
+        ''')
+        c.execute('ALTER TABLE star_orders ADD COLUMN IF NOT EXISTS checkout_at TIMESTAMPTZ')
+        c.execute('CREATE INDEX IF NOT EXISTS star_orders_user_chat_idx '
+                  'ON star_orders (user_id, chat_id, created_at DESC)')
 
         # One message per group per night, edited in place as each nightly job lands its
         # section, instead of seven separate messages between 00:00 and 00:20.
@@ -1209,7 +1240,8 @@ CHAT_SCOPED_TABLES = (
     'rebalance_log', 'crypto_holdings', 'bank_accounts', 'inventory', 'achievements',
     'consensus_vote_casts', 'consensus_votes', 'consensus_protection', 'boss_hits',
     'bosses', 'lottery_tickets', 'pvp_match_bets', 'pvp_matches', 'heist_attempts',
-    'loans', 'decree_log', 'shop_purchases', 'shop_item_state', 'kingdom', 'economy',
+    'loans', 'decree_log', 'shop_purchases', 'shop_item_state', 'star_orders',
+    'kingdom', 'economy',
     'bank_treasury', 'claimed_challenges', 'chat_instances', 'users', 'chats',
 )
 
@@ -2482,6 +2514,177 @@ def get_group_stats(chat_id):
         events = c.fetchone()[0]
         return {'players': players, 'total_size': total, 'biggest': biggest,
                 'active_today': active, 'log_events': events}
+
+
+# ---------------------------------------------------------------- tone + Telegram Stars
+
+def get_chat_tone(chat_id):
+    """`adult` or `polite`; unknown/private chats keep the original adult voice."""
+    if not chat_id or int(chat_id) >= 0:
+        return 'adult'
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(tone_mode, 'adult') FROM chats WHERE chat_id = %s",
+                  (chat_id,))
+        row = c.fetchone()
+        return row[0] if row and row[0] in ('adult', 'polite') else 'adult'
+
+
+def get_chat_tones(chat_ids):
+    """Bulk variant for the Mini App group picker (one query, not one per league)."""
+    ids = [int(cid) for cid in chat_ids if int(cid) < 0]
+    if not ids:
+        return {}
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT chat_id, COALESCE(tone_mode, 'adult') FROM chats "
+                  'WHERE chat_id = ANY(%s)', (ids,))
+        return {cid: mode if mode in ('adult', 'polite') else 'adult'
+                for cid, mode in c.fetchall()}
+
+
+def set_chat_tone(chat_id, mode):
+    """Set one league's public copy style. Returns False for an invalid mode/chat."""
+    if int(chat_id) >= 0 or mode not in ('adult', 'polite'):
+        return False
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('INSERT INTO chats (chat_id, tone_mode) VALUES (%s, %s) '
+                  'ON CONFLICT (chat_id) DO UPDATE SET tone_mode = EXCLUDED.tone_mode',
+                  (chat_id, mode))
+        return True
+
+
+def create_star_order(order_id, user_id, chat_id, sku, kind, quantity, stars):
+    """Persist a single-use order before its Telegram invoice is created."""
+    if (int(chat_id) >= 0 or kind not in ('item', 'size') or
+            int(quantity) <= 0 or int(stars) <= 0):
+        return False
+    with get_connection() as conn:
+        c = conn.cursor()
+        # Membership is checked again here rather than trusting the web/handler seam.
+        c.execute('SELECT 1 FROM users WHERE user_id = %s AND chat_id = %s',
+                  (user_id, chat_id))
+        if c.fetchone() is None:
+            return False
+        c.execute('INSERT INTO star_orders '
+                  '(id, user_id, chat_id, sku, kind, quantity, stars) '
+                  'VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING',
+                  (order_id, user_id, chat_id, sku, kind, int(quantity), int(stars)))
+        return c.rowcount > 0
+
+
+def fail_star_order(order_id):
+    """Close an order whose invoice could not be created; it can never be paid later."""
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE star_orders SET status = 'failed' "
+                  "WHERE id = %s AND status = 'created'", (order_id,))
+
+
+def get_star_order(order_id, user_id=None):
+    with get_connection() as conn:
+        c = conn.cursor()
+        sql = ('SELECT id::text, user_id, chat_id, sku, kind, quantity, stars, status, '
+               'telegram_charge_id, created_at, paid_at FROM star_orders WHERE id = %s')
+        args = [order_id]
+        if user_id is not None:
+            sql += ' AND user_id = %s'
+            args.append(user_id)
+        c.execute(sql, tuple(args))
+        row = c.fetchone()
+        if row is None:
+            return None
+        keys = ('id', 'user_id', 'chat_id', 'sku', 'kind', 'quantity', 'stars',
+                'status', 'charge_id', 'created_at', 'paid_at')
+        return dict(zip(keys, row))
+
+
+def claim_star_checkout(order_id, user_id, currency, total_amount):
+    """Atomically make an invoice single-use at pre-checkout time.
+
+    Telegram requires an answer within ten seconds. The short transaction both checks
+    the signed-in buyer/amount and flips `created -> checkout`, so a forwarded or
+    double-clicked invoice cannot be approved twice.
+    """
+    if currency != 'XTR':
+        return False
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE star_orders SET status = 'checkout', checkout_at = now() "
+                  "WHERE id = %s AND user_id = %s AND stars = %s "
+                  "AND status = 'created' RETURNING id",
+                  (order_id, user_id, int(total_amount)))
+        return c.fetchone() is not None
+
+
+def fulfill_star_order(order_id, user_id, currency, total_amount, charge_id):
+    """Grant a paid order exactly once, in the same transaction as its receipt row.
+
+    Returns a result dict, including `duplicate=True` for Telegram redelivery of the
+    same SuccessfulPayment, or None when any signed payment field disagrees with the
+    persisted order.
+    """
+    if currency != 'XTR' or not charge_id:
+        return None
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, chat_id, sku, kind, quantity, stars, status, '
+                  'telegram_charge_id FROM star_orders WHERE id = %s FOR UPDATE',
+                  (order_id,))
+        row = c.fetchone()
+        if row is None:
+            return None
+        oid, chat_id, sku, kind, quantity, stars, status, stored_charge = row
+        if oid != user_id or int(stars) != int(total_amount):
+            return None
+        result = {
+            'order_id': str(order_id), 'user_id': oid, 'chat_id': chat_id,
+            'sku': sku, 'kind': kind, 'quantity': int(quantity),
+            'stars': int(stars), 'charge_id': charge_id,
+        }
+        if status == 'fulfilled':
+            if stored_charge != charge_id:
+                return None
+            result['duplicate'] = True
+            return result
+        if status != 'checkout':
+            return None
+
+        # A Telegram charge id may only ever fulfil one order, even if a forged update
+        # tries to reuse it with a different payload.
+        c.execute('SELECT id::text FROM star_orders WHERE telegram_charge_id = %s',
+                  (charge_id,))
+        used = c.fetchone()
+        if used is not None and used[0] != str(order_id):
+            return None
+
+        if kind == 'item':
+            c.execute('INSERT INTO inventory (user_id, chat_id, item_name, quantity) '
+                      'VALUES (%s,%s,%s,%s) ON CONFLICT (user_id, chat_id, item_name) '
+                      'DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity',
+                      (user_id, chat_id, sku, int(quantity)))
+        elif kind == 'size':
+            c.execute('UPDATE users SET size = COALESCE(size,0) + %s '
+                      'WHERE user_id = %s AND chat_id = %s RETURNING size',
+                      (int(quantity), user_id, chat_id))
+            bal = c.fetchone()
+            if bal is None:
+                return None
+            c.execute('INSERT INTO size_log '
+                      '(chat_id, user_id, delta, balance_after, source, note) '
+                      'VALUES (%s,%s,%s,%s,%s,%s)',
+                      (chat_id, user_id, int(quantity), bal[0], 'telegram_stars',
+                       f'Stars order {order_id}'))
+            result['balance'] = float(bal[0])
+        else:
+            return None
+
+        c.execute("UPDATE star_orders SET status = 'fulfilled', "
+                  'telegram_charge_id = %s, paid_at = now() WHERE id = %s',
+                  (charge_id, order_id))
+        result['duplicate'] = False
+        return result
 
 
 def _retry_transient(fn):

@@ -75,25 +75,36 @@ def _esc_plain(text):
     return _html.escape(str(text), quote=False)
 
 
-def _tg_send(chat_id, text):
-    """POST one sendMessage. Stdlib only, and every failure is swallowed.
-
-    requirements.txt has no HTTP client and this is not worth adding one for: it is a
-    single form-encoded POST. It deliberately returns a bool instead of raising, because
-    every caller is in the "already committed" half of a transfer.
-    """
+def _tg_api(method, payload):
+    """Small Bot API boundary used for announcements, admin checks and invoices."""
     try:
-        data = urllib.parse.urlencode({
-            'chat_id': chat_id, 'text': text,
-            'parse_mode': 'HTML', 'disable_web_page_preview': 'true',
-        }).encode()
+        encoded = {
+            key: json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict))
+            else value
+            for key, value in payload.items() if value is not None
+        }
+        data = urllib.parse.urlencode(encoded).encode()
         req = urllib.request.Request(
-            f'https://api.telegram.org/bot{bot.TOKEN}/sendMessage', data=data,
+            f'https://api.telegram.org/bot{bot.TOKEN}/{method}', data=data,
             headers={'Content-Type': 'application/x-www-form-urlencoded'})
-        with urllib.request.urlopen(req, timeout=TG_TIMEOUT_SECONDS):
-            return True
+        with urllib.request.urlopen(req, timeout=TG_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode('utf-8'))
+        return body.get('result') if body.get('ok') else None
     except Exception:
-        return False
+        return None
+
+
+def _tg_send(chat_id, text):
+    """POST one tone-aware sendMessage; a failed announcement never rolls money back."""
+    return _tg_api('sendMessage', {
+        'chat_id': chat_id, 'text': bot.tone_text(chat_id, text),
+        'parse_mode': 'HTML', 'disable_web_page_preview': 'true',
+    }) is not None
+
+
+def _tg_is_admin(chat_id, user_id):
+    member = _tg_api('getChatMember', {'chat_id': chat_id, 'user_id': user_id})
+    return bool(member) and member.get('status') in ('creator', 'administrator', 'owner')
 
 
 def _guarded_call(fn, args):
@@ -303,10 +314,12 @@ def api_groups():
         return _fail('اجازهٔ دسترسی نداری', 403)
     rows = db.get_user_groups(who[0])
     titles = db.get_chat_titles([r[0] for r in rows])
+    tones = db.get_chat_tones([r[0] for r in rows])
     return jsonify({
         'ok': True,
         'name': who[1],
         'groups': [{'chat_id': cid, 'size': float(size or 0),
+                    'tone': tones.get(cid, 'adult'),
                     'title': titles.get(cid) or f'گروه {str(cid)[-6:]}'}
                    for cid, size in rows],
     })
@@ -468,8 +481,70 @@ def api_shop():
             'week_left': max(0, bot.SHOP_WEEKLY_LIMIT - w),
             'desc': bot.ITEM_DESCRIPTIONS.get(item, ''),
         })
-    return jsonify({'ok': True, 'items': items, 'wallet': float(wallet or 0),
+    item_stars = {p['item']: {'sku': sku, 'stars': p['stars']}
+                  for sku, p in bot.STAR_ITEM_PRODUCTS.items()}
+    for item in items:
+        item.update(item_stars.get(item['name'], {}))
+    packages = [{'sku': sku, **product}
+                for sku, product in bot.STAR_SIZE_PACKAGES.items()]
+    return jsonify({'ok': True, 'items': items, 'star_packages': packages,
+                    'wallet': float(wallet or 0),
                     'inflation': float(econ[0])})
+
+
+@app.post('/api/stars/invoice')
+def api_stars_invoice():
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, name, username, chat_id = sc
+    sku = str((request.get_json(silent=True) or {}).get('sku') or '')
+    db.get_user(uid, chat_id, username, name)
+    order_id, product = bot.create_star_order(uid, chat_id, sku)
+    if not order_id:
+        return _fail('این محصول پیدا نشد')
+    fields = bot.star_invoice_fields(order_id, product)
+    invoice_url = _tg_api('createInvoiceLink', {
+        'title': fields['title'], 'description': fields['description'],
+        'payload': fields['payload'], 'currency': 'XTR',
+        'prices': [p.to_dict() for p in fields['prices']],
+    })
+    if not invoice_url:
+        db.fail_star_order(order_id)
+        return _fail('ساخت فاکتور تلگرام ممکن نشد؛ دوباره امتحان کن', 502)
+    return jsonify({'ok': True, 'order_id': order_id, 'invoice_url': invoice_url})
+
+
+@app.get('/api/stars/order/<order_id>')
+def api_stars_order(order_id):
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _name, _username, chat_id = sc
+    valid_id = bot.parse_star_invoice_payload('stars:' + order_id)
+    order = valid_id and db.get_star_order(valid_id, uid)
+    if not order or order['chat_id'] != chat_id:
+        return _fail('سفارش پیدا نشد', 404)
+    return jsonify({'ok': True, 'status': order['status'], 'kind': order['kind'],
+                    'quantity': order['quantity'], 'stars': order['stars']})
+
+
+@app.post('/api/settings/tone')
+def api_settings_tone():
+    sc, err = _need_scope()
+    if err:
+        return err
+    uid, _name, _username, chat_id = sc
+    mode = str((request.get_json(silent=True) or {}).get('mode') or '')
+    if mode not in ('adult', 'polite'):
+        return _fail('لحن نامعتبره')
+    if not _tg_is_admin(chat_id, uid):
+        return _fail('فقط ادمین گروه می‌تونه لحن رو عوض کنه', 403)
+    db.set_chat_tone(chat_id, mode)
+    bot.set_cached_chat_tone(chat_id, mode)
+    return jsonify({'ok': True, 'tone': mode,
+                    'message': 'لحن محترمانه فعال شد' if mode == 'polite'
+                    else 'لحن +۱۸ فعال شد'})
 
 
 @app.get('/api/inventory')

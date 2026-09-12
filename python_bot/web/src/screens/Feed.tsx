@@ -5,12 +5,13 @@ import { num } from '@/lib/format'
 const ICON: Record<string, string> = {
   growth: '🌱', theft: '🥷', donation: '🎁', challenge: '⚔️', transfer: '🔁',
   night: '🌙', heist: '🚨', crypto: '📈', bank: '🏦', shop: '🏪', lottery: '🎟️',
+  stars: '⭐',
 }
 
 const LABEL: Record<string, string> = {
   growth: 'رشد', theft: 'دزدی', donation: 'اهدا', challenge: 'چالش', transfer: 'انتقال',
   night: 'گزارش شبانه', heist: 'سرقت', crypto: 'بازار', bank: 'بانک', shop: 'فروشگاه',
-  lottery: 'لاتاری',
+  lottery: 'لاتاری', stars: 'خرید Stars',
 }
 
 const clock = (t: number) =>

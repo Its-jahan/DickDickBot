@@ -4,6 +4,7 @@ import hmac
 import html
 import json
 import logging
+import os
 import random
 import re
 import urllib.parse
@@ -12,10 +13,16 @@ import datetime
 from datetime import time
 from zoneinfo import ZoneInfo
 import math
-from telegram import Update, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from telegram import (Update, InlineQueryResultArticle, InputTextMessageContent,
+                      InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo,
+                      LabeledPrice)
 from telegram.error import Forbidden
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, InlineQueryHandler, CallbackQueryHandler, TypeHandler
-from uuid import uuid4
+from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
+                          ContextTypes, filters, InlineQueryHandler,
+                          CallbackQueryHandler, TypeHandler,
+                          PreCheckoutQueryHandler, ExtBot)
+from telegram.request import HTTPXRequest
+from uuid import UUID, uuid4
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -35,6 +42,96 @@ def tehran_week_str():
 import db
 import lottery
 import decrees
+
+
+# ---------------------------------------------------------------- public copy style
+#
+# Game rules and stored ids stay in the original vocabulary. `tone_text` is a renderer
+# at the Telegram/web boundary, so changing a group's style can never change an item id,
+# callback payload, perk comparison or old event row. Longer named perks are replaced
+# first; the small root replacements catch free-form sentences after that.
+_POLITE_REPLACEMENTS = (
+    ('زن جنده', 'ملکهٔ شانس'), ('حروم‌دست', 'دست‌طلایی'),
+    ('کیرشکسته', 'آسیب‌دیده'),
+    ('حرومزاده', 'یخ‌زده'), ('کون‌سوخته', 'بداقبال'),
+    ('کون‌گشاد', 'خونسرد'), ('کص‌شانس', 'خوش‌شانس'),
+    ('کص‌کش', 'حسابگر'), ('کیرکلفت', 'قدرتمند'),
+    ('سوراخ‌جیب', 'جیب‌باز'), ('جاکش', 'میانجی'),
+    ('لاشی', 'جان‌سخت'), ('جقی', 'ریسک‌باز'),
+    ('شاه کص', 'ته‌جدولی'), ('دودول', 'قدرت'),
+    ('شومبول', 'قدرت'), ('کیر', 'قدرت'), ('کص', 'ضعف'),
+    ('کون', 'توان'), ('جنده', 'بدنام'), ('جق', 'ریسک'),
+)
+_TONE_CACHE = {}
+_TONE_CACHE_SECONDS = 60
+_CALLBACK_CHATS = {}
+_INLINE_CHATS = {}
+
+
+def polite_text(text):
+    """Render adult Persian copy as the group's polite, game-safe vocabulary."""
+    if not isinstance(text, str):
+        return text
+    for old, new in _POLITE_REPLACEMENTS:
+        text = text.replace(old, new)
+    return text
+
+
+def chat_tone(chat_id):
+    """Cached tone read: message delivery must not add a DB round trip every time."""
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return 'adult'
+    if chat_id >= 0:
+        return 'adult'
+    now = datetime.datetime.now().timestamp()
+    cached = _TONE_CACHE.get(chat_id)
+    if cached and now - cached[1] < _TONE_CACHE_SECONDS:
+        return cached[0]
+    try:
+        mode = db.get_chat_tone(chat_id)
+    except Exception:
+        mode = 'adult'
+    _TONE_CACHE[chat_id] = (mode, now)
+    return mode
+
+
+def set_cached_chat_tone(chat_id, mode):
+    _TONE_CACHE[int(chat_id)] = (mode, datetime.datetime.now().timestamp())
+
+
+def tone_text(chat_id, text):
+    return polite_text(text) if chat_tone(chat_id) == 'polite' else text
+
+
+class ToneAwareBot(ExtBot):
+    """Apply the selected copy style at the last shared Telegram boundary.
+
+    Message.reply_text/query.edit_message_text both end up on this same Bot instance,
+    which gives full handler coverage without duplicating a `tone_text` call at hundreds
+    of call sites. Callback ids are associated with their group by `log_incoming`.
+    """
+    async def send_message(self, chat_id, text, *args, **kwargs):
+        return await super().send_message(chat_id, tone_text(chat_id, text), *args, **kwargs)
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        chat_id = kwargs.get('chat_id')
+        if chat_id is None and args:
+            chat_id = args[0]
+        if chat_id is None:
+            chat_id = _INLINE_CHATS.get(kwargs.get('inline_message_id'))
+        return await super().edit_message_text(tone_text(chat_id, text), *args, **kwargs)
+
+    async def answer_callback_query(self, callback_query_id, *args, text=None, **kwargs):
+        chat_id = _CALLBACK_CHATS.pop(callback_query_id, None)
+        if text is not None:
+            text = tone_text(chat_id, text)
+        elif args:
+            args = list(args)
+            args[0] = tone_text(chat_id, args[0])
+        return await super().answer_callback_query(callback_query_id, *args,
+                                                   text=text, **kwargs)
 
 # A group nobody has spoken in for this long is switched off: no nightly report, no
 # tax run, no boss, no decree. It comes straight back the moment anybody speaks (see
@@ -300,8 +397,21 @@ async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.info("RX inline_query user=%s q=%r",
                          update.inline_query.from_user.id, update.inline_query.query[:64])
         elif update.callback_query is not None:
+            q = update.callback_query
+            # Query.answer only carries a callback id to Bot.answerCallbackQuery, so
+            # remember the originating league here (handler group -1) for the shared
+            # tone renderer. Inline messages need the same association for edits.
+            cid = None
+            if q.message is not None and q.message.chat is not None:
+                cid = q.message.chat.id
+            elif q.chat_instance:
+                cid = db.get_chat_id_from_instance(q.chat_instance)
+            if cid is not None:
+                _CALLBACK_CHATS[q.id] = cid
+                if q.inline_message_id:
+                    _INLINE_CHATS[q.inline_message_id] = cid
             logging.info("RX callback_query user=%s data=%r",
-                         update.callback_query.from_user.id, update.callback_query.data)
+                         q.from_user.id, q.data)
         elif update.my_chat_member is not None:
             m = update.my_chat_member
             logging.info("RX my_chat_member chat=%s %s -> %s",
@@ -362,6 +472,8 @@ BOT_COMMANDS = [
     ("i", "🎒 آیتم‌های من"),
     ("u", "💉 استفاده از آیتم — /u ویاگرا @user"),
     ("shop", "🏪 خرید آیتم با سانت"),
+    ("stars", "⭐ خرید آیتم یا بسته با Telegram Stars"),
+    ("tone", "🎭 انتخاب لحن +۱۸ یا محترمانه"),
     ("ejma", "⚖️ رای‌گیری برای کم‌کردن سایز — /ejma @user"),
     ("dozdi", "🥷 دزدی از یکی — /dozdi @user"),
     ("king", "👑 پادشاه گروه و قوانین تاج"),
@@ -394,6 +506,7 @@ BOT_COMMANDS = [
     ("dalghak", "🤡 دلقک‌های دربار"),
     ("ach", "🏅 نشان‌ها و استریک من"),
     ("wr", "📊 آمار برد و باخت"),
+    ("paysupport", "🧾 پشتیبانی پرداخت Stars"),
     ("help", "❓ راهنمای کامل بازی"),
 ]
 
@@ -714,6 +827,84 @@ SHOP_PRICES = {
     "بلیت طلایی": 90,
 }
 
+# Digital goods sold for Telegram Stars. These prices are intentionally fixed in XTR:
+# inflation is a property of the in-game centimetre economy, not Telegram's currency.
+# Star-bought items also do not consume the group's centimetre-shop scarcity slot — an
+# invoice can settle seconds later, and a player must never pay real Stars only to learn
+# that somebody else took the last unit while Telegram was checking out.
+STAR_SIZE_PACKAGES = {
+    'size_50':  {'title': 'بستهٔ ۵۰ سانتی',  'kind': 'size', 'quantity': 50,  'stars': 25},
+    'size_150': {'title': 'بستهٔ ۱۵۰ سانتی', 'kind': 'size', 'quantity': 150, 'stars': 60},
+    'size_400': {'title': 'بستهٔ ۴۰۰ سانتی', 'kind': 'size', 'quantity': 400, 'stars': 140},
+}
+_STAR_ITEM_PRICES = {
+    'ویاگرا': 8, 'قرص اورژانسی': 8, 'زعفرون': 20, 'کاندوم': 6,
+    'شیر موز': 6, 'سوزن': 5, 'طلسم': 5, 'اسپری': 4, 'قفل': 5,
+    'دستکش': 7, 'کیسه': 7, 'آژیر': 9, 'بلیت طلایی': 11,
+}
+STAR_ITEM_PRODUCTS = {
+    f'item_{i:02d}': {'title': name, 'kind': 'item', 'quantity': 1, 'stars': stars,
+                      'item': name}
+    for i, (name, stars) in enumerate(_STAR_ITEM_PRICES.items(), 1)
+}
+STAR_PRODUCTS = {**STAR_SIZE_PACKAGES, **STAR_ITEM_PRODUCTS}
+PAYMENT_SUPPORT_CONTACT = os.environ.get('PAYMENT_SUPPORT_CONTACT', '@Its_jahan')
+
+
+def star_product(sku):
+    """A defensive copy so callers can add display fields without mutating prices."""
+    row = STAR_PRODUCTS.get(str(sku))
+    return dict(row) if row else None
+
+
+def star_catalog():
+    return [{'sku': sku, **dict(product)} for sku, product in STAR_PRODUCTS.items()]
+
+
+def create_star_order(user_id, chat_id, product_sku):
+    """Create the persisted single-use order shared by chat and Mini App checkout."""
+    product = star_product(product_sku)
+    if product is None:
+        return None, None
+    order_id = str(uuid4())
+    goods = product.get('item') or product_sku
+    if not db.create_star_order(order_id, user_id, chat_id, goods, product['kind'],
+                                product['quantity'], product['stars']):
+        return None, None
+    return order_id, product
+
+
+def star_invoice_payload(order_id):
+    # 42 ASCII bytes, comfortably below Telegram's 128-byte payload cap.
+    return f'stars:{order_id}'
+
+
+def parse_star_invoice_payload(payload):
+    if not isinstance(payload, str) or not payload.startswith('stars:'):
+        return None
+    order_id = payload[6:]
+    try:
+        # Normalize and reject trailing/embedded data before it reaches SQL.
+        return str(UUID(order_id))
+    except (ValueError, AttributeError):
+        return None
+
+
+def star_invoice_fields(order_id, product):
+    if product['kind'] == 'size':
+        description = (f"{product['quantity']} سانتی‌متر به موجودی همان گروه اضافه می‌شود. "
+                       "تحویل فقط بعد از تأیید پرداخت Telegram انجام می‌شود.")
+    else:
+        description = (f"یک عدد {product['title']} به کولهٔ همان گروه اضافه می‌شود. "
+                       "تحویل فقط بعد از تأیید پرداخت Telegram انجام می‌شود.")
+    return {
+        'title': product['title'][:32],
+        'description': description[:255],
+        'payload': star_invoice_payload(order_id),
+        'currency': 'XTR',
+        'prices': [LabeledPrice(product['title'][:32], int(product['stars']))],
+    }
+
 # The shop is real supply and demand, shared by the whole group rather than per player:
 # every item has a global daily and weekly sale cap, and its price climbs toward
 # SHOP_SCARCITY_MAX_BONUS as that cap gets closer, so the last unit of the day costs
@@ -895,6 +1086,8 @@ HELP_TEXT = (
     "💔 /talagh — پادشاه همسرش رو طلاق می‌ده\n\n"
     "**اقتصاد و سرگرمی**\n"
     "🏪 /shop — خرید آیتم با سانت\n"
+    "⭐ /stars — خرید آیتم یا بستهٔ سانتی با Telegram Stars\n"
+    "🎭 /tone — انتخاب لحن +۱۸ یا محترمانه (فقط ادمین)\n"
     "🏦 /bank — بانک: سود روزانه، امن از دزدی\n"    "🏛 /markazi — ترازنامهٔ بانک مرکزی\n"
     "📥 /variz <مقدار> — واریز به بانک (سقف روزانه داره)\n"
     "🏧 /bardasht <مقدار> — برداشت از بانک\n"
@@ -2401,6 +2594,10 @@ async def _growth_roll(user, chat_id):
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.inline_query.from_user
     query = update.inline_query.query.strip()
+    # InlineQuery itself has no chat id. The last unambiguous league is the same scope
+    # already used for inventory/leaderboard lookup, so it is also the only honest tone
+    # scope for the message that will be inserted into that league.
+    last_chat = db.get_last_chat(user.id)
 
     # Telegram inline queries never carry "replying to X" context - the bot only ever
     # sees the typed query text, never which message (if any) you're replying to. So
@@ -2409,7 +2606,6 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # use on them, each with a confirm button that applies the effect once tapped.
     if query.startswith('@') and query[1:].split():
         target_username = query[1:].split()[0]
-        last_chat = db.get_last_chat(user.id)
         results = []
 
         if not last_chat:
@@ -2453,7 +2649,8 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         results.append(InlineQueryResultArticle(
                             id=str(uuid4()),
                             title=f"{item_name} ({qty} عدد) روی {target_name}",
-                            description=ITEM_DESCRIPTIONS.get(item_name, ''),
+                            description=tone_text(
+                                last_chat, ITEM_DESCRIPTIONS.get(item_name, '')),
                             input_message_content=InputTextMessageContent(
                                 f"💊 {user.first_name} می‌خواد از {item_name} روی {target_name} استفاده کنه...\nبرای تایید دکمه زیر رو بزن:"
                             ),
@@ -2477,20 +2674,23 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id=str(uuid4()),
         title=f"⚔️ چالش ({bet} سانت)",
         description=f"ایجاد چالش با شرط {bet} سانتی‌متر",
-        input_message_content=InputTextMessageContent(f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر ایجاد کرد!\nاولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود."),
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بیا کیرمو بخور ⚔️", callback_data=build_challenge_data(user.id, bet))]])
+        input_message_content=InputTextMessageContent(tone_text(
+            last_chat, f"⚔️ {user.first_name} یک چالش با شرط {bet} سانتی‌متر ایجاد کرد!\n"
+                       "اولین نفری که دکمه زیر را فشار دهد وارد مسابقه می‌شود.")),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            tone_text(last_chat, "بیا کیرمو بخور ⚔️"),
+            callback_data=build_challenge_data(user.id, bet))]])
     )
 
     # Leaderboard: render directly for the user's last active group so no extra
     # button press is needed. Fall back to a button only if we don't know the group.
-    last_chat = db.get_last_chat(user.id)
     top_text = build_top_text(last_chat) if last_chat else None
     if top_text:
         top_article = InlineQueryResultArticle(
             id=str(uuid4()),
             title="🏆 برترین‌های گروه",
             description="نمایش لیدربرد این گروه",
-            input_message_content=InputTextMessageContent(top_text)
+            input_message_content=InputTextMessageContent(tone_text(last_chat, top_text))
         )
     else:
         top_article = InlineQueryResultArticle(
@@ -2509,7 +2709,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             id=str(uuid4()),
             title="🎒 آیتم‌های من",
             description="استفاده مستقیم از آیتم‌هات",
-            input_message_content=InputTextMessageContent(inv_text),
+            input_message_content=InputTextMessageContent(tone_text(last_chat, inv_text)),
             reply_markup=inv_keyboard
         )
     else:
@@ -2524,17 +2724,21 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = [
         InlineQueryResultArticle(
             id=str(uuid4()),
-            title="🌱 رشد دادن دودول",
-            description="سایز دودولت رو تو این گروه بزرگ کن!",
-            input_message_content=InputTextMessageContent(f"🌱 {user.first_name} می‌خواد دودولش رو بماله..."),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بمالش تا بزرگ شه 💦", callback_data=f"grow_self_{user.id}")]])
+            title=tone_text(last_chat, "🌱 رشد دادن دودول"),
+            description=tone_text(last_chat, "سایز دودولت رو تو این گروه بزرگ کن!"),
+            input_message_content=InputTextMessageContent(tone_text(
+                last_chat, f"🌱 {user.first_name} می‌خواد دودولش رو بماله...")),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                tone_text(last_chat, "بمالش تا بزرگ شه 💦"),
+                callback_data=f"grow_self_{user.id}")]])
         ),
         top_article,
         InlineQueryResultArticle(
             id=str(uuid4()),
             title="📏 نمایش سایز من",
-            description="سایز دودولت رو تو این گروه ببین",
-            input_message_content=InputTextMessageContent(f"📏 {user.first_name} می‌خواد سایز دودولش رو ببینه..."),
+            description=tone_text(last_chat, "سایز دودولت رو تو این گروه ببین"),
+            input_message_content=InputTextMessageContent(tone_text(
+                last_chat, f"📏 {user.first_name} می‌خواد سایز دودولش رو ببینه...")),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نمایش سایز 👁️", callback_data=f"showsize_{user.id}")]])
         ),
         inv_article,
@@ -2551,7 +2755,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             id=str(uuid4()),
             title="❓ راهنمای بازی",
             description="لیست تمام دستورات و نحوه بازی",
-            input_message_content=InputTextMessageContent(HELP_TEXT)
+            input_message_content=InputTextMessageContent(tone_text(last_chat, HELP_TEXT))
         )
     ]
     if is_number:
@@ -6418,6 +6622,165 @@ async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), reply_markup=build_shop_keyboard(user.id, chat_id))
 
 
+def build_stars_keyboard(user_id):
+    size_buttons = [
+        InlineKeyboardButton(f"{p['title']} — {p['stars']} ⭐",
+                             callback_data=f"stars_{user_id}_{sku}")
+        for sku, p in STAR_SIZE_PACKAGES.items()
+    ]
+    item_buttons = [
+        InlineKeyboardButton(f"{p['title']} — {p['stars']} ⭐",
+                             callback_data=f"stars_{user_id}_{sku}")
+        for sku, p in STAR_ITEM_PRODUCTS.items()
+    ]
+    rows = [size_buttons]
+    rows.extend(item_buttons[i:i + 2] for i in range(0, len(item_buttons), 2))
+    return InlineKeyboardMarkup(rows)
+
+
+async def stars_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The chat checkout surface; the Mini App creates the same persisted invoices."""
+    if update.effective_chat.id >= 0:
+        await update.message.reply_text("این خرید برای یک لیگ مشخصه؛ داخل گروه /stars بزن.")
+        return
+    user, chat_id = update.effective_user, update.effective_chat.id
+    db.track_chat(chat_id, update.effective_chat.title)
+    db.get_user(user.id, chat_id, user.username, user.first_name)
+    await update.message.reply_text(
+        "⭐ <b>فروشگاه Telegram Stars</b>\n\n"
+        "بستهٔ سانتی مستقیم به موجودی همین گروه اضافه می‌شه؛ آیتم هم وارد کولهٔ "
+        "همین گروه می‌شه. تحویل فقط بعد از تأیید پرداخت تلگرامه.",
+        parse_mode='HTML', reply_markup=build_stars_keyboard(user.id))
+
+
+async def star_invoice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query, user = update.callback_query, update.callback_query.from_user
+    chat_id = resolve_chat_id(query)
+    parts = (query.data or '').split('_', 2)
+    if not chat_id or len(parts) != 3:
+        await query.answer("گروه این خرید پیدا نشد؛ دوباره /stars بزن.", show_alert=True)
+        return
+    try:
+        owner_id = int(parts[1])
+    except ValueError:
+        return
+    if user.id != owner_id:
+        await query.answer("این فاکتور برای شما نیست؛ خودت /stars بزن.", show_alert=True)
+        return
+    order_id, product = create_star_order(user.id, chat_id, parts[2])
+    if not order_id:
+        await query.answer("ساخت سفارش ممکن نشد؛ دوباره امتحان کن.", show_alert=True)
+        return
+    await query.answer()
+    fields = star_invoice_fields(order_id, product)
+    try:
+        await context.bot.send_invoice(chat_id=query.message.chat.id,
+                                       provider_token='', **fields)
+    except Exception:
+        db.fail_star_order(order_id)
+        logging.exception("could not create Stars invoice %s", order_id)
+        await context.bot.send_message(chat_id=query.message.chat.id,
+                                       text="ساخت فاکتور ممکن نشد؛ دوباره /stars بزن.")
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    order_id = parse_star_invoice_payload(query.invoice_payload)
+    ok = bool(order_id) and db.claim_star_checkout(
+        order_id, query.from_user.id, query.currency, query.total_amount)
+    if ok:
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message=(
+            "این فاکتور معتبر نیست یا قبلاً استفاده شده؛ لطفاً فاکتور تازه بسازید."))
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
+    order_id = parse_star_invoice_payload(payment.invoice_payload)
+    result = order_id and db.fulfill_star_order(
+        order_id, update.effective_user.id, payment.currency, payment.total_amount,
+        payment.telegram_payment_charge_id)
+    if not result:
+        logging.error("Stars payment could not be fulfilled: payload=%r charge=%r",
+                      payment.invoice_payload, payment.telegram_payment_charge_id)
+        await update.message.reply_text(
+            f"پرداخت ثبت شد ولی تحویل خودکار کامل نشد. با {PAYMENT_SUPPORT_CONTACT} تماس بگیر و "
+            "رسید پرداخت را بفرست.")
+        return
+    if result.get('duplicate'):
+        return
+    user_name = update.effective_user.first_name or 'بازیکن'
+    if result['kind'] == 'size':
+        text = (f"⭐ {_esc(user_name)} با Telegram Stars بستهٔ "
+                f"<b>{result['quantity']} سانتی</b> خرید.")
+    else:
+        text = f"⭐ {_esc(user_name)} با Telegram Stars یک <b>{_esc(result['sku'])}</b> خرید."
+    record(result['chat_id'], 'stars', re.sub(r'<[^>]+>', '', text),
+           actor_id=result['user_id'], actor_name=user_name,
+           amount=result['quantity'] if result['kind'] == 'size' else None)
+    await context.bot.send_message(chat_id=result['chat_id'], text=text, parse_mode='HTML')
+    if update.effective_chat.id != result['chat_id']:
+        await update.message.reply_text("پرداخت تأیید شد و خریدت به گروه اضافه شد ✅")
+
+
+async def paysupport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"برای مشکل پرداخت Stars به {PAYMENT_SUPPORT_CONTACT} پیام بده و اسکرین‌شات رسید، "
+        "زمان پرداخت و نام گروه را بفرست.")
+
+
+async def _is_group_admin(context, chat_id, user_id):
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return str(member.status) in ('administrator', 'creator', 'owner')
+    except Exception:
+        return False
+
+
+def tone_keyboard(mode):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(('✓ ' if mode == 'adult' else '') + 'لحن +۱۸',
+                             callback_data='tone_adult'),
+        InlineKeyboardButton(('✓ ' if mode == 'polite' else '') + 'لحن محترمانه',
+                             callback_data='tone_polite'),
+    ]])
+
+
+async def tone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id >= 0:
+        await update.message.reply_text("تنظیم لحن برای هر گروه جداست؛ داخل گروه /tone بزن.")
+        return
+    db.track_chat(chat_id, update.effective_chat.title)
+    mode = db.get_chat_tone(chat_id)
+    await update.message.reply_text(
+        "🎭 <b>لحن بازی این گروه</b>\n\n"
+        f"حالت فعلی: <b>{'محترمانه' if mode == 'polite' else '+۱۸'}</b>\n"
+        "فقط ادمین‌های گروه می‌تونن عوضش کنن.",
+        parse_mode='HTML', reply_markup=tone_keyboard(mode))
+
+
+async def tone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query, user = update.callback_query, update.callback_query.from_user
+    chat_id = resolve_chat_id(query)
+    mode = (query.data or '').removeprefix('tone_')
+    if not chat_id or mode not in ('adult', 'polite'):
+        await query.answer("گروه پیدا نشد.", show_alert=True)
+        return
+    if not await _is_group_admin(context, chat_id, user.id):
+        await query.answer("فقط ادمین گروه می‌تونه لحن رو عوض کنه.", show_alert=True)
+        return
+    db.set_chat_tone(chat_id, mode)
+    set_cached_chat_tone(chat_id, mode)
+    await query.answer("لحن گروه عوض شد ✅")
+    await query.edit_message_text(
+        "🎭 <b>لحن بازی این گروه</b>\n\n"
+        f"حالت فعلی: <b>{'محترمانه' if mode == 'polite' else '+۱۸'}</b>\n"
+        "فقط ادمین‌های گروه می‌تونن عوضش کنن.",
+        parse_mode='HTML', reply_markup=tone_keyboard(mode))
+
+
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
@@ -7195,11 +7558,13 @@ if __name__ == '__main__':
     # full of httpcore.ConnectTimeout reaching api.telegram.org, surfacing to players as
     # the generic "یه مشکل موقت پیش اومد" from on_error. Longer timeouts and a wider
     # pool turn a slow request into a slow reply instead of a failed one.
-    app = (ApplicationBuilder().token(TOKEN)
-           .concurrent_updates(True)
-           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
-           .get_updates_connect_timeout(30).get_updates_read_timeout(60)
-           .connection_pool_size(64)
+    normal_request = HTTPXRequest(connection_pool_size=64, connect_timeout=30,
+                                  read_timeout=30, write_timeout=30, pool_timeout=30)
+    updates_request = HTTPXRequest(connection_pool_size=1, connect_timeout=30,
+                                   read_timeout=60, write_timeout=30, pool_timeout=30)
+    telegram_bot = ToneAwareBot(token=TOKEN, request=normal_request,
+                                get_updates_request=updates_request)
+    app = (ApplicationBuilder().bot(telegram_bot).concurrent_updates(True)
            .post_init(setup_commands).build())
 
     app.job_queue.run_daily(midnight_tasks, time=time(hour=0, minute=0, second=0, tzinfo=IRAN_TZ))
@@ -7249,6 +7614,9 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(cmd(r'^/talagh\b'), divorce_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(dozdi|steal)\b'), steal_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(shop|forushgah)\b'), shop_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/stars\b'), stars_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/tone\b'), tone_cmd))
+    app.add_handler(MessageHandler(cmd(r'^/paysupport\b'), paysupport_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(lottery|lotari)\b'), lottery_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(bank|banak)\b'), bank_cmd))
     app.add_handler(MessageHandler(cmd(r'^/(variz|deposit)\b'), deposit_cmd))
@@ -7299,11 +7667,16 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(show_size_callback, pattern=r'^showsize_'))
     app.add_handler(CallbackQueryHandler(show_inv_callback, pattern=r'^showinv_'))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy_'))
+    app.add_handler(CallbackQueryHandler(star_invoice_callback, pattern=r'^stars_'))
+    app.add_handler(CallbackQueryHandler(tone_callback, pattern=r'^tone_'))
     app.add_handler(CallbackQueryHandler(boss_hit_callback, pattern=r'^bosshit_'))
     app.add_handler(CallbackQueryHandler(lottery_buy_callback, pattern=r'^lot_'))
     app.add_handler(CallbackQueryHandler(loan_accept_callback, pattern=r'^loanok_'))
     app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r'^xfer_'))
     app.add_handler(CallbackQueryHandler(decree_callback, pattern=r'^decree_'))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT,
+                                   successful_payment_callback))
     
     app.add_handler(InlineQueryHandler(inline_query))
     

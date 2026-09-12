@@ -16,6 +16,8 @@ import { Bag } from '@/screens/Bag'
 import { Transfer } from '@/screens/Transfer'
 import { ActionSheet, type ActionKind } from '@/screens/Actions'
 import { Login } from '@/screens/Login'
+import { ToneSettings } from '@/components/ToneSettings'
+import { politeText, tonePayload, type ToneMode } from '@/lib/tone'
 
 const ENDPOINT: Record<TabKey, string> = {
   home: '/api/home', feed: '/api/feed', crypto: '/api/crypto',
@@ -44,6 +46,7 @@ export default function App() {
   const [seen, setSeen] = useState(0)
   const [unread, setUnread] = useState(0)
   const toast = useToast()
+  const tone = (groups.find((g) => g.chat_id === chat)?.tone ?? 'adult') as ToneMode
 
   const logout = useCallback(() => {
     try { localStorage.removeItem('login'); localStorage.removeItem('chat') } catch { /* private window */ }
@@ -113,7 +116,7 @@ export default function App() {
       // screen can never be handed another screen's data - which is what made switching
       // tabs crash: setTab re-renders IMMEDIATELY, long before the new data arrives, so
       // <Top> got the home payload and read .rows.length off undefined.
-      if (seq === reqRef.current) setData({ tab: want, payload: d })
+      if (seq === reqRef.current) setData({ tab: want, payload: tonePayload(d, tone) })
     } catch (e: any) {
       // A response that lost the race must not clear the screen the player is now on.
       if (seq === reqRef.current) {
@@ -123,7 +126,7 @@ export default function App() {
     } finally {
       if (seq === reqRef.current) setLoading(false)
     }
-  }, [chat, tab, toast])
+  }, [chat, tab, toast, tone])
 
   useEffect(() => { if (phase === 'play') reload() }, [phase, tab, chat, reload])
 
@@ -154,12 +157,21 @@ export default function App() {
     setChat(id); setData(null); setTab('home'); setPhase('play')
   }
 
+  const changeTone = (mode: ToneMode) => {
+    setGroups((all) => all.map((g) => g.chat_id === chat ? { ...g, tone: mode } : g))
+    setData(null)
+  }
+
   const header = (
     <div className="mb-3 flex items-center justify-between">
       <div className="text-sm font-semibold text-muted-foreground">
-        {groups.find((g) => g.chat_id === chat)?.title ?? 'دودول'}
+        {groups.find((g) => g.chat_id === chat)?.title ??
+          (tone === 'polite' ? politeText('دودول') : 'دودول')}
       </div>
-      <ThemeToggle />
+      <div className="flex items-center gap-1">
+        {chat && <ToneSettings chat={chat} tone={tone} onTone={changeTone} />}
+        <ThemeToggle />
+      </div>
     </div>
   )
 

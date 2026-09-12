@@ -1416,6 +1416,42 @@ claim the slot, price off the counts the claim returned, charge, hand over, bump
 inflation only on the purchase that actually crosses a cap. If that ordering changes in
 one, change it in both.
 
+### Telegram Stars: payment confirmation owns fulfilment
+
+Digital goods are sold from both `/stars` and the Mini App, but both surfaces create
+the same persisted `star_orders` row and the same `stars:<uuid>` invoice payload. The
+currency is always `XTR`, there is exactly one `LabeledPrice`, and no provider token is
+used. The catalogue and prices live only in `bot.py`; `webapp.py` imports them rather
+than keeping a second list.
+
+The browser's `openInvoice` callback is presentation only. **Never grant goods from an
+HTTP response or a client-reported `paid` status.** `precheckout_callback` atomically
+claims `created -> checkout` after checking buyer, currency and amount;
+`successful_payment_callback` calls `db.fulfill_star_order`, which locks the order,
+checks the same fields plus the unique Telegram charge id, grants the item/size and
+marks the order fulfilled in one transaction. Telegram may redeliver an update after a
+reconnect; the second delivery must be a no-op. Keep `/paysupport` registered.
+
+Stars-bought items do not consume the centimetre shop's scarcity counters: payment can
+settle after another player takes the last unit, and paid goods cannot then be refused.
+A Stars size package is an explicit economy **source**, logged in `size_log` as
+`telegram_stars`; a Stars item adds inventory and changes neither wallet nor treasury.
+The successful purchase is also written to `events` and announced in its group.
+
+### Per-group adult/polite copy is a rendering boundary
+
+`chats.tone_mode` is `adult` by default so deploys do not silently change existing
+groups. Only a Telegram group administrator may change it, through `/tone` or the Mini
+App settings endpoint; both verify the role with `getChatMember`.
+
+Internal perk names, item ids, callback payloads, event rows and economic rules remain
+in the canonical vocabulary. `ToneAwareBot` renders normal Telegram sends, edits and
+callback alerts at the final boundary; the Mini App renders server-owned copy after it
+knows the selected group's mode, while preserving user/group names. Web-originated
+group announcements pass through `bot.tone_text` too. The bot process caches a group's
+mode for at most 60 seconds; an in-process `/tone` change invalidates it immediately,
+and a change made by the web process becomes visible to the bot after that bounded TTL.
+
 ### Auth is Telegram's signature, and nothing else
 
 There is no password and no session store. Telegram hands a Mini App an `initData`
